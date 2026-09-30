@@ -1,0 +1,63 @@
+# AgentPair 一键部署编排
+# 外部依赖(不在此编排内):
+#   - 阿里云 RDS PostgreSQL:经 DATABASE_URL 直连
+#   - OpenSandbox Server(另一台服务器):经 SANDBOX_SERVER_URL 直连
+#
+# 用法:cd deploy && bash deploy.sh(或 cp .env.production.example .env.production 后 docker compose up -d)
+name: agentpair
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    image: agentpair-backend:latest
+    env_file:
+      - .env.production
+    volumes:
+      # 日志持久化(出题链路 practice_generate.log / perf.log / acp/)
+      - backend_logs:/app/backend/logs
+      # 用户上传的 skill(不挂卷则容器重建后丢失)
+      - user_skills:/app/backend/user_skills
+      # 本地克隆目录(local 模式备用,生产 sandbox 模式几乎不写)
+      - backend_repos:/app/backend/_repos
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    networks:
+      - appnet
+    # 后端不对外暴露端口,全部经 nginx 反代
+    # 如需直连排查可临时加:ports: ["8000:8000"]
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+      args:
+        # VITE_* 为构建期变量,由 deploy.sh source .env.production 后注入
+        VITE_GITHUB_OAUTH_CLIENT_ID: ${VITE_GITHUB_OAUTH_CLIENT_ID:-}
+        VITE_GITHUB_OAUTH_REDIRECT_URI: ${VITE_GITHUB_OAUTH_REDIRECT_URI:-}
+        VITE_GITEE_OAUTH_CLIENT_ID: ${VITE_GITEE_OAUTH_CLIENT_ID:-}
+        VITE_GITEE_OAUTH_REDIRECT_URI: ${VITE_GITEE_OAUTH_REDIRECT_URI:-}
+    image: agentpair-frontend:latest
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - appnet
+
+volumes:
+  backend_logs:
+  user_skills:
+  backend_repos:
+
+networks:
+  appnet:
+    driver: bridge

@@ -1,0 +1,5149 @@
+<script setup lang="ts">
+/**
+ * 任务详情页
+ *
+ * 布局区域:
+ * 1. 主区协作对话流:按 round_idx 分组,展示 agent2 与 agent1 的来回
+ * 2. 右侧栏:覆盖度看板 / 结果清单(默认折叠,分组由 task.params._grouping 驱动)/
+ *    检查点评估聚合(含检查点思考链,点击定位对话流) / 任务概览 / 动态验证配置
+ *
+ * 实时更新:SSE 接收每条对话/状态变更 + thinking_delta(流式 token 增量)。
+ * 初始加载 GET /tasks/{id} 拿快照(补历史),然后 SSE 接收增量。
+ *
+ * 覆盖度看板:从 task.checklist 读取维度(agent2 第 0 轮动态生成,
+ * 用户可通过 ChecklistReviewDialog 编辑确认),不再从场景声明。
+ *
+ * 流式思考显示(thinking_delta):
+ * - 一次 LLM 调用对应一个 conv_id,前端按 conv_id 累积 reasoning + content
+ * - 流式期间以"流式思考卡片"显示打字机效果
+ * - source=checkpoint 的检查点思考链不进主对话流,路由到右侧栏检查点聚合区
+ * - 思考链同时以 type=thinking 落库(agent1 / agent2),
+ *   刷新页面后从 GET /tasks/{id} 还原为只读流式卡片
+ */
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { jsonrepair } from 'jsonrepair'
+
+import AppHeader from '@/components/AppHeader.vue'
+import ChecklistReviewDialog from '@/components/ChecklistReviewDialog.vue'
+import ConversationMessage from '@/components/ConversationMessage.vue'
+import PracticeGenerateDialog from '@/components/PracticeGenerateDialog.vue'
+import QuestionDialog from '@/components/QuestionDialog.vue'
+import UserMessageInput from '@/components/UserMessageInput.vue'
+import TaskRuntimeSettings from '@/components/TaskRuntimeSettings.vue'
+import CommandConfirmDialog from '@/components/CommandConfirmDialog.vue'
+import VerifyActionDialog from '@/components/VerifyActionDialog.vue'
+import WorkspaceSidebar from '@/components/WorkspaceSidebar.vue'
+import WorkspaceToggleButton from '@/components/WorkspaceToggleButton.vue'
+import {
+  cancelInterrupt,
+  downloadTaskReportMarkdown,
+  getPendingChecklist,
+  getPendingInterrupt,
+  getPendingQuestion,
+  getPendingVerifyAction,
+  getPendingCommandConfirm,
+  getTask,
+  getTaskCoverage,
+  getTaskReportHtml,
+  pauseTask,
+  resumeTask,
+  retryTask,
+  skipPreClone,
+  submitTaskAnswer,
+  submitTaskChecklist,
+  submitVerifyAction,
+  submitCommandConfirm,
+  updateTaskVerifierConfig,
+} from '@/api/task'
+import { subscribeTaskStream } from '@/api/stream'
+import { listDrafts, listGenerateJobs, getTaskGenerateModel } from '@/api/practice'
+import { ensureFeaturesLoaded, practiceEnabled } from '@/composables/useFeatures'
+import { listArtifacts } from '@/api/taskArtifacts'
+import { clientLog } from '@/utils/clientLog'
+import { extractErrorMessage } from '@/utils/error'
+import { parseDiffFileSegments } from '@/utils/diffFiles'
+import { renderMarkdown } from '@/utils/markdown'
+import { buildToolSegments, buildToolSummary, parseAgentTrace, toolFileTargetOf } from '@/utils/toolSummary'
+import type {
+  AgentCheckpointEventData,
+  AnswerItem,
+  ChecklistDimension,
+  ClarificationQuestion,
+  CloneProgressEventData,
+  Conversation,
+  PlanStep,
+  QuestionEventData,
+  ChecklistReviewEventData,
+  SendMessageResponse,
+  TaskCoverage,
+  TaskDetail,
+  TaskResult,
+  TaskStatus,
+  ThinkingDeltaEventData,
+  VerifyActionEventData,
+  CommandConfirmEventData,
+} from '@/types/task'
+import type { TaskArtifact } from '@/types/taskArtifact'
+import type { GenerateJobSummary, GenerateModelInfo } from '@/types/practice'
+
+const route = useRoute()
+const router = useRouter()
+
+const task = ref<TaskDetail | null>(null)
+const loading = ref(true)
+const error = ref('')
+let eventSource: EventSource | null = null
+/** 刚发起 resume/retry 的窗口标志:onDone 触发时校验是否竞态误推用 */
+const resumingRef = ref(false)
+/** 组件已卸载标志(onDone 异步窗口内防止泄漏新 SSE 连接) */
+let unmountedFlag = false
+/** 对话流容器引用,用于自动滚动到底部 */
+const conversationRef = ref<HTMLElement | null>(null)
+/** 自动跟随底部开关:用户手动上滚时暂停,滚回底部附近自动恢复
+ *  (参考 PracticeGenerateSidebar 的 followBottom 模式;流式期间高频
+ *  thinking_delta 不再无条件覆盖用户的滚动位置) */
+const followBottom = ref(true)
+
+/** 工作区侧栏是否折叠(默认折叠,完全隐藏) */
+const workspaceCollapsed = ref(true)
+
+/** 任务详情侧栏是否折叠(右侧栏,默认展开;折叠时完全隐藏,主区聚焦对话) */
+const detailCollapsed = ref(false)
+
+function toggleWorkspace(): void {
+  workspaceCollapsed.value = !workspaceCollapsed.value
+}
+
+function toggleDetail(): void {
+  detailCollapsed.value = !detailCollapsed.value
+}
+
+// ---- 工作区变更(任务完成时捕获的 git diff patch) ----
+
+/** 任务的工作区 diff 产物(任务完成时由后端捕获,kind="git_diff") */
+const workspaceArtifact = ref<TaskArtifact | null>(null)
+/** 仓库树快照产物(clone 时保底/任务结束时捕获,kind="repo_tree";无变更时的侧栏兜底) */
+const repoTreeArtifact = ref<TaskArtifact | null>(null)
+/** 工作区变更区折叠状态(默认展开) */
+const workspaceChangesCollapsed = ref(false)
+
+/** diff 产物元信息(从 metadata_ 解析,缺省 0/false) */
+const artifactMeta = computed(() => {
+  const m = workspaceArtifact.value?.metadata_
+  return {
+    files_changed: Number(m?.files_changed ?? 0),
+    char_count: Number(m?.char_count ?? 0),
+    truncated: Boolean(m?.truncated ?? false),
+  }
+})
+
+/** patch 文本按行拆分(供模板逐行着色,文本插值自动转义,无 XSS 风险) */
+const diffLines = computed<string[]>(() => {
+  const c = workspaceArtifact.value?.content ?? ''
+  return c ? c.split('\n') : []
+})
+
+/** 按行首字符判定 diff 行类型(纯 CSS 着色) */
+function diffLineClass(line: string): string {
+  if (line.startsWith('+++') || line.startsWith('---')) return 'diff-line-meta'
+  if (line.startsWith('@@')) return 'diff-line-hunk'
+  if (line.startsWith('+')) return 'diff-line-add'
+  if (line.startsWith('-')) return 'diff-line-del'
+  return 'diff-line-ctx'
+}
+
+/** 按文件块解析 diff(路径 + 起始行号),供变更文件列表与点击跳转锚点使用 */
+const diffSegments = computed(() => parseDiffFileSegments(diffLines.value))
+
+/** 变更文件清单(按出现顺序去重);工作区不可用时传给侧栏兜底展示 */
+const changedFiles = computed(() => {
+  const seen = new Set<string>()
+  const files: string[] = []
+  for (const seg of diffSegments.value) {
+    if (!seen.has(seg.path)) {
+      seen.add(seg.path)
+      files.push(seg.path)
+    }
+  }
+  return files
+})
+
+/** 仓库文件清单(repo_tree 快照,逐行路径);无变更文件时传给侧栏二级兜底 */
+const repoFiles = computed(() =>
+  (repoTreeArtifact.value?.content ?? '')
+    .split('\n')
+    .filter((p) => p.trim()),
+)
+
+/** diff 行号 → 锚点 id 映射(仅每个文件块起始行有锚点) */
+const diffAnchorByLine = computed(() => {
+  const m = new Map<number, string>()
+  diffSegments.value.forEach((seg, i) => m.set(seg.lineIndex, `diff-file-${i}`))
+  return m
+})
+
+/** 侧栏变更文件点击:展开"工作区变更"并滚动到对应文件的 diff 块 */
+async function scrollToDiffFile(path: string): Promise<void> {
+  const idx = diffSegments.value.findIndex((s) => s.path === path)
+  if (idx < 0) return
+  workspaceChangesCollapsed.value = false
+  await nextTick()
+  document
+    .getElementById(`diff-file-${idx}`)
+    ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+/** 拉取任务的工作区产物(git_diff + repo_tree);静默失败,不影响主流程 */
+async function loadArtifact(taskId: string): Promise<void> {
+  try {
+    const res = await listArtifacts(taskId)
+    workspaceArtifact.value =
+      res.artifacts.find((a) => a.kind === 'git_diff') ?? null
+    repoTreeArtifact.value =
+      res.artifacts.find((a) => a.kind === 'repo_tree') ?? null
+  } catch (err) {
+    console.warn('加载工作区产物失败:', err)
+    workspaceArtifact.value = null
+    repoTreeArtifact.value = null
+  }
+}
+
+// ---- 流式思考项(thinking_delta 累积)----
+// key: conv_id, value: 流式思考项状态
+interface StreamingItem {
+  conv_id: string
+  round_idx: number
+  role: 'agent1' | 'agent2'
+  iteration?: number
+  reasoning: string
+  content: string
+  status: 'streaming' | 'done' | 'error'
+  started_at: string
+  finished_at?: string
+  /** reasoning 是否展开(默认折叠,流式期间自动展开,完成后折叠) */
+  reasoning_expanded: boolean
+  /** 全局递增序号(流式项到达顺序,用于调试) */
+  seq: number
+  /** 该流式 thinking 开始时,其所在 round 已收到的正式对话数(用于计算插入位置) */
+  insertSeq: number
+  /** 是否为动态验证的思考流(verifier_agent 产生,显示"正在验证"而非"正在思考") */
+  verify?: boolean
+  /** 思考流来源:'checkpoint' → 检查点思考链,路由到右侧栏检查点聚合区,不进主对话流 */
+  source?: 'checkpoint'
+}
+
+const streamingItems = reactive<Map<string, StreamingItem>>(new Map())
+/**
+ * 历史回放思考项的展开状态
+ * key: conv_id(形如 history:${c.id});value: 是否展开
+ *
+ * 历史思考项在 roundGroups computed 里每次重算都会新建 streamingItem 对象,
+ * 状态无法持久,且其 conv_id 未注册进 streamingItems,故 toggleReasoning 找不到。
+ * 这里用独立 Map 持久化展开状态,computed 读取它,toggle 时修改它触发重算。
+ */
+const historyReasoningExpanded = reactive<Map<string, boolean>>(new Map())
+/** 全局序号计数器:流式项到达顺序 */
+let streamingSeqCounter = 0
+/** 每 round 已收到的正式对话数(用于给 streamingItem 计算插入位置 seq) */
+const convCountPerRound = reactive<Map<number, number>>(new Map())
+
+// ---- 计划清单(plan 事件 + 历史回放)----
+// key: round_idx,value: 该 round 最新一次的 plan 步骤列表(覆盖式更新)
+const planPerRound = reactive<Map<number, PlanStep[]>>(new Map())
+
+// ---- agent2 检查点评估结果(agent_checkpoint 事件)----
+// key: `${round_idx}:${iteration}`,value: 检查点评估结构化数据
+// 后端在检查点评估时同时推 agent_checkpoint 事件 + conversation 事件,
+// conversation 事件已由 onConversation 回调接收并渲染为 agent2 evaluation 卡片,
+// 这里存储 agent_checkpoint 的结构化字段(interrupt/reason/query)供将来扩展可视化。
+const checkpointsPerRound = reactive<Map<string, AgentCheckpointEventData>>(new Map())
+
+// ---- 待生效检查点打断(CLI 执行器:入队后到注入前可取消) ----
+// 后端检查点评估 interrupt=true 时推 agent_checkpoint 事件,此时打断已入队但
+// 未注入(要等当前 prompt 结束),窗口内用户可点右侧栏检查点条目上的
+// "取消打断"按钮;注入后([检查点中断] conversation 事件到达)或取消后窗口关闭。
+// 主对话流仅在打断真正注入后才展示追问指令卡片。
+interface PendingInterruptState {
+  round_idx: number
+  iteration: number | null
+  reason: string
+  query: string | null
+  /** pending=待生效(可取消);cancelling=取消请求已发出;cancelled=已取消 */
+  state: 'pending' | 'cancelling' | 'cancelled'
+}
+const pendingInterrupt = ref<PendingInterruptState | null>(null)
+
+/** 仅 CLI 执行器有可取消窗口(内置执行器打断在迭代边界即时注入) */
+const isCliExecutor = computed(
+  () => !!task.value?.executor && task.value.executor !== 'builtin',
+)
+
+/** 刷新页面后恢复待生效打断卡片(后端 in-memory 队列未 drain 才有) */
+async function restorePendingInterrupt(taskId: string): Promise<void> {
+  if (!isCliExecutor.value) return
+  try {
+    const p = await getPendingInterrupt(taskId)
+    if (p) {
+      pendingInterrupt.value = { ...p, state: 'pending' }
+      // 展开右侧栏,保证取消按钮可见
+      detailCollapsed.value = false
+    }
+  } catch {
+    // 无待生效打断或任务已结束,静默忽略
+  }
+}
+
+/** 用户点击取消打断;竞态输给注入时后端返回 cancelled=false */
+async function handleCancelInterrupt(): Promise<void> {
+  const p = pendingInterrupt.value
+  if (!task.value?.id || !p || p.state !== 'pending') return
+  p.state = 'cancelling'
+  try {
+    const res = await cancelInterrupt(String(task.value.id))
+    if (res.cancelled) {
+      p.state = 'cancelled'
+    } else {
+      // 打断已注入生效:正式 [检查点中断] 卡片会随 conversation 事件展示,清掉 pending 卡片
+      pendingInterrupt.value = null
+    }
+  } catch (err) {
+    p.state = 'pending'
+    error.value = extractErrorMessage(err)
+  }
+}
+
+// ---- 用户澄清提问弹窗(阶段 8)----
+// agent2 在第 0 轮评估时若 ask_user=true,后端推送 question 事件,
+// 前端弹出 QuestionDialog 让用户填答。刷新页面后通过 getPendingQuestion 恢复。
+const questionOpen = ref(false)
+const questionData = reactive<{
+  questions: ClarificationQuestion[]
+  reasoning: string
+  askRound: number
+}>({
+  questions: [],
+  reasoning: '',
+  askRound: 0,
+})
+const submittingAnswer = ref(false)
+
+/** 从 PendingQuestion / QuestionEventData 填充弹窗数据并打开 */
+function openQuestionDialog(payload: {
+  questions: ClarificationQuestion[]
+  reasoning?: string
+  ask_round?: number
+}): void {
+  questionData.questions = payload.questions ?? []
+  questionData.reasoning = payload.reasoning ?? ''
+  questionData.askRound = payload.ask_round ?? 0
+  questionOpen.value = true
+}
+
+/** 用户提交答案:调 API,成功后关闭弹窗 */
+async function handleSubmitAnswer(answers: AnswerItem[]): Promise<void> {
+  if (!task.value?.id || submittingAnswer.value) return
+  submittingAnswer.value = true
+  try {
+    const resp = await submitTaskAnswer(String(task.value.id), { answers })
+    if (resp.accepted) {
+      questionOpen.value = false
+    } else {
+      error.value = resp.message || '答案提交失败,任务可能已结束'
+    }
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+  } finally {
+    submittingAnswer.value = false
+  }
+}
+
+/** 用户取消提问弹窗(直接关闭,不提交) */
+function handleCancelQuestion(): void {
+  questionOpen.value = false
+}
+
+/** 刷新页面后恢复待回答问题弹窗(若后端有 pending question) */
+async function restorePendingQuestion(taskId: string): Promise<void> {
+  try {
+    const pending = await getPendingQuestion(taskId)
+    if (pending && pending.questions?.length) {
+      openQuestionDialog({
+        questions: pending.questions,
+        reasoning: pending.reasoning,
+        ask_round: pending.ask_round,
+      })
+    }
+  } catch {
+    // 无 pending question 或任务已结束,静默忽略
+  }
+}
+
+// ---- 覆盖度清单确认弹窗(checklist_review 事件)----
+// agent2 在第 0 轮动态生成覆盖度清单后推送 checklist_review 事件,
+// 前端弹出 ChecklistReviewDialog 让用户编辑确认。刷新页面后通过
+// getPendingChecklist 恢复弹窗。
+const checklistOpen = ref(false)
+const checklistData = reactive<{
+  checklist: ChecklistDimension[]
+  reasoning: string
+}>({
+  checklist: [],
+  reasoning: '',
+})
+const submittingChecklist = ref(false)
+
+/** 从 ChecklistReviewEventData / 待确认清单 填充弹窗数据并打开 */
+function openChecklistDialog(payload: {
+  checklist: ChecklistDimension[]
+  reasoning?: string
+}): void {
+  checklistData.checklist = payload.checklist ?? []
+  checklistData.reasoning = payload.reasoning ?? ''
+  checklistOpen.value = true
+}
+
+/** 用户提交清单:null=直接采用,数组=用户编辑后的清单 */
+async function handleSubmitChecklist(
+  checklist: ChecklistDimension[] | null,
+): Promise<void> {
+  if (!task.value?.id || submittingChecklist.value) return
+  submittingChecklist.value = true
+  try {
+    const resp = await submitTaskChecklist(String(task.value.id), checklist)
+    if (resp.accepted) {
+      checklistOpen.value = false
+    } else {
+      error.value = resp.message || '清单提交失败,任务可能已结束'
+    }
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+  } finally {
+    submittingChecklist.value = false
+  }
+}
+
+/** 用户取消清单弹窗(直接关闭,不提交) */
+function handleCancelChecklist(): void {
+  checklistOpen.value = false
+}
+
+/** 刷新页面后恢复待确认清单弹窗(若后端有 pending checklist) */
+async function restorePendingChecklist(taskId: string): Promise<void> {
+  try {
+    const pending = await getPendingChecklist(taskId)
+    if (pending && pending.length > 0) {
+      openChecklistDialog({ checklist: pending })
+    }
+  } catch {
+    // 无 pending checklist 或任务已结束,静默忽略
+  }
+}
+
+// ---- 验证动作授权弹窗(verify_action 事件)----
+// verifier_agent 在 per_action 模式下,每次执行 http_request / run_python_code 前
+// 推送 verify_action 事件,前端弹出 VerifyActionDialog 让用户确认/拒绝。
+// 对用户透明:不出现 verifier_agent 字样,只显示"验证动作需要授权"。
+const verifyActionOpen = ref(false)
+const verifyActionData = ref<VerifyActionEventData | null>(null)
+const submittingVerifyAction = ref(false)
+
+// ---- 危险命令确认弹窗(command_confirm 事件)----
+// local 模式下,LLM 调 run_command 执行的危险命令(如 rm -rf /)会推送
+// command_confirm 事件,前端弹出 CommandConfirmDialog 让用户确认/拒绝。
+const commandConfirmData = ref<CommandConfirmEventData | null>(null)
+const submittingCommandConfirm = ref(false)
+
+// ---- 仓库克隆进度(clone_progress 事件)----
+// local 模式下后端用 Popen 流式读 git clone 的 stderr,解析百分比后推送。
+// 克隆完成(后端推 status 切换 current_stage)或任务结束时清除。
+const cloneProgress = ref<CloneProgressEventData | null>(null)
+
+// 跳过预克隆:克隆阶段用户不想等时,请求后端终止 clone 并降级为自主克隆
+const skipClonePending = ref(false)
+
+/** 是否处于预克隆阶段(协议回退间隙无进度事件时也显示跳过按钮) */
+const isPreCloning = computed(
+  () =>
+    !!cloneProgress.value ||
+    (task.value?.current_stage || '').includes('正在克隆仓库'),
+)
+
+async function handleSkipPreClone(): Promise<void> {
+  if (!task.value?.id || skipClonePending.value) return
+  skipClonePending.value = true
+  try {
+    await skipPreClone(String(task.value.id))
+    // 阶段切换由 SSE status 事件驱动(后端降级后推新 stage),不本地改写
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+    skipClonePending.value = false
+  }
+}
+
+/** 从 VerifyActionEventData 填充弹窗数据并打开 */
+function openVerifyActionDialog(action: VerifyActionEventData): void {
+  verifyActionData.value = action
+  verifyActionOpen.value = true
+}
+
+/** 用户同意执行验证动作 */
+async function handleApproveVerifyAction(actionId: string): Promise<void> {
+  if (!task.value?.id || submittingVerifyAction.value) return
+  submittingVerifyAction.value = true
+  try {
+    const resp = await submitVerifyAction(String(task.value.id), {
+      action_id: actionId,
+      approved: true,
+    })
+    if (resp.accepted) {
+      verifyActionOpen.value = false
+      verifyActionData.value = null
+    } else {
+      error.value = resp.message || '授权提交失败,任务可能已结束'
+    }
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+  } finally {
+    submittingVerifyAction.value = false
+  }
+}
+
+/** 用户拒绝执行验证动作 */
+async function handleRejectVerifyAction(actionId: string): Promise<void> {
+  if (!task.value?.id || submittingVerifyAction.value) return
+  submittingVerifyAction.value = true
+  try {
+    const resp = await submitVerifyAction(String(task.value.id), {
+      action_id: actionId,
+      approved: false,
+    })
+    if (resp.accepted) {
+      verifyActionOpen.value = false
+      verifyActionData.value = null
+    } else {
+      error.value = resp.message || '授权提交失败,任务可能已结束'
+    }
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+  } finally {
+    submittingVerifyAction.value = false
+  }
+}
+
+/** 刷新页面后恢复待授权验证动作弹窗(若后端有 pending verify action) */
+async function restorePendingVerifyAction(taskId: string): Promise<void> {
+  try {
+    const pending = await getPendingVerifyAction(taskId)
+    if (pending && pending.action_id) {
+      openVerifyActionDialog(pending)
+    }
+  } catch {
+    // 无 pending verify action 或任务已结束,静默忽略
+  }
+}
+
+/** 用户同意执行危险命令 */
+async function handleApproveCommand(commandId: string) {
+  if (!task.value || submittingCommandConfirm.value) return
+  submittingCommandConfirm.value = true
+  try {
+    await submitCommandConfirm(task.value.id, { command_id: commandId, approved: true })
+    commandConfirmData.value = null
+  } catch (e) {
+    console.error('同意命令确认失败:', e)
+  } finally {
+    submittingCommandConfirm.value = false
+  }
+}
+
+/** 用户拒绝执行危险命令 */
+async function handleRejectCommand(commandId: string) {
+  if (!task.value || submittingCommandConfirm.value) return
+  submittingCommandConfirm.value = true
+  try {
+    await submitCommandConfirm(task.value.id, { command_id: commandId, approved: false })
+    commandConfirmData.value = null
+  } catch (e) {
+    console.error('拒绝命令确认失败:', e)
+  } finally {
+    submittingCommandConfirm.value = false
+  }
+}
+
+/** 恢复危险命令确认弹窗(页面刷新后,若后端有 pending command confirm) */
+async function restorePendingCommandConfirm(taskId: string): Promise<void> {
+  try {
+    const pendingCmd = await getPendingCommandConfirm(taskId)
+    if (pendingCmd) {
+      commandConfirmData.value = pendingCmd
+    }
+  } catch (e) {
+    console.error('获取待确认命令失败:', e)
+  }
+}
+
+// ---- 运行时验证配置切换(任务运行界面调整授权模式) ----
+const verifierConfigSaving = ref(false)
+
+/** 切换验证授权模式(direct ↔ per_action),立即保存到后端 */
+async function toggleVerifierAuthMode(): Promise<void> {
+  if (!task.value?.id || verifierConfigSaving.value) return
+  const newMode = task.value.verifier_auth_mode === 'direct' ? 'per_action' : 'direct'
+  verifierConfigSaving.value = true
+  try {
+    const updated = await updateTaskVerifierConfig(String(task.value.id), {
+      verifier_auth_mode: newMode,
+    })
+    task.value = updated
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+  } finally {
+    verifierConfigSaving.value = false
+  }
+}
+
+/** 切换验证开关,立即保存到后端 */
+async function toggleVerifierEnabled(): Promise<void> {
+  if (!task.value?.id || verifierConfigSaving.value) return
+  const newEnabled = !task.value.verifier_enabled
+  verifierConfigSaving.value = true
+  try {
+    const updated = await updateTaskVerifierConfig(String(task.value.id), {
+      verifier_enabled: newEnabled,
+    })
+    task.value = updated
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+  } finally {
+    verifierConfigSaving.value = false
+  }
+}
+
+/** 任务是否启用了动态验证 */
+const verifierActive = computed(
+  () => !!task.value?.verifier_enabled && !!task.value?.test_env_url,
+)
+
+/** 脱敏展示 token 值(只显示前 8 + 后 4 字符,中间用 *** 代替) */
+function maskTokenValue(value: string): string {
+  if (!value) return ''
+  if (value.length <= 12) return '***'
+  return value.slice(0, 8) + '***' + value.slice(-4)
+}
+
+// ---- 加载 + SSE 订阅 ----
+
+async function initTask(): Promise<void> {
+  const taskId = route.params.id as string
+  try {
+    // 拉任务快照(场景降级后不再需要单独拉 /scenarios:结果分组/meta
+    // 从 task.params._grouping 和 results 的 metadata keys 推断)
+    const taskData = await getTask(taskId)
+    task.value = taskData
+    error.value = ''
+    loading.value = false
+    // 初始加载完成:强制置底并重置跟随开关(语义上的"应跳转"时机)
+    forceScrollToBottom()
+    // [诊断] 任务快照拉取:记录后端返回的状态(与前端显示对拍)
+    clientLog(taskId, 'task_fetch', {
+      status: taskData.status,
+      error_message: taskData.error_message,
+      current_stage: taskData.current_stage,
+    })
+
+    // 从历史对话提取 plan(刷新页面/迟到订阅者回放)
+    // agent1 的 type=thinking content 里可能含 <plan>...</plan>,
+    // 每个 round 取最后一次出现的 plan(可能被后续思考更新过状态)
+    extractPlanFromHistory(taskData.conversations)
+
+    // 恢复 convCountPerRound(按 round 统计历史对话数,含 thinking,跳过 user question)
+    // 必须和 roundGroups 里 localIdx 的基准一致:localIdx 跳过 user question,
+    // 这里也跳过,否则刷新后新 thinking 的 insertSeq 偏大,seq 排到 tool_call 之前
+    convCountPerRound.clear()
+    for (const c of taskData.conversations) {
+      if (c.role === 'user' && c.type === 'question') continue
+      convCountPerRound.set(
+        c.round_idx,
+        (convCountPerRound.get(c.round_idx) ?? 0) + 1,
+      )
+    }
+
+    // 2. 若任务仍在进行(含暂停态),连接 SSE 接收实时事件
+    if (task.value && (task.value.status === 'pending' || task.value.status === 'running' || task.value.status === 'paused')) {
+      connectSSE(taskId)
+      // 恢复可能存在的待回答问题弹窗(刷新页面 / 迟到订阅者场景)
+      // 后端 agent2 可能已发出 ask_user,但 SSE 事件在连接前已错过,
+      // 通过 GET /pending_question 拉取当前待回答问题
+      void restorePendingQuestion(taskId)
+      // 恢复可能存在的待确认清单弹窗(同理,SSE 事件可能已错过)
+      void restorePendingChecklist(taskId)
+      // 恢复可能存在的待授权验证动作弹窗(per_action 模式刷新页面后)
+      void restorePendingVerifyAction(taskId)
+      // 恢复可能存在的待确认危险命令弹窗(local 模式刷新页面后)
+      void restorePendingCommandConfirm(taskId)
+      // 恢复可能存在的待生效检查点打断(CLI 执行器,中断队列未 drain 时)
+      void restorePendingInterrupt(taskId)
+    }
+
+    // 3. 加载覆盖度看板(task.checklist 存在才拉取)
+    void loadCoverage()
+    // 4. 加载工作区变更(任务完成时捕获的 diff;进行中任务此时为空,完成时由 SSE done 触发重拉)
+    void loadArtifact(taskId)
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+    loading.value = false
+  }
+}
+
+// ---- 覆盖度看板(仅当 task.checklist 存在时启用) ----
+
+const coverageData = ref<TaskCoverage | null>(null)
+
+/**
+ * 拉取覆盖度数据;task.checklist 不存在或任务无 evaluation 时静默置空。
+ *
+ * 场景降级后,覆盖度维度从 task.checklist 读取(由 agent2 第 0 轮动态生成),
+ * 不再从场景声明 coverage 读取。
+ */
+async function loadCoverage(): Promise<void> {
+  if (!task.value?.id || !task.value.checklist?.length) return
+  try {
+    coverageData.value = await getTaskCoverage(String(task.value.id))
+  } catch {
+    coverageData.value = null
+  }
+}
+
+// ---- 报告导出(Markdown 下载 / PDF 打印) ----
+
+const exporting = ref(false)
+
+/** 导出 Markdown:下载 .md 文件 */
+async function exportMarkdown(): Promise<void> {
+  if (!task.value?.id || exporting.value) return
+  exporting.value = true
+  try {
+    const blob = await downloadTaskReportMarkdown(String(task.value.id))
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `task-${task.value.id}.md`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+  } finally {
+    exporting.value = false
+  }
+}
+
+/** 导出 PDF:获取 HTML 报告,新窗口渲染并调起打印 */
+async function exportPdf(): Promise<void> {
+  if (!task.value?.id || exporting.value) return
+  exporting.value = true
+  try {
+    const html = await getTaskReportHtml(String(task.value.id))
+    const w = window.open('', '_blank')
+    if (!w) {
+      error.value = '无法打开新窗口,请检查浏览器弹窗拦截设置'
+      return
+    }
+    w.document.write(html)
+    w.document.close()
+    w.focus()
+    // 等待渲染后调起打印对话框(用户可选"另存为 PDF")
+    setTimeout(() => w.print(), 400)
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+  } finally {
+    exporting.value = false
+  }
+}
+
+function connectSSE(taskId: string): void {
+  // 关闭旧连接
+  if (eventSource) eventSource.close()
+
+  eventSource = subscribeTaskStream(taskId, {
+    onConnected: (data) => {
+      // 更新状态(可能任务已结束)
+      if (task.value) {
+        task.value.status = data.status
+        task.value.current_stage = data.current_stage
+      }
+    },
+    onConversation: (data) => {
+      if (!task.value) return
+      // 追加到对话列表
+      // 注意:agent1 的 type=thinking 不走 SSE 推送(已在流式卡片展示),
+      // 这里收到的都是其他类型(工具调用/结果/提交/用户指令/agent2 评估等)
+      const conv: Conversation = {
+        id: data.id,
+        round_idx: data.round_idx,
+        role: data.role,
+        type: data.type,
+        content: data.content,
+        reasoning: data.reasoning ?? null,
+        tool_call_id: data.tool_call_id ?? null,
+        created_at: data.created_at || new Date().toISOString(),
+      }
+      task.value.conversations.push(conv)
+      // 维护该 round 的正式对话计数(供 streamingItem 计算插入位置 seq)
+      // 必须与 roundGroups 里 localIdx 的基准一致:localIdx 跳过 user question
+      // (user question 单独提到顶部 userDirective 渲染),这里也跳过,
+      // 否则每 round 多算 1,流式 thinking 的 insertSeq 偏大,seq 排到 tool_call 之后,
+      // 导致 thinking 不再是迭代起点,首个 tool_call 被甩进 plains(界面最底部)。
+      if (!(data.role === 'user' && data.type === 'question')) {
+        convCountPerRound.set(
+          data.round_idx,
+          (convCountPerRound.get(data.round_idx) ?? 0) + 1,
+        )
+      }
+      // 自动滚动到底部
+      nextTick(scrollToBottom)
+
+      // 检查点打断正式注入生效([检查点中断] 卡片接管展示)→ 清掉 pending 卡片
+      if (
+        data.role === 'agent2' &&
+        (data.content || '').startsWith('[检查点中断]')
+      ) {
+        pendingInterrupt.value = null
+      }
+
+      // agent2 评估产出 → 刷新覆盖度看板
+      if (data.role === 'agent2' && data.type === 'evaluation') {
+        void loadCoverage()
+      }
+    },
+    onConversationUpdate: (data) => {
+      if (!task.value) return
+      // 更新已有对话项的 content(如 Kimi 增量参数补全后刷新 tool_call 显示)
+      const conv = task.value.conversations.find((c) => c.id === data.id)
+      if (conv) {
+        conv.content = data.content
+      }
+    },
+    onStatus: (data) => {
+      if (task.value) {
+        task.value.status = data.status
+        task.value.current_stage = data.current_stage
+      }
+      // 阶段切换(如"正在读取仓库根目录结构...")意味着克隆已完成,清除进度条
+      cloneProgress.value = null
+      skipClonePending.value = false
+    },
+    onThinkingDelta: (data) => {
+      handleThinkingDelta(data)
+      nextTick(scrollToBottom)
+    },
+    onCloneProgress: (data) => {
+      cloneProgress.value = data
+      nextTick(scrollToBottom)
+    },
+    onPlan: (data) => {
+      // 覆盖式更新:每个 round 只保留最新一次 plan
+      planPerRound.set(data.round_idx, data.steps)
+      nextTick(scrollToBottom)
+    },
+    onQuestion: (data: QuestionEventData) => {
+      // agent2 请求用户澄清:弹出 QuestionDialog
+      openQuestionDialog({
+        questions: data.questions,
+        reasoning: data.reasoning,
+        ask_round: data.ask_round,
+      })
+    },
+    onChecklistReview: (data: ChecklistReviewEventData) => {
+      // agent2 动态生成覆盖度清单:弹出 ChecklistReviewDialog 让用户编辑确认
+      openChecklistDialog({
+        checklist: data.checklist,
+        reasoning: data.reasoning,
+      })
+    },
+    onVerifyAction: (data: VerifyActionEventData) => {
+      // 动态验证动作需要授权(per_action 模式):弹出 VerifyActionDialog
+      openVerifyActionDialog(data)
+    },
+    onCommandConfirm: (data) => {
+      commandConfirmData.value = data
+    },
+    onAgentCheckpoint: (data: AgentCheckpointEventData) => {
+      // agent2 检查点评估结果:存储结构化数据
+      // 后端同时推 conversation 事件(role=agent2, type=evaluation),
+      // 由 onConversation 回调渲染为对话卡片,这里只存储供将来扩展
+      checkpointsPerRound.set(`${data.round_idx}:${data.iteration}`, data)
+      if (data.interrupt) {
+        console.info(
+          `[检查点评估] 第${data.round_idx}轮迭代${data.iteration} 打断: ${data.reason}`,
+        )
+        // CLI 执行器:打断已入队但未注入,右侧栏检查点条目进入待生效态(带取消按钮);
+        // 主对话流不展示追问指令,要等打断真正注入后由 [检查点中断] 卡片展示
+        if (isCliExecutor.value) {
+          pendingInterrupt.value = {
+            round_idx: data.round_idx,
+            iteration: data.iteration,
+            reason: data.reason,
+            query: data.query,
+            state: 'pending',
+          }
+          // 展开右侧栏暴露取消按钮(pending 窗口有限,折叠态会错过)
+          detailCollapsed.value = false
+        }
+      }
+    },
+    onInterruptCancelled: (data) => {
+      // 后端确认取消成功(本端发起或其他端发起):侧栏条目切为已取消态
+      const p = pendingInterrupt.value
+      if (p && p.round_idx === data.round_idx) {
+        p.state = 'cancelled'
+      }
+    },
+    onDone: async () => {
+      // [诊断] done 事件处理:记录是否走了 resume 竞态校验分支
+      clientLog(taskId, 'view_on_done', { resuming: resumingRef.value })
+      // 竞态防御:completed 追问 / failed 重试后立即重连的 SSE,可能被后端
+      // 按旧快照(COMPLETED/FAILED)误推 done 关闭(后端已同步改 RUNNING +
+      // 事件总线双重防御,这里作前端兜底)。重新校验任务状态,若实际仍在
+      // 运行则重连 SSE 继续接收新一轮事件,不执行任务结束清理。
+      if (resumingRef.value) {
+        resumingRef.value = false
+        try {
+          const fresh = await getTask(taskId)
+          if (
+            fresh &&
+            (fresh.status === 'running' ||
+              fresh.status === 'paused' ||
+              fresh.status === 'pending')
+          ) {
+            if (unmountedFlag) return // 组件已卸载,不再重连(防止连接泄漏)
+            task.value = fresh
+            connectSSE(taskId)
+            return
+          }
+        } catch {
+          // 拉取失败走正常 done 流程(下方还会再拉一次)
+        }
+      }
+      // 任务完成:拉取最终结果(含 results)
+      try {
+        task.value = await getTask(taskId)
+        if (task.value) {
+          // 重新提取 plan(最终快照可能含最后一轮的 plan 更新)
+          extractPlanFromHistory(task.value.conversations)
+          // 恢复 convCountPerRound(最终快照含所有 thinking,跳过 user question,与 localIdx 对齐)
+          convCountPerRound.clear()
+          for (const c of task.value.conversations) {
+            if (c.role === 'user' && c.type === 'question') continue
+            convCountPerRound.set(
+              c.round_idx,
+              (convCountPerRound.get(c.round_idx) ?? 0) + 1,
+            )
+          }
+          // 清空流式卡片(已完成,由历史对话接管显示)
+          streamingItems.clear()
+        }
+      } catch (err) {
+        console.error('拉取最终结果失败:', err)
+      }
+      // 清除克隆进度条(任务结束)
+      cloneProgress.value = null
+      skipClonePending.value = false
+      // 任务结束,待生效打断不再有意义(队列已随任务结束清理)
+      pendingInterrupt.value = null
+      // 任务完成时后端刚写入工作区 diff,重拉一次展示(失败兜底,静默)
+      void loadArtifact(taskId)
+    },
+    onError: async (data) => {
+      // [诊断] 前端显示"失败"的唯一入口:记录触发时本地状态,
+      // 与后端 client.log / 事件总线日志对拍定位"未知失败"
+      clientLog(taskId, 'view_on_error', {
+        local_status: task.value?.status,
+        error_message: data.error_message,
+        resuming: resumingRef.value,
+      })
+      // 退出 resume 窗口(任务真实失败,不再需要竞态校验)
+      resumingRef.value = false
+      if (task.value) {
+        task.value.status = 'failed'
+        task.value.error_message = data.error_message || '执行失败'
+      }
+      // 清除克隆进度条(任务失败)
+      cloneProgress.value = null
+      skipClonePending.value = false
+      pendingInterrupt.value = null
+    },
+  })
+}
+
+// ---- 流式增量处理 ----
+
+function handleThinkingDelta(data: ThinkingDeltaEventData): void {
+  const { conv_id, round_idx, role, phase, delta, iteration, verify, source } = data
+
+  if (phase === 'start') {
+    // 创建新的流式项:reasoning 默认折叠(用户可手动展开查看思考链)
+    // 记录该 round 当前已收到的正式对话数,用于后续 seq 计算(让 thinking 排在
+    // 它之后的 tool_call 之前,而非所有 thinking 都挤在最前面)
+    const insertSeq = convCountPerRound.get(round_idx) ?? 0
+    streamingItems.set(conv_id, {
+      conv_id,
+      round_idx,
+      role,
+      iteration,
+      reasoning: '',
+      content: '',
+      status: 'streaming',
+      started_at: new Date().toISOString(),
+      reasoning_expanded: false,
+      seq: streamingSeqCounter++,
+      insertSeq,
+      verify,
+      source,
+    })
+    return
+  }
+
+  const item = streamingItems.get(conv_id)
+  if (!item) {
+    // 没收到 start 事件就来了 delta,创建一个
+    const insertSeq = convCountPerRound.get(round_idx) ?? 0
+    streamingItems.set(conv_id, {
+      conv_id,
+      round_idx,
+      role,
+      iteration,
+      reasoning: '',
+      content: '',
+      status: 'streaming',
+      started_at: new Date().toISOString(),
+      reasoning_expanded: false,
+      seq: streamingSeqCounter++,
+      insertSeq,
+      verify,
+      source,
+    })
+  }
+
+  const cur = streamingItems.get(conv_id)!
+  if (phase === 'reasoning') {
+    cur.reasoning += delta
+  } else if (phase === 'content') {
+    cur.content += delta
+  } else if (phase === 'error') {
+    cur.status = 'error'
+    cur.reasoning += `\n[错误] ${delta}`
+  } else if (phase === 'end') {
+    // 流式结束:标记完成,reasoning 自动折叠(只显示标题和字数提示)
+    // 不移除卡片:它是本次会话内唯一的实时展示载体;
+    // 刷新页面后由落库的 type=thinking 记录还原为只读卡片
+    cur.status = 'done'
+    cur.finished_at = new Date().toISOString()
+    cur.reasoning_expanded = false
+  }
+}
+
+/** 切换流式卡片 reasoning 的展开/折叠 */
+function toggleReasoning(convId: string): void {
+  // 实时流式项:状态存在 streamingItems 里
+  const item = streamingItems.get(convId)
+  if (item) {
+    item.reasoning_expanded = !item.reasoning_expanded
+    return
+  }
+  // 历史回放项:conv_id 形如 history:xxx,未注册进 streamingItems,
+  // 用独立 Map 持久化展开状态(修改后触发 roundGroups computed 重算)
+  const cur = historyReasoningExpanded.get(convId) ?? false
+  historyReasoningExpanded.set(convId, !cur)
+}
+
+// ---- plan 提取工具(与后端 _extract_plan 逻辑一致:优先 JSON 格式,回退逐行格式)----
+
+const PLAN_BLOCK_RE = /<plan>\s*([\s\S]*?)\s*<\/plan>/
+const PLAN_LINE_RE = /^\s*(?:\d+[.、)]\s*)?(?:\[([\w_]+)\]\s*)?(.+)$/
+/** 含文字字符(字母/数字/下划线/中文)才算有效步骤行,纯符号行("["、"]")跳过 */
+const PLAN_LINE_HAS_TEXT_RE = /[\w\u4e00-\u9fff]/
+
+/** 尝试把 plan 块按 JSON 解析(对象数组,或逐行多个对象),失败返回 null
+ *
+ * system prompt 示范的是 JSON 数组格式,模型照做时逐行解析会把整行 JSON
+ * 当成步骤文本;这里优先按 JSON 解析。容错:无包裹数组时补 [ ],
+ * 原生 JSON.parse 失败后用 jsonrepair 修复(尾逗号/截断/缺引号等,
+ * 与后端 json_repair 对齐)。
+ */
+function parsePlanJson(block: string): PlanStep[] | null {
+  const trimmed = block.trim()
+  if (!trimmed || (trimmed[0] !== '[' && trimmed[0] !== '{')) return null
+  const candidate = trimmed[0] === '[' ? trimmed : `[${trimmed}]`
+  let parsed: unknown = null
+  try {
+    parsed = JSON.parse(candidate)
+  } catch {
+    try {
+      parsed = JSON.parse(jsonrepair(candidate))
+    } catch {
+      return null
+    }
+  }
+  if (!Array.isArray(parsed)) return null
+  const steps: PlanStep[] = []
+  for (const e of parsed) {
+    if (!e || typeof e !== 'object') continue
+    const obj = e as Record<string, unknown>
+    const text = String(obj.text ?? obj.content ?? '').trim()
+    if (!text) continue
+    let status = String(obj.status ?? 'pending').trim() as PlanStep['status']
+    if (status !== 'pending' && status !== 'in_progress' && status !== 'done') {
+      status = 'pending'
+    }
+    steps.push({ id: steps.length + 1, text, status })
+  }
+  return steps.length > 0 ? steps : null
+}
+
+/** 从单段 content 提取 plan 步骤列表,无 plan 块返回 null */
+function parsePlanFromContent(content: string): PlanStep[] | null {
+  const m = content.match(PLAN_BLOCK_RE)
+  if (!m) return null
+  const block = m[1]
+  // 优先 JSON 解析(模型按 system prompt 示范输出 JSON 数组)
+  const jsonSteps = parsePlanJson(block)
+  if (jsonSteps) return jsonSteps
+  const steps: PlanStep[] = []
+  let id = 0
+  for (const line of block.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    if (!PLAN_LINE_HAS_TEXT_RE.test(trimmed)) continue
+    const lm = trimmed.match(PLAN_LINE_RE)
+    if (!lm) continue
+    id += 1
+    let status: PlanStep['status'] = (lm[1] as PlanStep['status']) || 'pending'
+    if (status !== 'pending' && status !== 'in_progress' && status !== 'done') {
+      status = 'pending'
+    }
+    steps.push({ id, text: lm[2].trim(), status })
+  }
+  return steps.length > 0 ? steps : null
+}
+
+/** 从 kimi code CLI 的 TodoList tool_call 提取计划清单
+ *
+ * 落库 content 格式为 intent 首行(`调用 TodoList [TodoList]`)+ 完整入参 JSON
+ * ({todos: [{title, status}]}),jsonrepair 容错解析。
+ * 查询/清空模式(无 todos/空数组)返回 null,保持最后已知计划。
+ */
+function parseTodoListToolCall(content: string): PlanStep[] | null {
+  const nl = content.indexOf('\n')
+  if (nl < 0) return null
+  if (!content.slice(0, nl).trimEnd().endsWith('[TodoList]')) return null
+  const detail = content.slice(nl + 1).trim()
+  if (!detail.startsWith('{') && !detail.startsWith('[')) return null
+  let parsed: unknown = null
+  try {
+    parsed = JSON.parse(detail)
+  } catch {
+    try {
+      parsed = JSON.parse(jsonrepair(detail))
+    } catch {
+      return null
+    }
+  }
+  const todos =
+    parsed && typeof parsed === 'object'
+      ? (parsed as Record<string, unknown>).todos
+      : null
+  if (!Array.isArray(todos) || todos.length === 0) return null
+  const steps: PlanStep[] = []
+  for (const t of todos) {
+    if (!t || typeof t !== 'object') continue
+    const obj = t as Record<string, unknown>
+    const text = String(obj.title ?? '').trim()
+    if (!text) continue
+    let statusStr = String(obj.status ?? 'pending').trim()
+    if (statusStr === 'completed') statusStr = 'done'
+    const status: PlanStep['status'] =
+      statusStr === 'pending' || statusStr === 'in_progress' || statusStr === 'done'
+        ? statusStr
+        : 'pending'
+    steps.push({ id: steps.length + 1, text, status })
+  }
+  return steps.length > 0 ? steps : null
+}
+
+/** 从历史对话提取 plan,每个 round 取最后一次出现的 plan(可能被更新过状态)
+ *
+ * 两个来源:
+ * - 内置 agent1:thinking content 里的 <plan> 块
+ * - kimi code CLI 等外部执行器:TodoList tool_call 落库的入参 JSON
+ */
+function extractPlanFromHistory(conversations: Conversation[]): void {
+  // 按 round 收集所有含 plan 的记录,保留每个 round 最后一次
+  const lastPlanPerRound = new Map<number, PlanStep[]>()
+  for (const c of conversations) {
+    if (c.role !== 'agent1' || !c.content) continue
+    let steps: PlanStep[] | null = null
+    if (c.type === 'thinking') {
+      steps = parsePlanFromContent(c.content)
+    } else if (c.type === 'tool_call') {
+      steps = parseTodoListToolCall(c.content)
+    }
+    if (steps) {
+      lastPlanPerRound.set(c.round_idx, steps)
+    }
+  }
+  for (const [roundIdx, steps] of lastPlanPerRound) {
+    planPerRound.set(roundIdx, steps)
+  }
+}
+
+/** 对话流滚动监听:用户离开底部 → 暂停跟随;滚回底部附近 → 恢复跟随。
+ * 程序化置底总是恰好停在底部,proximity 判断天然不会误判。 */
+function handleConversationScroll(): void {
+  const el = conversationRef.value
+  if (!el) return
+  followBottom.value = el.scrollTop + el.clientHeight >= el.scrollHeight - 12
+}
+
+/** 仅在跟随状态下置底(SSE 增量事件调用;用户上滚回看时不打扰) */
+function scrollToBottom(): void {
+  if (!followBottom.value) return
+  if (conversationRef.value) {
+    conversationRef.value.scrollTop = conversationRef.value.scrollHeight
+  }
+}
+
+/** 强制置底并重置跟随开关(初始加载/发送消息/重试等语义上的"应跳转"时机) */
+function forceScrollToBottom(): void {
+  followBottom.value = true
+  nextTick(() => {
+    if (conversationRef.value) {
+      conversationRef.value.scrollTop = conversationRef.value.scrollHeight
+    }
+  })
+}
+
+onMounted(initTask)
+onUnmounted(() => {
+  unmountedFlag = true
+  if (eventSource) eventSource.close()
+})
+
+/**
+ * 切换任务时清理旧任务状态(组件复用,route.params.id 变化)
+ */
+function resetTaskState(): void {
+  // 断开旧 SSE,避免向旧任务写数据
+  if (eventSource) {
+    eventSource.close()
+    eventSource = null
+  }
+  // 清空流式/计划/对话计数等运行态
+  streamingItems.clear()
+  planPerRound.clear()
+  convCountPerRound.clear()
+  checkpointsPerRound.clear()
+  historyReasoningExpanded.clear()
+  // 关闭提问弹窗
+  questionOpen.value = false
+  // 关闭清单确认弹窗
+  checklistOpen.value = false
+  // 重置 resume 窗口标志(防止跨任务误触发 onDone 校验)
+  resumingRef.value = false
+  // 重置任务视图态
+  task.value = null
+  coverageData.value = null
+  loading.value = true
+  error.value = ''
+}
+
+// 同一组件复用下,route.params.id 变化时重新加载任务
+watch(
+  () => route.params.id,
+  (newId, oldId) => {
+    if (!newId || newId === oldId) return
+    resetTaskState()
+    void initTask()
+  },
+)
+
+// ---- 对话流分组:按 round_idx → 按 plan step 分组迭代 → 再按迭代分段 ----
+//
+// 层级结构:
+//   round
+//     ├─ plain segment     (agent2 评估/追问/总结、user 指令等关键节点,平铺)
+//     └─ step group        (plan step,文字=step.text,内含多个迭代;无 plan 时回退为单个平铺组)
+//          └─ iteration segment (agent1 一次 ReAct 循环:thinking + N 个工具调用/结果)
+//
+// 迭代识别:遇到 agent1 的 thinking 项(实时流式或历史 type=thinking)就开新迭代,
+// 后续 agent1 的 tool_call/tool_result/submit 归入当前迭代,
+// 直到遇到下一个 thinking(开新迭代)或非 agent1 消息(关闭迭代,平铺该消息)。
+// 缺失 thinking 锚点时开无 thinking 的兜底迭代承接工具项,不退化为 plain 段。
+//
+// step 归属推断:用迭代内首个工具调用的工具名匹配 plan step 关键词
+// (复用后端 _TOOL_STEP_KEYWORDS 映射,与 plan 状态推进逻辑一致)
+//
+// 折叠策略:
+// - step 组:默认折叠(完成后)或展开(含流式中)。文字=step.text,唯一折叠单位。
+// - 迭代:不再单独折叠,内容在 step-body 内直接平铺(无摘要行、无边框包装)。
+// - 工具行:默认折叠(compact 单行 / agent、toolpair 卡片,按 tool_call id 记录展开)。
+
+interface DisplayItem {
+  /** 正式对话用 UUID,流式项用 `stream:${conv_id}` */
+  id: string
+  round_idx: number
+  created_at: string
+  /** 是否流式思考项 */
+  is_streaming: boolean
+  /** 稳定排序序号:正式对话用数组下标,流式项用全局计数器(避免跨来源 created_at 时钟漂移) */
+  seq: number
+  /** 正式对话字段 */
+  role?: string
+  type?: string
+  content?: string
+  /** 完整评估/思考链(如 agent2 evaluation),可折叠回看 */
+  reasoning?: string | null
+  /** 仅 type=tool_result 有:对应 tool_call 会话记录的 id(并行调用时精确配对) */
+  tool_call_id?: string | null
+  /** 流式项字段 */
+  streaming?: StreamingItem
+}
+
+/** 平铺段:agent2/user 等关键消息,直接渲染为单张卡片 */
+interface PlainSegment {
+  kind: 'plain'
+  item: DisplayItem
+  /** 平铺消息在该轮内的原始位置:位于第几个迭代之后(0 = 轮首,首个迭代之前;轮内无迭代时恒为 0) */
+  afterIterationIdx: number
+}
+
+/** 迭代段:agent1 一次 ReAct 循环的所有产物 */
+interface IterationSegment {
+  kind: 'iteration'
+  /** 迭代在 round 内的序号(从 1 开始) */
+  iterationIdx: number
+  /** 唯一标识:`${roundIdx}-${iterationIdx}` */
+  id: string
+  /** 该迭代的 thinking 项(流式或历史,通常 1 条;锚点缺失的兜底迭代可为空) */
+  thinkingItems: DisplayItem[]
+  /** 该迭代内的工具调用项(tool_call + tool_result),按时间顺序 */
+  toolItems: DisplayItem[]
+  /** 该迭代内的其他 agent1 项(submit 等) */
+  otherItems: DisplayItem[]
+  /** 是否包含正在流式中的项(自动展开用) */
+  hasStreaming: boolean
+}
+
+/** 检查点标记:agent2 迭代边界轻量评估,挂在对应迭代边界处。
+ * 两种来源,渲染方式不同:
+ * - 检查点评估([检查点评估):不渲染消息卡片,定位时浮现横线
+ * - 检查点中断([检查点中断):实际生效的中断追问,渲染为可见消息卡片 */
+interface CheckpointMarker {
+  /** 显示在哪次迭代的 iteration-block 之后(该迭代的 iterationIdx);0 = 首个迭代之前 */
+  afterIterationIdx: number
+  item: DisplayItem
+}
+
+/** plan step 分组:把归属同一 step 的迭代合并 */
+interface StepGroup {
+  kind: 'step'
+  /** step 唯一标识:`${roundIdx}-step-${stepId}` 或 `${roundIdx}-nostep` */
+  id: string
+  /** step 文字(无 plan 时为"执行过程") */
+  text: string
+  /** step 状态(无 plan 时为 in_progress) */
+  status: PlanStep['status'] | 'none'
+  /** 该 step 下的迭代列表 */
+  iterations: IterationSegment[]
+  /** 是否含流式中(任一迭代流式则为 true) */
+  hasStreaming: boolean
+  /** 该 step 内的检查点标记(渲染在对应迭代边界处) */
+  checkpoints: CheckpointMarker[]
+  /** 该 step 内的平铺消息(如用户追问/回答,位于组内迭代边界;含此消息的组默认展开) */
+  plains: PlainSegment[]
+}
+
+type RoundSegment = PlainSegment | StepGroup
+
+interface RoundGroup {
+  roundIdx: number
+  label: string
+  segments: RoundSegment[]
+  /** 该 round 的计划清单(复杂任务时 agent1 输出,空数组表示无 plan) */
+  planSteps: PlanStep[]
+}
+
+/** 用户手动展开过的 step 组 id */
+const expandedSteps = reactive<Set<string>>(new Set())
+/** 用户手动收起过的 step 组 id(优先级最高,覆盖“最后一组默认展开”) */
+const collapsedSteps = reactive<Set<string>>(new Set())
+/** 用户展开过的工具行(紧凑行轻量展开 / 子智能体卡片 / 普通工具卡片),存 tool_call id,
+ * 内部思考小卡用 `${callId}-think` 复合 key */
+const expandedToolRows = reactive<Set<string>>(new Set())
+
+/** 判断 DisplayItem 是否为 agent1 的 thinking(迭代起点) */
+function isReactThinkingItem(item: DisplayItem): boolean {
+  if (item.is_streaming) {
+    return item.streaming?.role === 'agent1'
+  }
+  return item.role === 'agent1' && item.type === 'thinking'
+}
+
+/** 判断 DisplayItem 是否属于 agent1(用于归入当前迭代) */
+function isReactAgentItem(item: DisplayItem): boolean {
+  if (item.is_streaming) return item.streaming?.role === 'agent1'
+  return item.role === 'agent1'
+}
+
+/** 判断 DisplayItem 是否正在流式 */
+function isStreamingActive(item: DisplayItem): boolean {
+  return !!(item.is_streaming && item.streaming?.status === 'streaming')
+}
+
+/** 工具名 → plan step 关键词映射(与后端 _TOOL_STEP_KEYWORDS 保持一致) */
+const TOOL_STEP_KEYWORDS: Record<string, string[]> = {
+  clone_repo:     ['克隆', 'clone', '仓库'],
+  list_files:     ['结构', '目录', '查看', 'list'],
+  read_file:      ['读取', '依赖', '清单', 'read'],
+  query_cve:      ['依赖', 'cve', '漏洞'],
+  list_dependencies: ['依赖', '清单', 'dependency', '锁文件', 'lockfile'],
+  search_code:    ['注入', '密钥', '反序列化', 'ssrf', '路径', '认证', '授权',
+                    '审计', '代码审计', 'search'],
+  run_semgrep:    ['semgrep', 'sast', '静态分析'],
+  run_lint:       ['lint', '风格', '规范', '静态检查', 'ruff', 'eslint'],
+  run_coverage:   ['覆盖率', '覆盖', '测试', 'coverage'],
+  git_diff:       ['diff', '变更', '增量', '改动', '对比'],
+  list_skills:    ['skill', '技能'],
+  skill:          ['skill', '技能'],
+  submit_results: ['提交', '汇总', 'submit'],
+}
+
+/** 从工具调用 content 提取工具名 */
+function extractToolNameFromContent(content: string): string {
+  // 新格式(向 qoder CLI 看齐):"人类可读意图 [tool_name]\n{参数JSON}"
+  // 匹配首行末尾的 [tool_name] 标签(首行是 intent,后续行是参数 JSON)
+  const firstLine = content.split('\n', 1)[0]
+  const m = firstLine.match(/\[(\w+)\]$/)
+  return m ? m[1] : ''
+}
+
+/** 推断迭代归属哪个 plan step,返回 step id(无匹配返回 null) */
+function inferStepFromIteration(
+  iter: IterationSegment,
+  planSteps: PlanStep[],
+): number | null {
+  if (!planSteps.length) return null
+  // 取迭代内首个 tool_call 的工具名
+  const firstToolCall = iter.toolItems.find(
+    (i) => !i.is_streaming && i.type === 'tool_call',
+  )
+  if (!firstToolCall) return null
+  const toolName = extractToolNameFromContent(firstToolCall.content || '')
+  if (!toolName) return null
+  const keywords = TOOL_STEP_KEYWORDS[toolName]
+  if (!keywords) return null
+
+  const kwLower = keywords.map((k) => k.toLowerCase())
+  // 先找 pending(进入新步骤),再找 in_progress(同步骤内)
+  for (const s of planSteps) {
+    if (s.status !== 'pending') continue
+    if (kwLower.some((k) => s.text.toLowerCase().includes(k))) return s.id
+  }
+  for (const s of planSteps) {
+    if (s.status !== 'in_progress') continue
+    if (kwLower.some((k) => s.text.toLowerCase().includes(k))) return s.id
+  }
+  return null
+}
+
+/** 把单个 round 内的 DisplayItem 列表先按迭代分段,再按 plan step 分组 */
+function segmentRoundItems(
+  roundIdx: number,
+  items: DisplayItem[],
+  planSteps: PlanStep[],
+): RoundSegment[] {
+  // 第一阶段:按 thinking 起点切迭代(原逻辑)
+  const iterations: IterationSegment[] = []
+  const plains: PlainSegment[] = []
+  /** 检查点评估/中断:发生在迭代边界,记录当时已完成的迭代数,
+   * 供第二阶段把横线(评估)/消息卡片(中断)挂到对应迭代边界 */
+  const checkpointMarkers: CheckpointMarker[] = []
+  let current: IterationSegment | null = null
+  let iterCounter = 0
+
+  const closeCurrent = () => {
+    if (current) {
+      iterations.push(current)
+      current = null
+    }
+  }
+
+  for (const item of items) {
+    if (isReactThinkingItem(item)) {
+      closeCurrent()
+      iterCounter++
+      current = {
+        kind: 'iteration',
+        iterationIdx: iterCounter,
+        id: `${roundIdx}-${iterCounter}`,
+        thinkingItems: [item],
+        toolItems: [],
+        otherItems: [],
+        hasStreaming: isStreamingActive(item),
+      }
+    } else if (isReactAgentItem(item)) {
+      if (!current) {
+        // 缺失 thinking 锚点(空 thinking 未落库 / CLI agent 未发文本直接工具调用 /
+        // 前面的非 react 消息关闭了迭代):开一个无 thinking 的兜底迭代承接,
+        // 避免工具项退化为 plain 段被追加到"执行过程"折叠块末尾
+        iterCounter++
+        current = {
+          kind: 'iteration',
+          iterationIdx: iterCounter,
+          id: `${roundIdx}-${iterCounter}`,
+          thinkingItems: [],
+          toolItems: [],
+          otherItems: [],
+          hasStreaming: false,
+        }
+      }
+      if (item.is_streaming) {
+        current.thinkingItems.push(item)
+      } else if (item.type === 'tool_call' || item.type === 'tool_result') {
+        current.toolItems.push(item)
+      } else {
+        current.otherItems.push(item)
+      }
+      if (isStreamingActive(item)) current.hasStreaming = true
+    } else {
+      closeCurrent()
+      if (isCheckpointItem(item) || isCheckpointInterruptItem(item)) {
+        // 检查点评估/中断都发生在迭代边界:记录当时已完成的迭代数,
+        // 第二阶段把横线(评估)/中断追问卡片挂到 step 组内对应迭代边界处
+        checkpointMarkers.push({ afterIterationIdx: iterCounter, item })
+      } else {
+        // 记录消息在轮内的原始位置(已完成迭代数),第二阶段按位置穿插,
+        // 避免用户追问等轮首/轮中消息被统一追加到轮末
+        plains.push({ kind: 'plain', item, afterIterationIdx: iterCounter })
+      }
+    }
+  }
+  closeCurrent()
+
+  // 第二阶段:按 plan step 分组迭代
+  // 无 plan 时,所有迭代归入单个"执行过程"组(保持折叠体验一致)
+  const segments: RoundSegment[] = []
+  const stepGroupsMap = new Map<number, StepGroup>()
+  const noStepGroup: StepGroup = {
+    kind: 'step',
+    id: `${roundIdx}-nostep`,
+    text: '执行过程',
+    status: 'none',
+    iterations: [],
+    hasStreaming: false,
+    checkpoints: [],
+    plains: [],
+  }
+
+  /** 迭代序号 → 所属 step 组(用于把检查点标记挂到对应组) */
+  const groupByIterIdx = new Map<number, StepGroup>()
+
+  for (const iter of iterations) {
+    const stepId = inferStepFromIteration(iter, planSteps)
+    if (stepId !== null) {
+      // 归入 plan step 组
+      let group = stepGroupsMap.get(stepId)
+      if (!group) {
+        const step = planSteps.find((s) => s.id === stepId)
+        group = {
+          kind: 'step',
+          id: `${roundIdx}-step-${stepId}`,
+          text: step?.text || '(未知步骤)',
+          status: step?.status || 'pending',
+          iterations: [],
+          hasStreaming: false,
+          checkpoints: [],
+          plains: [],
+        }
+        stepGroupsMap.set(stepId, group)
+      }
+      group.iterations.push(iter)
+      if (iter.hasStreaming) group.hasStreaming = true
+      groupByIterIdx.set(iter.iterationIdx, group)
+    } else {
+      // 无法归属(无 plan 或工具名无匹配)→ 归入无 step 组
+      noStepGroup.iterations.push(iter)
+      if (iter.hasStreaming) noStepGroup.hasStreaming = true
+      groupByIterIdx.set(iter.iterationIdx, noStepGroup)
+    }
+  }
+
+  // 把检查点标记分配到所属 step 组:按"前一次迭代"的序号查找;
+  // 序号为 0(边界在首个迭代之前)时兜底到含首个迭代的组;
+  // 轮内尚无任何迭代时降级为 plain 段追加到末尾(极端兜底)
+  for (const marker of checkpointMarkers) {
+    const target =
+      marker.afterIterationIdx > 0
+        ? groupByIterIdx.get(marker.afterIterationIdx)
+        : groupByIterIdx.get(1)
+    if (target) {
+      target.checkpoints.push(marker)
+    } else {
+      plains.push({ kind: 'plain', item: marker.item, afterIterationIdx: marker.afterIterationIdx })
+    }
+  }
+
+  // 按 plan step 顺序输出 step 组(无 plan 时只有 noStepGroup)
+  const orderedGroups: StepGroup[] = []
+  for (const step of planSteps) {
+    const group = stepGroupsMap.get(step.id)
+    if (group) {
+      // 同步最新状态(plan 可能已被 LLM 更新)
+      group.status = step.status
+      orderedGroups.push(group)
+    }
+  }
+  // 追加无法归属的迭代组(如果有)
+  if (noStepGroup.iterations.length > 0) {
+    orderedGroups.push(noStepGroup)
+  }
+
+  // 平铺消息按原始位置穿插到 step 组之间或组内迭代边界,不再统一追加到轮末
+  // (此前 44f5d7d 重构出 step 分组时丢掉了 plain 的位置语义,导致用户追问等
+  //  轮首/轮中消息显示在所有 agent1 响应之后)。
+  // 规则(afterIterationIdx = 消息位于第几个迭代之后,0 = 轮首):
+  // - 轮首(0)→ 输出到最前
+  // - 组内边界(下一迭代与它同组)→ 挂到组上,模板在组内迭代边界渲染
+  // - 组间边界 → 插到所属组之后
+  // - 轮末(>= 迭代总数)→ 追加末尾(天然轮末的评估/总结保持原样)
+  const headPlains: PlainSegment[] = []
+  const tailPlains: PlainSegment[] = []
+  const afterGroupPlains = new Map<StepGroup, PlainSegment[]>()
+  for (const p of plains) {
+    const n = p.afterIterationIdx
+    if (n <= 0) {
+      headPlains.push(p)
+    } else if (n >= iterations.length) {
+      tailPlains.push(p)
+    } else {
+      const group = groupByIterIdx.get(n)
+      const nextGroup = groupByIterIdx.get(n + 1)
+      if (group && nextGroup === group) {
+        // 组内边界:挂到组,渲染在迭代 n 与 n+1 之间
+        group.plains.push(p)
+      } else if (group) {
+        // 组间边界:插到所属组之后
+        let list = afterGroupPlains.get(group)
+        if (!list) {
+          list = []
+          afterGroupPlains.set(group, list)
+        }
+        list.push(p)
+      } else {
+        // 兜底(理论上不可达):追加末尾
+        tailPlains.push(p)
+      }
+    }
+  }
+
+  segments.push(...headPlains)
+  for (const g of orderedGroups) {
+    segments.push(g)
+    const after = afterGroupPlains.get(g)
+    if (after) segments.push(...after)
+  }
+  segments.push(...tailPlains)
+
+  return segments
+}
+
+const roundGroups = computed<RoundGroup[]>(() => {
+  if (!task.value?.conversations && streamingItems.size === 0) return []
+
+  const groups = new Map<number, DisplayItem[]>()
+
+  // 加入正式对话:
+  // - type=thinking 且有 reasoning → 转成流式卡片样式展示(只读,状态 done,reasoning 折叠)
+  //   这样刷新页面后历史的思考过程仍以流式卡片的形式展示,和实时流式视觉一致
+  // - role=user type=question(用户指令) → 跳过,单独提取到顶部 userDirective 显示
+  // - 其他类型 → 正常对话项
+  //
+  // seq 计算:用"该 round 内的下标 * 1000"(每条间隔 1000,留出空间给实时流式 thinking 插入)
+  // 历史回放场景:thinking 和 tool_call 都在 convs,下标交替,顺序天然正确。
+  const convs = task.value?.conversations ?? []
+  const roundCounter = new Map<number, number>() // 每 round 内的下标计数
+  convs.forEach((c) => {
+    // 用户指令不进 round 分组,提到最顶部单独渲染
+    if (c.role === 'user' && c.type === 'question') return
+
+    // 检查点思考链(带检查点前缀的 type=thinking)路由到右侧栏检查点聚合区,
+    // 不进主对话流(与后端 agent_checkpoint 落库的 content 前缀约定一致)
+    if (
+      c.role === 'agent2' &&
+      c.type === 'thinking' &&
+      (c.content || '').startsWith('[检查点评估')
+    ) return
+
+    const localIdx = roundCounter.get(c.round_idx) ?? 0
+    roundCounter.set(c.round_idx, localIdx + 1)
+    const seq = localIdx * 1000
+
+    if (c.type === 'thinking' && c.reasoning) {
+      // 还原为流式卡片(只读模式)
+      const historyConvId = `history:${c.id}`
+      const streamingItem: StreamingItem = {
+        conv_id: historyConvId,
+        round_idx: c.round_idx,
+        role: c.role as 'agent1' | 'agent2',
+        reasoning: c.reasoning,
+        content: c.content,
+        status: 'done',
+        started_at: c.created_at,
+        finished_at: c.created_at,
+        // 从独立 Map 读取持久化的展开状态(实时流式项不在此处读取)
+        reasoning_expanded: historyReasoningExpanded.get(historyConvId) ?? false,
+        seq: 0,
+        insertSeq: localIdx,
+      }
+      if (!groups.has(c.round_idx)) groups.set(c.round_idx, [])
+      groups.get(c.round_idx)!.push({
+        id: `stream:history:${c.id}`,
+        round_idx: c.round_idx,
+        created_at: c.created_at,
+        is_streaming: true,
+        seq,
+        streaming: streamingItem,
+      })
+    } else {
+      // 正常对话项
+      if (!groups.has(c.round_idx)) groups.set(c.round_idx, [])
+      groups.get(c.round_idx)!.push({
+        id: c.id,
+        round_idx: c.round_idx,
+        created_at: c.created_at,
+        is_streaming: false,
+        seq,
+        role: c.role,
+        type: c.type,
+        content: c.content,
+        reasoning: c.reasoning,
+        tool_call_id: c.tool_call_id,
+      })
+    }
+  })
+
+  // 加入实时流式思考项(SSE 期间)
+  // 实时流式 thinking 不在 convs(后端 publish_event=False),只在 streamingItems 里。
+  // 用 insertSeq(该 thinking 开始时该 round 已收到的正式对话数)定位插入位置:
+  //   seq = insertSeq * 1000 - 500
+  // 排在 convs[insertSeq-1](seq=(insertSeq-1)*1000)之后、convs[insertSeq](seq=insertSeq*1000)之前。
+  // 例:thinking1 在 convCount=0 时开始(insertSeq=0),seq=-500,排在 tool_call1(seq=0)之前;
+  //     thinking2 在 convCount=2 时开始(insertSeq=2),seq=1500,排在 tool_result1(seq=1000)
+  //     之后、tool_call2(seq=2000)之前。这样每个 thinking 紧跟它之后的 tool_call/tool_result,
+  //     正确归入各自迭代,不会出现"所有 thinking 挤前面、所有 tool_call 堆最后"的错乱。
+  for (const item of streamingItems.values()) {
+    // 检查点思考链在右侧栏检查点聚合区展示,不进主对话流
+    if (item.source === 'checkpoint') continue
+    if (!groups.has(item.round_idx)) groups.set(item.round_idx, [])
+    groups.get(item.round_idx)!.push({
+      id: `stream:${item.conv_id}`,
+      round_idx: item.round_idx,
+      created_at: item.started_at,
+      is_streaming: true,
+      seq: item.insertSeq * 1000 - 500,
+      streaming: item,
+    })
+  }
+
+  return [...groups.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([roundIdx, items]) => {
+      // 用 seq 排序(稳定,不依赖跨来源的 created_at)
+      const sorted = items.sort((a, b) => a.seq - b.seq)
+      const steps = planPerRound.get(roundIdx) ?? []
+      return {
+        roundIdx,
+        label: roundIdx === 0 ? '初始评估' : `第 ${roundIdx} 轮`,
+        segments: segmentRoundItems(roundIdx, sorted, steps),
+        planSteps: steps,
+      }
+    })
+})
+
+/** 用户指令(从对话中提取,单独显示在最顶部) */
+const userDirective = computed<DisplayItem | null>(() => {
+  const c = task.value?.conversations?.find(
+    (x) => x.role === 'user' && x.type === 'question',
+  )
+  if (!c) return null
+  return {
+    id: c.id,
+    round_idx: c.round_idx,
+    created_at: c.created_at,
+    is_streaming: false,
+    seq: 0,
+    role: c.role,
+    type: c.type,
+    content: c.content,
+  }
+})
+
+// ---- 折叠状态查询/切换 ----
+
+/** step 组是否展开:手动收起优先;否则手动展开 OR 含流式(自动展开)
+ * OR 任务已结束且是最后一组(最终总结直接可见,不折叠) */
+function isStepExpanded(group: StepGroup): boolean {
+  if (collapsedSteps.has(group.id)) return false
+  // 含流式或含组内平铺消息(如用户追问/回答)时自动展开,保证消息可见
+  if (expandedSteps.has(group.id) || group.hasStreaming || group.plains.length > 0) return true
+  return !isRunning.value && isLastStepGroup(group)
+}
+
+function toggleStep(group: StepGroup): void {
+  if (isStepExpanded(group)) {
+    collapsedSteps.add(group.id)
+    expandedSteps.delete(group.id)
+  } else {
+    collapsedSteps.delete(group.id)
+    expandedSteps.add(group.id)
+  }
+}
+
+/** 是否为最后一个 round 的最后一个 step 组(最终总结所在) */
+function isLastStepGroup(group: StepGroup): boolean {
+  const groups = roundGroups.value
+  if (!groups.length) return false
+  const lastRound = groups[groups.length - 1]
+  const last = lastRound.segments[lastRound.segments.length - 1]
+  return !!last && last.kind === 'step' && last.id === group.id
+}
+
+/** step 组的状态图标:done=✓,in_progress=◌,pending=○,none=· */
+function stepStatusIcon(status: PlanStep['status'] | 'none'): string {
+  switch (status) {
+    case 'done': return '✓'
+    case 'in_progress': return '◌'
+    case 'pending': return '○'
+    default: return '·'
+  }
+}
+
+/** 工具渲染行是否展开(默认折叠,由用户控制;key 支持 `${callId}-think` 复合键) */
+function isRowExpanded(key: string): boolean {
+  return expandedToolRows.has(key)
+}
+
+function toggleRow(key: string): void {
+  if (expandedToolRows.has(key)) {
+    expandedToolRows.delete(key)
+  } else {
+    expandedToolRows.add(key)
+  }
+}
+
+/** 工具渲染行:compact 单行摘要 / agent 子智能体卡片 / toolpair 普通工具卡片 / plain 兜底。
+ * 字段扁平化避免模板内联合类型收窄 */
+interface ToolRenderRow {
+  key: string
+  kind: 'compact' | 'agent' | 'toolpair' | 'plain'
+  /** compact/agent/toolpair:tool_call id(展开状态 key) */
+  callId: string
+  /** compact:单行摘要;agent/toolpair:卡片标题 */
+  summary: string
+  /** compact:可跳转的文件路径(工作区相对路径,无则空串) */
+  filePath: string
+  /** compact:摘要中展示的文件路径文本 */
+  fileDisplay: string
+  /** compact:摘要拆分前后缀(filePath 非空时,摘要 = prefix + fileDisplay + suffix) */
+  summaryPrefix: string
+  summarySuffix: string
+  /** 是否已有结果(执行中为 false) */
+  hasResult: boolean
+  /** 结果文本(compact 轻量展开 / toolpair 结果块) */
+  resultContent: string
+  /** agent/toolpair:调用参数 detail(展开后等宽块) */
+  callDetail: string
+  /** agent:内部思考(<think> 块内容) */
+  agentThink: string
+  /** agent:Markdown 渲染的报告正文 HTML */
+  agentBodyHtml: string
+  /** plain:该段内的工具项(兜底原渲染) */
+  items: DisplayItem[]
+}
+
+/** tool_call content 拆分为 intent(首行,剥 [tool_name] 标签)与 detail(其后内容) */
+function callPartsOf(call: DisplayItem): { intent: string; detail: string } {
+  const content = call.content || ''
+  const idx = content.indexOf('\n')
+  const rawIntent = idx < 0 ? content : content.slice(0, idx)
+  return {
+    intent: rawIntent.replace(/\s*\[\w+\]$/, ''),
+    detail: idx < 0 ? '' : content.slice(idx + 1),
+  }
+}
+
+/**
+ * 迭代内工具项拆分为渲染行:
+ * compact(浏览型单行摘要)、agent(子智能体卡片,Markdown 报告)、
+ * toolpair(普通工具,调用+结果整体一张折叠卡)。
+ */
+function toolRowsOf(iter: IterationSegment): ToolRenderRow[] {
+  const empty = {
+    resultContent: '',
+    callDetail: '',
+    agentThink: '',
+    agentBodyHtml: '',
+    filePath: '',
+    fileDisplay: '',
+    summaryPrefix: '',
+    summarySuffix: '',
+    items: [] as DisplayItem[],
+  }
+  return buildToolSegments(iter.toolItems).map((seg, idx) => {
+    if (seg.kind === 'plain') {
+      return {
+        key: `${iter.id}-plain-${idx}`,
+        kind: 'plain' as const,
+        callId: '',
+        summary: '',
+        hasResult: false,
+        ...empty,
+        items: seg.items,
+      }
+    }
+    const callId = seg.call.id
+    const parts = callPartsOf(seg.call)
+    if (seg.kind === 'compact') {
+      // 读文件工具提取跳转目标:摘要中路径文本包成链接,点击在工作区文件树打开
+      const target = toolFileTargetOf(seg.call, seg.result)
+      return {
+        key: callId,
+        kind: 'compact' as const,
+        callId,
+        summary: buildToolSummary(seg.call, seg.result),
+        hasResult: !!seg.result,
+        ...empty,
+        resultContent: seg.result?.content || '',
+        filePath: target?.path || '',
+        fileDisplay: target?.display || '',
+        summaryPrefix: target?.prefix || '',
+        summarySuffix: target?.suffix || '',
+      }
+    }
+    if (seg.kind === 'agent') {
+      const trace = seg.result ? parseAgentTrace(seg.result.content || '') : null
+      // 标题:子任务意图 + 子智能体类型/状态后缀
+      const tags: string[] = []
+      if (trace?.subType) tags.push(trace.subType)
+      if (!seg.result) tags.push('执行中…')
+      else if (trace?.status && trace.status !== 'completed') tags.push(trace.status)
+      else tags.push('已完成')
+      return {
+        key: callId,
+        kind: 'agent' as const,
+        callId,
+        summary: `🤖 ${parts.intent}${tags.length ? ' · ' + tags.join(' · ') : ''}`,
+        hasResult: !!seg.result,
+        ...empty,
+        callDetail: parts.detail,
+        agentThink: trace?.think || '',
+        agentBodyHtml: trace ? renderMarkdown(trace.body) : '',
+      }
+    }
+    // toolpair:普通工具(写操作/非只读命令等),调用+结果整体一张折叠卡
+    return {
+      key: callId,
+      kind: 'toolpair' as const,
+      callId,
+      summary: `🔧 ${parts.intent}`,
+      hasResult: !!seg.result,
+      ...empty,
+      callDetail: parts.detail,
+      resultContent: seg.result?.content || '',
+    }
+  })
+}
+
+/** plan 进度文本:已完成 / 总数 */
+function planProgress(steps: PlanStep[]): string {
+  const done = steps.filter((s) => s.status === 'done').length
+  return `${done}/${steps.length}`
+}
+
+// ---- 结果分组:由 task.params._grouping 驱动 ----
+//
+// 场景降级后,分组声明由 agent2 在 done 时写入 task.params._grouping,
+// 不再从场景声明读取。grouping 结构与原 ScenarioResultGrouping 一致:
+// - 无 _grouping:不分组,所有结果放入单个"结果"组平铺
+// - type=ordered:按声明 values 的 order 排序,metadata 缺失该字段用 default 组
+// - type=dynamic:按 metadata 实际值动态分组,缺失用 default 组
+//
+// color 与前端 sev-<color> CSS class 对齐(安全场景保留原视觉)
+
+/** 分组枚举值(对应原 ScenarioResultGroupValue) */
+interface ResultGroupValue {
+  value: string
+  label: string
+  /** 颜色 key,对应前端 CSS class 后缀(如 critical/high/medium) */
+  color: string
+  /** 排序序号 */
+  order: number
+}
+
+/** 分组声明(对应原 ScenarioResultGrouping,从 task.params._grouping 读取) */
+interface ResultGrouping {
+  /** 从 result.metadata 取该字段分组 */
+  field: string
+  /** ordered(固定枚举+顺序) | dynamic(按值动态分组) */
+  type: 'ordered' | 'dynamic'
+  /** ordered 时的固定枚举值 */
+  values: ResultGroupValue[]
+  /** 元数据缺失该字段时的分组名 */
+  default_label: string
+  /** 默认分组颜色 key(对应前端 sev-<color> CSS class) */
+  default_color: string
+}
+
+interface ResultGroup {
+  /** 分组 key(severity 值或 '__default__' / 'all') */
+  key: string
+  label: string
+  /** 颜色 key,对应 sev-<color> CSS class */
+  color: string
+  results: TaskResult[]
+}
+
+/** 从 task.params._grouping 读取分组声明(可能不存在) */
+const resultGrouping = computed<ResultGrouping | null>(() => {
+  const g = task.value?.params?.['_grouping'] as Partial<ResultGrouping> | undefined
+  if (!g || !g.field) return null
+  // 形态校验通过即可,字段完整性由后端保证
+  return g as ResultGrouping
+})
+
+const resultGroups = computed<ResultGroup[]>(() => {
+  if (!task.value?.results) return []
+  const results = task.value.results
+  const grouping = resultGrouping.value
+
+  // 不分组:单个平铺组
+  if (!grouping) {
+    return [{ key: 'all', label: '结果', color: 'unknown', results }]
+  }
+
+  // 按 grouping.field 从 metadata 取值分组
+  const buckets = new Map<string, TaskResult[]>()
+  for (const r of results) {
+    const raw = (r.metadata_?.[grouping.field] as string | undefined) ?? ''
+    const key = raw || '__default__'
+    if (!buckets.has(key)) buckets.set(key, [])
+    buckets.get(key)!.push(r)
+  }
+
+  if (grouping.type === 'ordered') {
+    // 按声明 values 的 order 排序,仅渲染有结果的组
+    const ordered: ResultGroup[] = []
+    for (const v of [...grouping.values].sort((a, b) => a.order - b.order)) {
+      const rs = buckets.get(v.value) || []
+      if (rs.length > 0) {
+        ordered.push({ key: v.value, label: v.label, color: v.color, results: rs })
+      }
+    }
+    // default 组(metadata 缺失字段的结果)
+    const defaultRs = buckets.get('__default__') || []
+    if (defaultRs.length > 0) {
+      ordered.push({
+        key: '__default__',
+        label: grouping.default_label,
+        color: grouping.default_color,
+        results: defaultRs,
+      })
+    }
+    return ordered
+  }
+
+  // dynamic:按实际值动态分组,缺失用 default
+  const dyn: ResultGroup[] = []
+  for (const [key, rs] of buckets) {
+    if (key === '__default__') {
+      dyn.push({ key, label: grouping.default_label, color: grouping.default_color, results: rs })
+    } else {
+      dyn.push({ key, label: key, color: grouping.default_color, results: rs })
+    }
+  }
+  return dyn
+})
+
+// ---- 状态徽章 ----
+
+const statusConfig: Record<TaskStatus, { label: string; class: string }> = {
+  pending: { label: '等待中', class: 'badge-pending' },
+  running: { label: '进行中', class: 'badge-running' },
+  paused: { label: '已暂停', class: 'badge-paused' },
+  completed: { label: '已完成', class: 'badge-completed' },
+  failed: { label: '已失败', class: 'badge-failed' },
+}
+
+// ---- 是否运行中(控制滚动区域提示) ----
+// paused 也算"活跃"状态:仍在 SSE 订阅,UI 显示暂停徽标 + 恢复按钮
+const isRunning = computed(
+  () =>
+    task.value?.status === 'pending' ||
+    task.value?.status === 'running' ||
+    task.value?.status === 'paused',
+)
+
+/** 是否处于暂停态(控制按钮文案:暂停 ↔ 恢复) */
+const isPaused = computed(() => task.value?.status === 'paused')
+
+/** 暂停/恢复按钮 loading 态(防止重复点击) */
+const pausing = ref(false)
+
+/** 点击暂停/恢复按钮:根据当前状态调对应 API */
+async function handleTogglePause(): Promise<void> {
+  if (!task.value?.id || pausing.value) return
+  pausing.value = true
+  try {
+    if (isPaused.value) {
+      await resumeTask(String(task.value.id))
+    } else if (task.value.status === 'running' || task.value.status === 'pending') {
+      await pauseTask(String(task.value.id))
+    }
+    // 状态变更由 SSE status 事件驱动更新,这里不本地改写
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+  } finally {
+    pausing.value = false
+  }
+}
+
+// ---- 结果卡片 metadata 渲染:动态推断 ----
+//
+// 场景降级后,展示字段不再由场景声明 result_meta_fields 决定,
+// 而是从所有 results 的 metadata keys 动态推断:
+// - 收集所有 results 的 metadata keys 的并集(保持首次出现顺序)
+// - file_path 视为 file 类型(可点击跳转源码),其余视为 text
+// - 单条 result 渲染时,只展示该 result 实际有值(非空)的字段
+
+/** 推断的 metadata 展示字段 */
+interface InferredMetaField {
+  name: string
+  type: 'text' | 'file'
+}
+
+interface ResultMetaItem {
+  field: InferredMetaField
+  value: string
+}
+
+/**
+ * 推断结果 metadata 展示字段:从所有 results 的 metadata keys 动态收集
+ *
+ * 取并集(保持首次出现顺序),file_path 视为 file 类型,其余为 text。
+ */
+const inferredMetaFields = computed<InferredMetaField[]>(() => {
+  const results = task.value?.results ?? []
+  const seen = new Set<string>()
+  const fields: InferredMetaField[] = []
+  for (const r of results) {
+    if (!r.metadata_) continue
+    for (const key of Object.keys(r.metadata_)) {
+      if (seen.has(key)) continue
+      seen.add(key)
+      fields.push({
+        name: key,
+        type: key === 'file_path' ? 'file' : 'text',
+      })
+    }
+  }
+  return fields
+})
+
+/** 结果清单正文 markdown 渲染(审计结果通常含标题/列表/代码块) */
+function renderResultContent(content: string | null | undefined): string {
+  return renderMarkdown(content)
+}
+
+function getResultMetaItems(r: TaskResult): ResultMetaItem[] {
+  const items: ResultMetaItem[] = []
+  for (const f of inferredMetaFields.value) {
+    const v = r.metadata_?.[f.name]
+    if (v != null && v !== '') {
+      items.push({ field: f, value: String(v) })
+    }
+  }
+  return items
+}
+
+// ---- 结果项点击跳转源码位置(B1) ----
+
+/** 工作区侧栏组件引用,用于调用 openTaskFile 跳转 */
+const sidebarRef = ref<InstanceType<typeof WorkspaceSidebar> | null>(null)
+
+/** 从 line_range 字符串(如 "10-20" / "10")解析起始行号 */
+function parseStartLine(lineRange?: string): number | undefined {
+  if (!lineRange) return undefined
+  const m = lineRange.match(/(\d+)/)
+  return m ? parseInt(m[1], 10) : undefined
+}
+
+/** 点击结果项的文件标签:展开侧栏并打开文件定位行号 */
+async function onResultFileClick(r: TaskResult): Promise<void> {
+  const path = r.metadata_?.['file_path'] as string | undefined
+  if (!path || !task.value?.id) return
+  const startLine = parseStartLine(r.metadata_?.['line_range'] as string | undefined)
+  // 展开工作区侧栏(若折叠)
+  workspaceCollapsed.value = false
+  await nextTick()
+  await sidebarRef.value?.openTaskFile(String(task.value.id), path, startLine)
+}
+
+/** 点击工具行摘要中的文件路径:展开工作区侧栏并在文件树中打开该文件 */
+async function onToolFileClick(path: string): Promise<void> {
+  if (!path || !task.value?.id) return
+  workspaceCollapsed.value = false
+  await nextTick()
+  await sidebarRef.value?.openTaskFile(String(task.value.id), path)
+}
+
+// ---- 侧栏事件:任务被删除 / 标题被修改 ----
+
+/** 侧栏删除任务后:若删除的是当前详情页任务,跳转离开(避免停在 404 页) */
+function onSidebarTaskDeleted(taskId: string): void {
+  if (task.value && task.value.id === taskId) {
+    // 关闭 SSE 等资源
+    if (eventSource) {
+      eventSource.close()
+      eventSource = null
+    }
+    router.replace('/tasks/new')
+  }
+}
+
+/** 侧栏修改标题后:若改的是当前详情页任务,同步本地 task.title */
+function onSidebarTaskTitleUpdated(taskId: string, title: string | null): void {
+  if (task.value && task.value.id === taskId) {
+    task.value = { ...task.value, title }
+  }
+}
+
+// ---- 格式化时间 ----
+
+function formatTime(iso: string): string {
+  const d = new Date(iso)
+  return d.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
+
+/** 无标题时回退到 user_input,并截断到 max 字符(与历史任务侧栏一致) */
+function truncateInput(s: string, max = 40): string {
+  if (s.length <= max) return s
+  return s.slice(0, max) + '...'
+}
+
+// ---- 用户补充消息输入框事件处理 ----
+
+/**
+ * 用户消息发送成功后的处理
+ *
+ * - completed 态:后端已启动 resume 线程(状态 → RUNNING),需重连 SSE
+ *   接收新一轮的事件。用户消息的 conversation 事件已由后端在 reset_task_bus
+ *   后 publish,会通过 SSE 历史补播送达。
+ * - running / paused 态:SSE 已连接,conversation 事件由 onConversation 自动接收,
+ *   无需额外处理。
+ */
+function handleMessageSent(_resp: SendMessageResponse): void {
+  if (task.value?.status === 'completed') {
+    // 后端 resume 线程已把状态改回 RUNNING,本地同步 + 重连 SSE
+    task.value.status = 'running'
+    task.value.current_stage = '用户追加消息,重启执行'
+    // 标记 resume 窗口:onDone 若在窗口内触发,需校验是否竞态误推
+    resumingRef.value = true
+    connectSSE(String(task.value.id))
+  }
+  forceScrollToBottom()
+}
+
+/** 用户消息发送失败:展示错误提示 */
+function handleMessageError(message: string): void {
+  error.value = message
+}
+
+/** 运行时设置(模型/协作策略)保存成功:回填后端最新快照 */
+function handleRuntimeConfigSaved(updated: TaskDetail): void {
+  task.value = updated
+}
+
+// ---- 失败任务重试(底部重试条,替换输入框位置)----
+
+/** 重试请求是否进行中(按钮 loading 态,防重复点击) */
+const retrying = ref(false)
+
+/**
+ * 重试失败任务
+ *
+ * 后端按失败阶段自动分流(断点续跑优先,无可续进度从头重跑)。
+ * 启动成功后乐观置 running + 清错误信息 + 重连 SSE
+ * (同 handleMessageSent 的 completed 分支;后端已 reset_task_bus,
+ * 重试标记对话等事件会通过 SSE 历史补播送达)。
+ */
+async function handleRetry(): Promise<void> {
+  if (!task.value || task.value.status !== 'failed' || retrying.value) return
+  // [诊断] 用户点击重试:与后端 retry 拒绝日志对拍(定位"running 不能重试")
+  clientLog(String(task.value.id), 'retry_clicked', {
+    local_status: task.value.status,
+    error_message: task.value.error_message,
+  })
+  retrying.value = true
+  try {
+    const resp = await retryTask(String(task.value.id))
+    clientLog(String(task.value.id), 'retry_response', {
+      accepted: resp.accepted,
+      message: resp.message,
+    })
+    if (resp.accepted) {
+      task.value.status = 'running'
+      task.value.error_message = null
+      task.value.current_stage = '重试失败任务...'
+      // 标记 resume 窗口(同 handleMessageSent:onDone 校验竞态误推)
+      resumingRef.value = true
+      connectSSE(String(task.value.id))
+      forceScrollToBottom()
+    } else {
+      error.value = resp.message || '重试启动失败'
+    }
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+  } finally {
+    retrying.value = false
+  }
+}
+
+/** 判断 DisplayItem 是否为用户补充消息(type=message,需右对齐展示) */
+function isUserMessageItem(item: DisplayItem): boolean {
+  return !item.is_streaming && item.role === 'user' && item.type === 'message'
+}
+
+/**
+ * 判断 DisplayItem 是否为 agent2 检查点评估(迭代边界轻量评估)。
+ *
+ * 与完整评估(round 边界)区分:后端 agent_checkpoint._record_checkpoint 落库时,
+ * content 以 "[检查点评估 · 第N轮迭代M]" 开头;完整评估由 LLM 自由生成,
+ * 不带此前缀。这里靠前缀判定,简单可靠。
+ */
+function isCheckpointItem(item: DisplayItem): boolean {
+  if (item.is_streaming) return false
+  if (item.role !== 'agent2' || item.type !== 'evaluation') return false
+  return (item.content || '').startsWith('[检查点评估')
+}
+
+/**
+ * 判断 DisplayItem 是否为检查点中断的追问记录(实际生效的中断)。
+ *
+ * 后端 acp_base 在 CLI 软中断真正发出追问 prompt 时落库,content 以
+ * "[检查点中断] " 开头。与检查点评估的隐藏横线不同,它要在主对话流
+ * 按时间顺序显示为可见消息卡片(同正常 agent2 追问)。
+ */
+function isCheckpointInterruptItem(item: DisplayItem): boolean {
+  if (item.is_streaming) return false
+  if (item.role !== 'agent2' || item.type !== 'evaluation') return false
+  return (item.content || '').startsWith('[检查点中断]')
+}
+
+/** 解析检查点评估 content,提取 interrupt/reason/query */
+function parseCheckpointContent(c: string): {
+  isInterrupt: boolean
+  cancelled: boolean
+  reason: string
+  query: string | null
+} {
+  // content 格式(后端 agent_checkpoint._record_checkpoint):
+  //   打断:[检查点评估 · 第N轮迭代M] 打断\n理由:...\n追问指令:...
+  //   继续:[检查点评估 · 第N轮迭代M] 继续\n理由:...
+  const isInterrupt = c.startsWith('[检查点评估') && /\] 打断/.test(c)
+  // 用户取消待生效打断后,后端在评估记录末尾追加的标记(INTERRUPT_CANCEL_MARKER)
+  const cancelled = c.includes('[用户已取消该打断')
+  const reasonMatch = c.match(/理由:([^\n]*)/)
+  const queryMatch = c.match(/追问指令:([^\n]*)/)
+  return {
+    isInterrupt,
+    cancelled,
+    reason: reasonMatch ? reasonMatch[1].trim() : '',
+    query: queryMatch ? queryMatch[1].trim() : null,
+  }
+}
+
+/** 检查点评估聚合条目(右侧栏聚合列表展示) */
+interface CheckpointEntry {
+  id: string
+  roundIdx: number
+  iteration: number | null
+  isInterrupt: boolean
+  /** 打断被用户取消(评估记录带已取消标记) */
+  cancelled: boolean
+  reason: string
+  query: string | null
+  /** 检查点思考链(落库 type=thinking 或实时流式累积) */
+  thinking?: string
+  /** 思考链是否正在流式输出 */
+  thinkingStreaming?: boolean
+  /** 评估尚未落库(思考链正在流式,评估进行中) */
+  pending?: boolean
+}
+
+/** 检查点条目对应的待生效打断状态(null=该条目无对应的 pending 打断)
+ *
+ * 按 round + iteration 匹配 pendingInterrupt(SSE agent_checkpoint 或
+ * 刷新恢复);侧栏"待生效"徽标与"取消打断"按钮均由此驱动。
+ */
+function interruptPendingState(
+  cp: CheckpointEntry,
+): 'pending' | 'cancelling' | 'cancelled' | null {
+  const p = pendingInterrupt.value
+  if (!p || !cp.isInterrupt) return null
+  if (cp.roundIdx !== p.round_idx) return null
+  if (cp.iteration !== null && p.iteration !== null && cp.iteration !== p.iteration) return null
+  return p.state
+}
+
+/** 解析检查点 content 前缀中的轮次/迭代号(与后端落库格式一致) */
+function parseCheckpointPos(content: string): {
+  roundIdx: number | null
+  iteration: number | null
+} {
+  const m = content.match(/\[检查点评估 · 第(\d+)轮迭代(\d+)\]/)
+  return m
+    ? { roundIdx: parseInt(m[1], 10), iteration: parseInt(m[2], 10) }
+    : { roundIdx: null, iteration: null }
+}
+
+/**
+ * 检查点评估聚合列表(右侧栏展示)。
+ *
+ * 三个来源合并:
+ * 1. 落库的检查点评估(type=evaluation,与 isCheckpointItem 同一判定):
+ *    GET 快照刷新后可还原历史,运行中 SSE conversation 事件推送实时生效;
+ * 2. 落库的检查点思考链(type=thinking,content 带检查点前缀):
+ *    按 轮次:迭代 挂到对应评估条目下;
+ * 3. 实时流式中的检查点思考(streamingItems 中 source=checkpoint):
+ *    已有对应评估条目 → 挂上实时思考链;评估尚未落库 → 生成"评估中"占位条目。
+ */
+const checkpointList = computed<CheckpointEntry[]>(() => {
+  const convs = task.value?.conversations ?? []
+
+  // 落库的检查点思考链:按 轮次:迭代 索引
+  const thinkingByKey = new Map<string, string>()
+  for (const c of convs) {
+    if (c.role !== 'agent2' || c.type !== 'thinking') continue
+    const content = c.content || ''
+    if (!content.startsWith('[检查点评估')) continue
+    if (!c.reasoning) continue
+    const pos = parseCheckpointPos(content)
+    if (pos.roundIdx === null || pos.iteration === null) continue
+    thinkingByKey.set(`${pos.roundIdx}:${pos.iteration}`, c.reasoning)
+  }
+
+  // 落库的检查点评估:聚合条目主体。
+  // 同 轮次:迭代 只保留最新一条:历史缺陷曾导致同一迭代边界重复落库
+  // (同一决策回合内多个工具结果各自命中 K 边界,重复评估/推送),
+  // 去重兜底避免右侧栏重复展示;后端新数据已加防重,此处兜底存量数据。
+  const entriesByKey = new Map<string, { entry: CheckpointEntry; created_at: string | null }>()
+  for (const c of convs) {
+    if (c.role !== 'agent2' || c.type !== 'evaluation') continue
+    const content = c.content || ''
+    if (!content.startsWith('[检查点评估')) continue
+    const pos = parseCheckpointPos(content)
+    const roundIdx = pos.roundIdx ?? c.round_idx
+    // 迭代号解析失败时按记录 id 为 key(天然唯一,不参与合并)
+    const key = pos.iteration !== null ? `${roundIdx}:${pos.iteration}` : `id:${c.id}`
+    const entry: CheckpointEntry = {
+      id: c.id,
+      roundIdx,
+      iteration: pos.iteration,
+      ...parseCheckpointContent(content),
+      thinking:
+        pos.iteration !== null
+          ? thinkingByKey.get(`${roundIdx}:${pos.iteration}`)
+          : undefined,
+      thinkingStreaming: false,
+      pending: false,
+    }
+    const prev = entriesByKey.get(key)
+    // 同 key 保留最新(convs 按 created_at 升序,后者即最新;显式比较兜底乱序)
+    if (!prev || (c.created_at ?? '') >= (prev.created_at ?? '')) {
+      entriesByKey.set(key, { entry, created_at: c.created_at ?? null })
+    }
+  }
+  const list = [...entriesByKey.values()].map((v) => v.entry)
+
+  // 实时流式中的检查点思考链(source=checkpoint)
+  for (const item of streamingItems.values()) {
+    if (item.source !== 'checkpoint' || item.iteration === undefined) continue
+    const existing = list.find(
+      (e) => e.roundIdx === item.round_idx && e.iteration === item.iteration,
+    )
+    if (existing) {
+      // 评估已落库:思考链优先用实时累积(刷新前落库记录尚未进快照)
+      existing.thinking = item.reasoning || existing.thinking
+      existing.thinkingStreaming = item.status === 'streaming'
+    } else {
+      // 评估进行中:占位条目(评估落库后由上方分支接管)
+      list.push({
+        id: `live:${item.conv_id}`,
+        roundIdx: item.round_idx,
+        iteration: item.iteration,
+        isInterrupt: false,
+        cancelled: false,
+        reason: '',
+        query: null,
+        thinking: item.reasoning,
+        thinkingStreaming: item.status === 'streaming',
+        pending: true,
+      })
+    }
+  }
+
+  return list
+})
+
+/** 检查点思考链展开状态(右侧栏;流式中强制展开) */
+const checkpointThinkingExpanded = reactive<Set<string>>(new Set())
+
+function toggleCheckpointThinking(id: string): void {
+  if (checkpointThinkingExpanded.has(id)) {
+    checkpointThinkingExpanded.delete(id)
+  } else {
+    checkpointThinkingExpanded.add(id)
+  }
+}
+
+/** 思考链是否展开:流式中强制展开,其余按手动展开状态 */
+function isCheckpointThinkingExpanded(cp: CheckpointEntry): boolean {
+  return !!cp.thinkingStreaming || checkpointThinkingExpanded.has(cp.id)
+}
+
+/** 筛选 step 组内应显示在迭代 iterIdx 之后的检查点标记(0 = 首个迭代之前) */
+function checkpointsAfter(group: StepGroup, iterIdx: number): CheckpointMarker[] {
+  return group.checkpoints.filter((c) => c.afterIterationIdx === iterIdx)
+}
+
+/** 筛选 step 组内应显示在迭代 iterIdx 之后的平铺消息(0 = 首个迭代之前) */
+function plainsAfter(group: StepGroup, iterIdx: number): PlainSegment[] {
+  return group.plains.filter((p) => p.afterIterationIdx === iterIdx)
+}
+
+/** 检查点横线 class 列表(打断评估为橙色、继续为主题色) */
+function checkpointDividerClass(marker: CheckpointMarker): (string | Record<string, boolean>)[] {
+  return [
+    'checkpoint-divider',
+    { 'checkpoint-divider-interrupt': parseCheckpointContent(marker.item.content || '').isInterrupt },
+  ]
+}
+
+/** 查找检查点条目所在的 step 组(定位前需先展开它) */
+function findCheckpointGroup(id: string): StepGroup | null {
+  for (const round of roundGroups.value) {
+    for (const seg of round.segments) {
+      if (seg.kind === 'step' && seg.checkpoints.some((c) => c.item.id === id)) {
+        return seg
+      }
+    }
+  }
+  return null
+}
+
+/** 点击右侧栏检查点条目:展开其所在 step 组,滚动到对话流中该检查点位置,横线浮现闪烁后淡出 */
+async function locateCheckpoint(id: string): Promise<void> {
+  // 横线渲染在 step-body 内迭代边界处:step 折叠时锚点不存在,先展开对应 step 组
+  const group = findCheckpointGroup(id)
+  if (group) {
+    collapsedSteps.delete(group.id)
+    expandedSteps.add(group.id)
+    await nextTick()
+  }
+  const el = document.getElementById(`checkpoint-anchor-${id}`)
+  if (!el) return
+  // 重复点击同一检查点时重启浮现动画
+  el.classList.remove('checkpoint-divider-active')
+  void el.offsetWidth
+  el.classList.add('checkpoint-divider-active')
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  window.setTimeout(() => el.classList.remove('checkpoint-divider-active'), 1600)
+}
+
+// ---- 右侧栏结果清单展开状态(默认折叠,点击卡片展开正文) ----
+const expandedResults = reactive<Set<string>>(new Set())
+
+// ---- 生成练习题(把结果清单的真实发现转为自适应练习题,见 PracticeGenerateDialog) ----
+// 后端 PRACTICE_ENABLED=false 时隐藏入口并跳过 draft 拉取
+ensureFeaturesLoaded()
+const practiceDialogOpen = ref(false)
+/** 该任务待确认 draft 数(>0 时按钮提示「确认练习题(N)」,含任务完成后自动生成的) */
+const pendingDraftCount = ref(0)
+
+async function refreshPracticeDraftCount(): Promise<void> {
+  if (!practiceEnabled.value) {
+    pendingDraftCount.value = 0
+    return
+  }
+  if (!task.value || task.value.status !== 'completed') {
+    pendingDraftCount.value = 0
+    return
+  }
+  try {
+    pendingDraftCount.value = (await listDrafts(String(task.value.id))).length
+  } catch {
+    pendingDraftCount.value = 0  // 匿名/失败不提示
+  }
+}
+
+/** 本次出题将使用的模型(与后端出题同一解析逻辑;任务完成 + 功能开启时展示) */
+const generateModelInfo = ref<GenerateModelInfo | null>(null)
+
+async function refreshGenerateModel(): Promise<void> {
+  if (!practiceEnabled.value || !task.value || task.value.status !== 'completed') {
+    generateModelInfo.value = null
+    return
+  }
+  try {
+    generateModelInfo.value = await getTaskGenerateModel(String(task.value.id))
+  } catch {
+    generateModelInfo.value = null  // 匿名/失败不展示
+  }
+}
+
+/** 模型来源的中文说明(任务详情页「本次出题将使用」后缀) */
+const generateModelSourceLabel = computed(() => {
+  const source = generateModelInfo.value?.source
+  if (source === 'task') return '任务配置'
+  if (source === 'default') return '练习默认设置'
+  return '环境默认'
+})
+
+watch(
+  () => task.value?.status,
+  (status) => {
+    if (status === 'completed') {
+      refreshPracticeDraftCount()
+      refreshGenerateModel()
+      // 自动出题在任务完成时触发:开始轮询本任务关联的运行中 job,展示跳转入口
+      startGenJobPoll()
+    } else {
+      stopGenJobPoll()
+    }
+  },
+)
+
+// ---- 出题进度跳转入口:轮询本任务关联的出题 job(手动/自动),运行中时展示 ----
+const runningGenJob = ref<GenerateJobSummary | null>(null)
+let genJobPollTimer: ReturnType<typeof setInterval> | null = null
+
+async function pollRunningGenJob(): Promise<void> {
+  if (!practiceEnabled.value || !task.value || task.value.status !== 'completed') {
+    runningGenJob.value = null
+    return
+  }
+  try {
+    const res = await listGenerateJobs()
+    const taskId = String(task.value.id)
+    runningGenJob.value = res.jobs.find(
+      (j) => j.task_id === taskId && (j.status === 'pending' || j.status === 'running'),
+    ) ?? null
+  } catch {
+    runningGenJob.value = null  // 匿名/失败不提示
+  }
+}
+
+function startGenJobPoll(): void {
+  if (genJobPollTimer) return
+  void pollRunningGenJob()
+  genJobPollTimer = setInterval(pollRunningGenJob, 5000)
+}
+
+function stopGenJobPoll(): void {
+  if (genJobPollTimer) {
+    clearInterval(genJobPollTimer)
+    genJobPollTimer = null
+  }
+  runningGenJob.value = null
+}
+
+onUnmounted(stopGenJobPoll)
+
+/** 跳转自适应练习页查看出题进度(练习页会自动展开出题进度侧栏) */
+function goToPracticeProgress(): void {
+  router.push({ name: 'practice' })
+}
+
+function openPracticeGenerate(): void {
+  // 打开出题对话框前刷新一次模型展示(设置里可能刚换过默认模型)
+  void refreshGenerateModel()
+  practiceDialogOpen.value = true
+}
+
+function toggleResult(id: string): void {
+  if (expandedResults.has(id)) {
+    expandedResults.delete(id)
+  } else {
+    expandedResults.add(id)
+  }
+}
+</script>
+
+<template>
+  <div class="page">
+    <AppHeader>
+      <template #leading>
+        <WorkspaceToggleButton
+          v-if="task"
+          :collapsed="workspaceCollapsed"
+          expand-title="展开历史任务"
+          collapse-title="折叠历史任务"
+          data-onboarding="detail-workspace-toggle"
+          @toggle="toggleWorkspace"
+        />
+      </template>
+    </AppHeader>
+
+    <div class="page-body">
+    <!-- 左侧:历史任务栏 + 按需切换工作区(v-show 保留已加载的任务列表/文件树状态,折叠不销毁) -->
+    <WorkspaceSidebar
+      v-show="!workspaceCollapsed"
+      ref="sidebarRef"
+      :changed-files="changedFiles"
+      :repo-files="repoFiles"
+      @task-deleted="onSidebarTaskDeleted"
+      @task-title-updated="onSidebarTaskTitleUpdated"
+      @open-diff-file="scrollToDiffFile"
+    />
+
+    <main class="main">
+      <!-- 标题/状态行(固定在滚动容器外,不随对话滚动;有任务即显示) -->
+      <div v-if="task" class="conv-header">
+        <!-- 左侧:对话标题 + 创建时间 -->
+        <div class="conv-header-info">
+          <span class="conv-header-title" :title="task?.title || task?.user_input">
+            {{ truncateInput(task?.title || task?.user_input || '') }}
+          </span>
+          <span v-if="task?.created_at" class="conv-header-time">{{ formatTime(task.created_at) }}</span>
+        </div>
+        <!-- 右侧:暂停态橙色徽标 + 恢复按钮;运行态红色实时徽标 + 暂停按钮 -->
+        <template v-if="isRunning">
+          <span v-if="isPaused" class="paused-indicator">
+            <span class="paused-bars" /><span>已暂停</span>
+          </span>
+          <span v-else class="live-indicator">
+            <span class="live-dot" />实时
+          </span>
+          <button
+            class="btn-pause"
+            :disabled="pausing"
+            :title="isPaused ? '恢复执行' : '暂停执行'"
+            data-onboarding="detail-pause"
+            @click="handleTogglePause"
+          >
+            {{ pausing ? '处理中...' : isPaused ? '恢复' : '暂停' }}
+          </button>
+        </template>
+      </div>
+      <div ref="conversationRef" class="main-scroll" @scroll="handleConversationScroll">
+      <!-- 加载中 -->
+      <div v-if="loading" class="loading-state">
+        <div class="spinner-lg" />
+        <p>加载任务详情...</p>
+      </div>
+
+      <!-- 错误 -->
+      <div v-else-if="error" class="error-state">
+        <p>{{ error }}</p>
+        <RouterLink to="/tasks/new">提交新任务</RouterLink>
+      </div>
+
+      <!-- 任务详情(主区聚焦协作对话流;结果清单/检查点评估/覆盖度看板在右侧栏) -->
+      <template v-else-if="task">
+        <!-- 协作对话流(无外框,顶部仅在运行时显示实时徽标) -->
+        <section
+          v-if="roundGroups.length > 0 || isRunning"
+          class="conversation-section"
+          data-onboarding="detail-conversation"
+        >
+          <!-- 用户指令(右对齐,像聊天界面的用户消息气泡) -->
+          <div v-if="userDirective" class="user-directive">
+            <ConversationMessage
+              :item="userDirective"
+              @toggle-reasoning="toggleReasoning"
+            />
+          </div>
+
+          <div v-for="group in roundGroups" :key="group.roundIdx" class="round-group">
+            <div class="round-label">{{ group.label }}</div>
+            <!-- 计划清单(复杂任务时 agent1 输出,展示接下来要做的步骤 + 进度) -->
+            <div v-if="group.planSteps.length > 0" class="plan-card">
+              <div class="plan-header">
+                <span class="plan-title">计划清单</span>
+                <span class="plan-progress">{{ planProgress(group.planSteps) }}</span>
+              </div>
+              <div class="plan-steps">
+                <div
+                  v-for="s in group.planSteps"
+                  :key="s.id"
+                  :class="['plan-step', `plan-step-${s.status}`]"
+                >
+                  <span class="plan-step-icon">{{
+                    s.status === 'done' ? '✓' : s.status === 'in_progress' ? '◌' : '○'
+                  }}</span>
+                  <span class="plan-step-text">{{ s.text }}</span>
+                </div>
+              </div>
+            </div>
+            <div class="messages">
+              <template
+                v-for="seg in group.segments"
+                :key="seg.kind === 'step' ? `step-${seg.id}` : `plain-${seg.item.id}`"
+              >
+                <!-- 平铺段:agent2 评估/追问/总结、user 指令等关键消息 -->
+                <!-- 用户补充消息(type=message)右对齐,与顶部 userDirective 视觉一致 -->
+                <div
+                  v-if="seg.kind === 'plain' && !isCheckpointItem(seg.item)"
+                  :class="{ 'user-msg-row': isUserMessageItem(seg.item) }"
+                >
+                  <ConversationMessage
+                    :item="seg.item"
+                    @toggle-reasoning="toggleReasoning"
+                  />
+                </div>
+
+                <!-- 检查点位置标记:平时隐藏;点击右侧栏条目时浮现横线叠加在内容分界线上(不撑开行距),
+                     打断评估为橙色、继续为主题色,闪烁后淡出 -->
+                <div
+                  v-else-if="seg.kind === 'plain' && isCheckpointItem(seg.item)"
+                  :id="`checkpoint-anchor-${seg.item.id}`"
+                  :class="[
+                    'checkpoint-divider',
+                    {
+                      'checkpoint-divider-interrupt':
+                        parseCheckpointContent(seg.item.content || '').isInterrupt,
+                    },
+                  ]"
+                />
+
+                <!-- step 分组:plan step 下含多个迭代(无 plan 时为单个"执行过程"组) -->
+                <div
+                  v-else-if="seg.kind === 'step'"
+                  class="step-block"
+                  :class="{
+                    'step-streaming': seg.hasStreaming,
+                    'step-done': seg.status === 'done',
+                    'step-expanded': isStepExpanded(seg),
+                  }"
+                >
+                  <div class="step-header" @click="toggleStep(seg)">
+                    <span class="step-toggle">{{ isStepExpanded(seg) ? '▼' : '▶' }}</span>
+                    <span
+                      :class="['step-status-icon', `step-status-${seg.status}`]"
+                    >{{ stepStatusIcon(seg.status) }}</span>
+                    <span class="step-text">{{ seg.text }}</span>
+                    <span class="step-iter-count">{{ seg.iterations.length }} 次迭代</span>
+                    <span v-if="seg.hasStreaming" class="step-streaming-tag">
+                      <span class="typing-dots"><span></span><span></span><span></span></span>
+                    </span>
+                  </div>
+                  <div v-if="isStepExpanded(seg)" class="step-body">
+                    <!-- 该 step 下的所有迭代:不再折叠,内容直接平铺
+                         (折叠单位上移到 step 组,浏览型工具已单行化) -->
+                    <!-- 检查点标记:渲染在迭代边界处(afterIterationIdx=0 表示首个迭代之前)。
+                         中断追问 → 可见消息卡片(按时间顺序);评估 → 隐藏横线 -->
+                    <template v-for="cp in checkpointsAfter(seg, 0)" :key="`cp-${cp.item.id}`">
+                      <ConversationMessage
+                        v-if="isCheckpointInterruptItem(cp.item)"
+                        :item="cp.item"
+                        @toggle-reasoning="toggleReasoning"
+                      />
+                      <div
+                        v-else
+                        :id="`checkpoint-anchor-${cp.item.id}`"
+                        :class="checkpointDividerClass(cp)"
+                      />
+                    </template>
+                    <!-- 组内平铺消息(如用户追问/回答):渲染在迭代边界处(0 = 首个迭代之前) -->
+                    <template v-for="p in plainsAfter(seg, 0)" :key="`plain-${p.item.id}`">
+                      <div :class="{ 'user-msg-row': isUserMessageItem(p.item) }">
+                        <ConversationMessage
+                          :item="p.item"
+                          @toggle-reasoning="toggleReasoning"
+                        />
+                      </div>
+                    </template>
+                    <template v-for="iter in seg.iterations" :key="iter.id">
+                    <!-- 迭代内容直接平铺:无摘要行、无边框包装(wrapper 仅作结构容器,
+                         保留它以免 step-body 加 gap 影响零高度检查点横线) -->
+                    <div class="iteration-block">
+                      <div class="iteration-body">
+                        <!-- thinking 项(流式或历史) -->
+                        <ConversationMessage
+                          v-for="t in iter.thinkingItems"
+                          :key="t.id"
+                          :item="t"
+                          @toggle-reasoning="toggleReasoning"
+                        />
+                        <!-- 工具调用渲染行:compact 单行摘要 / agent 子智能体卡片 /
+                             toolpair 普通工具卡片 / plain 兜底 -->
+                        <template v-for="row in toolRowsOf(iter)" :key="row.key">
+                          <!-- 紧凑工具:单行摘要,点击轻量展开原始结果 -->
+                          <div v-if="row.kind === 'compact'" class="tool-compact">
+                            <div class="tool-compact-row" @click="toggleRow(row.callId)">
+                              <span class="tool-group-toggle">
+                                {{ row.hasResult ? (isRowExpanded(row.callId) ? '▼' : '▶') : '' }}
+                              </span>
+                              <span class="tool-compact-summary">
+                                <template v-if="row.filePath">
+                                  {{ row.summaryPrefix }}<a
+                                    class="tool-file-link"
+                                    title="在文件树中打开"
+                                    @click.stop="onToolFileClick(row.filePath)"
+                                  >{{ row.fileDisplay }}</a>{{ row.summarySuffix }}
+                                </template>
+                                <template v-else>{{ row.summary }}</template>
+                              </span>
+                            </div>
+                            <div
+                              v-if="row.hasResult && isRowExpanded(row.callId)"
+                              class="tool-compact-result"
+                            >{{ row.resultContent }}</div>
+                          </div>
+                          <!-- 子智能体卡片:标题单行,展开后参数 + 内部思考 + Markdown 报告 -->
+                          <div v-else-if="row.kind === 'agent'" class="tool-card tool-card-agent">
+                            <div class="tool-card-header" @click="toggleRow(row.callId)">
+                              <span class="tool-group-toggle">{{ isRowExpanded(row.callId) ? '▼' : '▶' }}</span>
+                              <span class="tool-card-title">{{ row.summary }}</span>
+                            </div>
+                            <div v-if="isRowExpanded(row.callId)" class="tool-card-body">
+                              <div v-if="row.callDetail" class="tool-card-section">
+                                <div class="tool-card-section-label">子任务参数</div>
+                                <div class="tool-card-mono">{{ row.callDetail }}</div>
+                              </div>
+                              <div v-if="row.agentThink" class="tool-card-section">
+                                <div
+                                  class="tool-card-section-label tool-card-think-toggle"
+                                  @click.stop="toggleRow(row.callId + '-think')"
+                                >{{ isRowExpanded(row.callId + '-think') ? '▼' : '▶' }} 内部思考</div>
+                                <div
+                                  v-if="isRowExpanded(row.callId + '-think')"
+                                  class="tool-card-think"
+                                >{{ row.agentThink }}</div>
+                              </div>
+                              <div
+                                v-if="row.hasResult"
+                                class="tool-card-markdown markdown-body"
+                                v-html="row.agentBodyHtml"
+                              />
+                              <div v-else class="tool-card-running">子智能体执行中…</div>
+                            </div>
+                          </div>
+                          <!-- 普通工具卡片:调用+结果整体折叠 -->
+                          <div v-else-if="row.kind === 'toolpair'" class="tool-card">
+                            <div class="tool-card-header" @click="toggleRow(row.callId)">
+                              <span class="tool-group-toggle">{{ isRowExpanded(row.callId) ? '▼' : '▶' }}</span>
+                              <span class="tool-card-title">{{ row.summary }}</span>
+                            </div>
+                            <div v-if="isRowExpanded(row.callId)" class="tool-card-body">
+                              <div v-if="row.callDetail" class="tool-card-section">
+                                <div class="tool-card-section-label">调用参数</div>
+                                <div class="tool-card-mono">{{ row.callDetail }}</div>
+                              </div>
+                              <div v-if="row.hasResult" class="tool-card-section">
+                                <div class="tool-card-section-label">工具结果</div>
+                                <div class="tool-card-mono">{{ row.resultContent }}</div>
+                              </div>
+                              <div v-if="!row.callDetail && !row.hasResult" class="tool-card-running">执行中…</div>
+                            </div>
+                          </div>
+                          <!-- plain 兜底:落单 result 等原样渲染 -->
+                          <template v-else-if="row.kind === 'plain'">
+                            <ConversationMessage
+                              v-for="ti in row.items"
+                              :key="ti.id"
+                              :item="ti"
+                              @toggle-reasoning="toggleReasoning"
+                            />
+                          </template>
+                        </template>
+                        <!-- 其他项(submit 等) -->
+                        <ConversationMessage
+                          v-for="o in iter.otherItems"
+                          :key="o.id"
+                          :item="o"
+                          @toggle-reasoning="toggleReasoning"
+                        />
+                      </div>
+                    </div>
+                    <!-- 检查点标记:该迭代为评估/中断边界。
+                         中断追问 → 可见消息卡片;评估 → 隐藏横线(平时隐藏,定位时浮现) -->
+                    <template v-for="cp in checkpointsAfter(seg, iter.iterationIdx)" :key="`cp-${cp.item.id}`">
+                      <ConversationMessage
+                        v-if="isCheckpointInterruptItem(cp.item)"
+                        :item="cp.item"
+                        @toggle-reasoning="toggleReasoning"
+                      />
+                      <div
+                        v-else
+                        :id="`checkpoint-anchor-${cp.item.id}`"
+                        :class="checkpointDividerClass(cp)"
+                      />
+                    </template>
+                    <!-- 组内平铺消息(如用户追问):渲染在该迭代之后,与迭代内容保持时间顺序 -->
+                    <template v-for="p in plainsAfter(seg, iter.iterationIdx)" :key="`plain-${p.item.id}`">
+                      <div :class="{ 'user-msg-row': isUserMessageItem(p.item) }">
+                        <ConversationMessage
+                          :item="p.item"
+                          @toggle-reasoning="toggleReasoning"
+                        />
+                      </div>
+                    </template>
+                    </template>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+          <!-- 运行中等待提示(没有流式项时才显示) -->
+          <!-- 优先用后端推送的 current_stage(如"正在克隆仓库..."),无则回退通用文案 -->
+          <!-- 暂停态:不显示打字动画(已暂停,不再思考) -->
+          <div
+            v-if="isRunning && streamingItems.size === 0"
+            class="waiting-hint"
+            :class="{ 'waiting-hint-paused': isPaused }"
+          >
+            <template v-if="cloneProgress && !isPaused">
+              <div class="clone-progress">
+                <div class="clone-progress-info">
+                  <span class="clone-progress-stage">
+                    {{ task?.current_stage || '正在克隆仓库...' }}
+                  </span>
+                  <span class="clone-progress-percent">{{ cloneProgress.percent }}%</span>
+                </div>
+                <div class="clone-progress-bar">
+                  <div
+                    class="clone-progress-fill"
+                    :style="{ width: cloneProgress.percent + '%' }"
+                  ></div>
+                </div>
+                <div class="clone-progress-msg">{{ cloneProgress.message }}</div>
+                <div class="clone-progress-actions">
+                  <button
+                    class="clone-skip-btn"
+                    :disabled="skipClonePending"
+                    :title="'跳过后改由执行阶段自主克隆(可能多耗时几十秒)'"
+                    @click="handleSkipPreClone"
+                  >{{ skipClonePending ? '正在跳过...' : '跳过预克隆' }}</button>
+                </div>
+              </div>
+            </template>
+            <template v-else>
+              <span v-if="!isPaused" class="typing-dots">
+                <span></span><span></span><span></span>
+              </span>
+              {{ isPaused ? '已暂停,点击恢复按钮继续执行' : (task?.current_stage || '智能体思考中...') }}
+              <button
+                v-if="!isPaused && isPreCloning"
+                class="clone-skip-btn"
+                :disabled="skipClonePending"
+                :title="'跳过后改由执行阶段自主克隆(可能多耗时几十秒)'"
+                @click="handleSkipPreClone"
+              >{{ skipClonePending ? '正在跳过...' : '跳过预克隆' }}</button>
+            </template>
+          </div>
+        </section>
+
+        <!-- 工作区变更(任务完成时捕获的 git diff patch,只读;文本插值自动转义,无 XSS 风险) -->
+        <section v-if="workspaceArtifact" class="workspace-changes-section">
+          <div
+            class="wc-header"
+            @click="workspaceChangesCollapsed = !workspaceChangesCollapsed"
+          >
+            <h2>
+              工作区变更
+              <span class="count">({{ artifactMeta.files_changed }} 个文件)</span>
+            </h2>
+            <span class="wc-meta">
+              {{ artifactMeta.char_count }} 字符
+              <span v-if="artifactMeta.truncated" class="wc-truncated">
+                · 已截断(仅查看,不可 git apply)
+              </span>
+            </span>
+            <button
+              class="wc-toggle"
+              :title="workspaceChangesCollapsed ? '展开' : '折叠'"
+            >
+              {{ workspaceChangesCollapsed ? '▸' : '▾' }}
+            </button>
+          </div>
+          <div v-if="!workspaceChangesCollapsed" class="diff-view">
+            <div
+              v-for="(line, i) in diffLines"
+              :key="i"
+              :id="diffAnchorByLine.get(i)"
+              :class="['diff-line', diffLineClass(line)]"
+            >{{ line }}</div>
+          </div>
+        </section>
+      </template>
+      </div>
+
+      <!-- 运行时设置面板(输入框上方箭头展开:react/agent2 模型 + 协作策略;
+           运行中/暂停中修改在下一轮执行生效,组件内 toast 提示) -->
+      <TaskRuntimeSettings
+        v-if="task && (task.status === 'running' || task.status === 'paused' || task.status === 'completed' || task.status === 'failed')"
+        :key="String(task.id)"
+        :task="task"
+        @saved="handleRuntimeConfigSaved"
+      />
+
+      <!-- 用户补充消息输入框(running/paused/completed 可见,pending 隐藏) -->
+      <UserMessageInput
+        v-if="task && (task.status === 'running' || task.status === 'paused' || task.status === 'completed')"
+        :task-id="String(task.id)"
+        :task-status="task.status"
+        @sent="handleMessageSent"
+        @error="handleMessageError"
+      />
+
+      <!-- 失败任务重试条(failed 状态替换输入框位置) -->
+      <div v-if="task && task.status === 'failed'" class="retry-bar">
+        <div class="retry-bar-text">
+          <span class="retry-bar-label">任务执行失败,可重试</span>
+          <span
+            v-if="task.error_message"
+            class="retry-bar-error"
+            :title="task.error_message"
+          >{{ truncateInput(task.error_message, 80) }}</span>
+        </div>
+        <button class="retry-btn" :disabled="retrying" @click="handleRetry">
+          {{ retrying ? '重试启动中...' : '重试' }}
+        </button>
+      </div>
+    </main>
+
+    <!-- 右侧:任务详情 + 覆盖度看板(抽屉把手式;展开时顶部条带标题+折叠按钮,折叠时悬浮把手在 page-body 右上角) -->
+    <aside v-if="task && !detailCollapsed" class="detail-sidebar">
+      <div class="detail-sidebar-header">
+        <span class="detail-sidebar-title">任务详情</span>
+        <!-- 状态徽标 + 下载/打印:自任务概览区块顶部迁入,排在折叠按钮左侧 -->
+        <span :class="['badge', statusConfig[task.status].class]">
+          {{ statusConfig[task.status].label }}
+        </span>
+        <div
+          v-if="task.status === 'completed' || task.results.length > 0"
+          class="overview-actions"
+        >
+          <button
+            class="btn-export"
+            :disabled="exporting"
+            title="下载 Markdown 报告"
+            @click="exportMarkdown"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" y1="15" x2="12" y2="3" />
+            </svg>
+          </button>
+          <button
+            class="btn-export"
+            :disabled="exporting"
+            title="打印或另存为 PDF"
+            @click="exportPdf"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="6 9 6 2 18 2 18 9" />
+              <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" />
+              <rect x="6" y="14" width="12" height="8" />
+            </svg>
+          </button>
+        </div>
+        <WorkspaceToggleButton
+          side="right"
+          :collapsed="false"
+          expand-title="展开任务详情"
+          collapse-title="折叠任务详情"
+          @toggle="toggleDetail"
+        />
+      </div>
+      <div class="detail-sidebar-body">
+        <!-- 覆盖度(task.checklist 存在时显示,置顶以便无需滚动即可查看) -->
+        <section v-if="task.checklist?.length && coverageData" class="coverage-section">
+          <h2>
+            覆盖度
+            <span class="count">{{ coverageData.covered_count }}/{{ coverageData.total_count }}</span>
+            <span v-if="coverageData.last_round !== null" class="coverage-round">
+              第 {{ coverageData.last_round }} 轮评估
+            </span>
+          </h2>
+          <div class="coverage-grid">
+            <div
+              v-for="d in coverageData.dimensions"
+              :key="d.id"
+              :class="['coverage-card', d.covered ? 'coverage-covered' : 'coverage-missing']"
+              :title="d.description"
+            >
+              <span class="coverage-dot" />
+              <span class="coverage-name">{{ d.name }}</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- 任务详情(扁平化,无卡片外框):状态徽标与下载/打印按钮已移至标题行,用户意图卡片已移除 -->
+        <section class="overview-section">
+          <dl class="overview-meta">
+            <div>
+              <dt>场景</dt>
+              <dd>{{ task.scenario }}</dd>
+            </div>
+            <div>
+              <dt>创建时间</dt>
+              <dd>{{ formatTime(task.created_at) }}</dd>
+            </div>
+            <div v-if="task.completed_at">
+              <dt>完成时间</dt>
+              <dd>{{ formatTime(task.completed_at) }}</dd>
+            </div>
+          </dl>
+          <div v-if="task.current_stage" class="overview-stage">
+            <span class="label">当前阶段</span>
+            <p>{{ task.current_stage }}</p>
+          </div>
+          <div v-if="task.error_message" class="alert alert-error">
+            {{ task.error_message }}
+          </div>
+        </section>
+
+        <!-- 动态验证配置(仅当任务配了测试环境 URL 时显示)
+             对用户透明:不出现 verifier_agent 字样,只显示"动态验证"。
+             运行时可切换开关与授权模式,立即保存到后端。 -->
+        <section v-if="task.test_env_url" class="verifier-section">
+          <h2 class="verifier-title">
+            动态验证
+            <span
+              :class="['verifier-status', verifierActive ? 'verifier-on' : 'verifier-off']"
+            >{{ verifierActive ? '运行中' : '已关闭' }}</span>
+          </h2>
+          <div class="verifier-env">
+            <span class="label">测试环境</span>
+            <code :title="task.test_env_url">{{ task.test_env_url }}</code>
+          </div>
+          <button
+            type="button"
+            class="verifier-toggle-btn"
+            :disabled="verifierConfigSaving"
+            @click="toggleVerifierEnabled"
+          >
+            {{ task.verifier_enabled ? '关闭验证' : '开启验证' }}
+          </button>
+          <button
+            v-if="task.verifier_enabled"
+            type="button"
+            class="verifier-toggle-btn"
+            :disabled="verifierConfigSaving"
+            @click="toggleVerifierAuthMode"
+          >
+            {{ task.verifier_auth_mode === 'direct' ? '模式:直接执行' : '模式:逐动作授权' }}
+          </button>
+
+          <!-- 已配置的登录凭证(只读展示,header_value 脱敏) -->
+          <div
+            v-if="task.verifier_enabled && task.verifier_auth_tokens && task.verifier_auth_tokens.length > 0"
+            class="verifier-tokens"
+          >
+            <span class="label">登录凭证</span>
+            <div
+              v-for="(token, idx) in task.verifier_auth_tokens"
+              :key="idx"
+              class="verifier-token-item"
+            >
+              <span class="token-label">{{ token.label }}</span>
+              <code class="token-header">{{ token.header_name }}: {{ maskTokenValue(token.header_value) }}</code>
+            </div>
+          </div>
+        </section>
+
+        <!-- 结果清单(分组由 task.params._grouping 驱动,卡片默认折叠;置底展示) -->
+        <section
+          v-if="task.results.length > 0"
+          class="sidebar-results"
+          data-onboarding="detail-results"
+        >
+          <h2>
+            结果清单 <span class="count">({{ task.results.length }})</span>
+            <!-- 本任务的出题 job 运行中时,隐藏「生成练习题」入口,改为展示跳转练习页看实时进度 -->
+            <button
+              v-if="runningGenJob"
+              class="gen-progress-entry"
+              title="跳转到自适应练习查看出题进度"
+              @click="goToPracticeProgress"
+            >
+              <span class="gen-pulse-dot" aria-hidden="true" />
+              正在出题<template v-if="runningGenJob.total">({{ runningGenJob.done }}/{{ runningGenJob.total }})</template>
+              · 查看进度
+            </button>
+            <button
+              v-else-if="task.status === 'completed' && practiceEnabled"
+              class="practice-generate-btn"
+              :title="pendingDraftCount > 0 ? '存在待确认的候选题,点击预览入库' : '把审计发现改编为自适应练习题'"
+              @click="openPracticeGenerate"
+            >{{ pendingDraftCount > 0 ? `确认练习题(${pendingDraftCount})` : '生成练习题' }}</button>
+          </h2>
+          <!-- 出题入口旁:展示本次出题将使用的模型,避免用户困惑为什么没用默认模型 -->
+          <p v-if="generateModelInfo && task.status === 'completed' && practiceEnabled" class="generate-model-hint">
+            本次出题将使用：<strong class="generate-model-name">{{ generateModelInfo.model }}</strong>
+            <span class="generate-model-source">（{{ generateModelSourceLabel }}）</span>
+          </p>
+          <template v-for="group in resultGroups" :key="group.key">
+            <h3 v-if="resultGrouping" class="sidebar-result-group">
+              <span :class="['severity-tag', `sev-${group.color}`]">{{ group.label }}</span>
+              <span class="count">{{ group.results.length }}</span>
+            </h3>
+            <div class="result-cards">
+              <article
+                v-for="r in group.results"
+                :key="r.id"
+                :class="['result-card', { 'result-card-expanded': expandedResults.has(r.id) }]"
+                @click="toggleResult(r.id)"
+              >
+                <div class="result-header">
+                  <span class="result-toggle">{{ expandedResults.has(r.id) ? '▼' : '▶' }}</span>
+                  <h4>{{ r.title }}</h4>
+                  <span class="round-tag">第 {{ r.round_idx }} 轮</span>
+                </div>
+                <div v-if="getResultMetaItems(r).length > 0" class="result-meta">
+                  <span
+                    v-for="item in getResultMetaItems(r)"
+                    :key="item.field.name"
+                    :class="['meta-tag', { 'meta-file': item.field.type === 'file' }]"
+                    @click.stop="item.field.type === 'file' ? onResultFileClick(r) : undefined"
+                  >
+                    {{ item.value }}
+                  </span>
+                </div>
+                <div
+                  v-if="expandedResults.has(r.id)"
+                  class="result-content markdown-body"
+                  v-html="renderResultContent(r.content)"
+                />
+              </article>
+            </div>
+          </template>
+        </section>
+
+        <!-- 检查点评估聚合(置底;含检查点思考链,点击条目定位对话流对应轮次) -->
+        <section v-if="checkpointList.length > 0" class="sidebar-checkpoints">
+          <h2>检查点评估 <span class="count">({{ checkpointList.length }})</span></h2>
+          <div class="checkpoint-list">
+            <div
+              v-for="cp in checkpointList"
+              :key="cp.id"
+              :class="['checkpoint-item', { 'checkpoint-item-interrupt': cp.isInterrupt }]"
+              :title="cp.pending ? undefined : '点击定位对话流中的检查点位置'"
+              @click="!cp.pending && locateCheckpoint(cp.id)"
+            >
+              <div class="checkpoint-item-head">
+                <span class="checkpoint-item-pos">
+                  第 {{ cp.roundIdx }} 轮<template v-if="cp.iteration !== null"> · 迭代 {{ cp.iteration }}</template>
+                </span>
+                <span v-if="cp.pending" class="checkpoint-badge checkpoint-badge-pending">
+                  评估中
+                </span>
+                <template v-else-if="cp.isInterrupt && interruptPendingState(cp)">
+                  <!-- 待生效窗口:打断已入队未注入,展示取消按钮(已取消态只剩徽标) -->
+                  <span
+                    v-if="interruptPendingState(cp) === 'cancelled'"
+                    class="checkpoint-badge checkpoint-badge-cancelled"
+                  >
+                    已取消
+                  </span>
+                  <span v-else class="checkpoint-badge checkpoint-badge-awaiting">
+                    打断待生效
+                  </span>
+                  <button
+                    v-if="interruptPendingState(cp) !== 'cancelled'"
+                    class="checkpoint-cancel-btn"
+                    :disabled="interruptPendingState(cp) === 'cancelling'"
+                    title="取消后追问指令不会下发给智能体"
+                    @click.stop="handleCancelInterrupt"
+                  >{{ interruptPendingState(cp) === 'cancelling' ? '正在取消...' : '取消打断' }}</button>
+                </template>
+                <span
+                  v-else-if="cp.isInterrupt && cp.cancelled"
+                  class="checkpoint-badge checkpoint-badge-cancelled"
+                >
+                  已取消
+                </span>
+                <span
+                  v-else
+                  :class="[
+                    'checkpoint-badge',
+                    cp.isInterrupt ? 'checkpoint-badge-interrupt' : 'checkpoint-badge-continue',
+                  ]"
+                >
+                  {{ cp.isInterrupt ? '已打断' : '继续' }}
+                </span>
+              </div>
+              <template v-if="!cp.pending">
+                <div class="checkpoint-item-reason">{{ cp.reason || '无说明' }}</div>
+                <div v-if="cp.isInterrupt && cp.query" class="checkpoint-item-query">
+                  追问:{{ cp.query }}
+                </div>
+              </template>
+              <!-- 检查点思考链(落库 type=thinking / 实时流式;默认折叠,流式中展开) -->
+              <div
+                v-if="cp.thinking"
+                class="checkpoint-thinking"
+                :class="{ 'checkpoint-thinking-active': cp.thinkingStreaming }"
+                @click.stop
+              >
+                <div
+                  class="checkpoint-thinking-header"
+                  @click="toggleCheckpointThinking(cp.id)"
+                >
+                  <span class="checkpoint-thinking-toggle">
+                    {{ isCheckpointThinkingExpanded(cp) ? '▼' : '▶' }}
+                  </span>
+                  <span>{{ cp.thinkingStreaming ? '正在思考…' : '思考过程' }}</span>
+                  <span class="checkpoint-thinking-meta">{{ cp.thinking.length }} 字</span>
+                </div>
+                <div
+                  v-if="isCheckpointThinkingExpanded(cp)"
+                  class="checkpoint-thinking-body"
+                >{{ cp.thinking }}</div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </aside>
+
+    <!-- 折叠态:page-body 右上角悬浮把手(header 下方右侧,点击重新展开;有结果时显示数量角标) -->
+    <div v-else-if="task" class="detail-handle">
+      <WorkspaceToggleButton
+        side="right"
+        :collapsed="true"
+        expand-title="展开任务详情"
+        collapse-title="折叠任务详情"
+        @toggle="toggleDetail"
+      />
+      <span v-if="task.results.length > 0" class="detail-handle-badge">
+        {{ task.results.length }}
+      </span>
+    </div>
+    </div>
+
+    <!-- 用户澄清提问弹窗(agent2 ask_user=true 时触发) -->
+    <QuestionDialog
+      :open="questionOpen"
+      :questions="questionData.questions"
+      :reasoning="questionData.reasoning"
+      :ask-round="questionData.askRound"
+      :submitting="submittingAnswer"
+      @submit="handleSubmitAnswer"
+      @cancel="handleCancelQuestion"
+    />
+
+    <!-- 覆盖度清单确认弹窗(agent2 动态生成 checklist 后触发) -->
+    <ChecklistReviewDialog
+      :open="checklistOpen"
+      :checklist="checklistData.checklist"
+      :reasoning="checklistData.reasoning"
+      :submitting="submittingChecklist"
+      @submit="handleSubmitChecklist"
+      @cancel="handleCancelChecklist"
+    />
+
+    <!-- 验证动作授权弹窗(per_action 模式,每个 HTTP/PoC 动作需用户确认) -->
+    <VerifyActionDialog
+      :open="verifyActionOpen"
+      :action="verifyActionData"
+      :submitting="submittingVerifyAction"
+      @approve="handleApproveVerifyAction"
+      @reject="handleRejectVerifyAction"
+    />
+
+    <!-- 练习题生成预览对话框(结果清单发现 → LLM 出题 → 预览确认入库) -->
+    <PracticeGenerateDialog
+      v-if="task"
+      :open="practiceDialogOpen"
+      :task-id="String(task.id)"
+      @close="practiceDialogOpen = false; refreshPracticeDraftCount()"
+      @confirmed="practiceDialogOpen = false; refreshPracticeDraftCount()"
+    />
+
+    <!-- 危险命令确认弹窗(local 模式,危险命令需用户确认) -->
+    <CommandConfirmDialog
+      :open="!!commandConfirmData"
+      :command="commandConfirmData"
+      :submitting="submittingCommandConfirm"
+      @approve="handleApproveCommand"
+      @reject="handleRejectCommand"
+    />
+  </div>
+</template>
+
+<style scoped>
+.page {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  /* 手机地址栏伸缩兜底 */
+  height: 100dvh;
+  overflow: hidden;
+  background: var(--color-bg);
+}
+
+.page-body {
+  flex: 1;
+  display: flex;
+  align-items: stretch;
+  min-height: 0;
+  overflow: hidden;
+  position: relative; /* 给折叠态悬浮把手定位 */
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  max-width: var(--content-width);
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 可滚动内容区(结果清单 + 协作对话流) */
+.main-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-6) var(--space-6) var(--space-12);
+}
+
+/* 用户补充消息(type=message):右对齐,与顶部 userDirective 一致 */
+.user-msg-row {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.user-msg-row :deep(.msg-group) {
+  max-width: 80%;
+}
+
+/* ---- 右侧任务详情栏(抽屉把手式;展开时顶部条+滚动内容区,折叠时不渲染) ---- */
+.detail-sidebar {
+  flex-shrink: 0;
+  width: clamp(320px, 28vw, 420px);
+  min-width: 320px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-bg);
+}
+
+/* 顶部条:标题 + 折叠按钮(header 下方,固定不滚) */
+.detail-sidebar-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
+}
+
+.detail-sidebar-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--color-text);
+}
+
+/* 标题行内的状态徽标与导出按钮:紧凑不换行、不被压缩,
+   窄屏下优先保标题截断 */
+.detail-sidebar-header .badge {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.detail-sidebar-header .overview-actions {
+  flex-shrink: 0;
+}
+
+.detail-sidebar-header .btn-export {
+  width: 28px;
+  height: 28px;
+}
+
+/* 内容区:独立滚动,卡片间距用 gap 统一 */
+.detail-sidebar-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+
+
+/* ---- 折叠态悬浮把手(page-body 右上角,header 下方右侧) ---- */
+.detail-handle {
+  position: absolute;
+  right: var(--space-3);
+  top: var(--space-3);
+  z-index: 5;
+}
+
+/* 折叠态结果数量角标(提示折叠栏内有结果) */
+.detail-handle-badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: var(--fw-semibold);
+  color: var(--color-surface);
+  background: var(--color-primary);
+  border-radius: var(--radius-full);
+  pointer-events: none;
+}
+
+/* ---- 响应式:窄屏下右侧栏改为覆盖式抽屉 ---- */
+@media (max-width: 1024px) {
+  .detail-sidebar {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 20;
+    width: min(420px, 85vw);
+    box-shadow: var(--shadow-xl);
+  }
+}
+
+/* ---- 手机档:抽屉更宽、主区滚动内边距收紧 ---- */
+@media (max-width: 640px) {
+  .detail-sidebar {
+    width: min(420px, 92vw);
+  }
+
+  .main-scroll {
+    padding: var(--space-4) var(--space-3) var(--space-8);
+  }
+}
+
+/* ---- 加载 / 错误状态 ---- */
+.loading-state,
+.error-state {
+  text-align: center;
+  padding: var(--space-16) var(--space-6);
+  color: var(--color-text-secondary);
+}
+
+.spinner-lg {
+  width: 40px;
+  height: 40px;
+  margin: 0 auto var(--space-4);
+  border: 3px solid var(--color-border);
+  border-top-color: var(--color-primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---- 任务详情概览(扁平化) ---- */
+.overview-section {
+  padding: var(--space-2) 0;
+}
+
+/* 出题进度跳转入口(位于结果清单标题行,与「生成练习题」按钮互斥;呼吸红点提示运行中) */
+.gen-progress-entry {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: auto;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.gen-progress-entry:hover {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+  background: var(--color-primary-light);
+}
+
+.gen-progress-entry .gen-pulse-dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-primary);
+  animation: gen-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes gen-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.7); }
+}
+
+.overview-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.btn-export {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.btn-export:hover:not(:disabled) {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.btn-export:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.overview-meta {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.overview-meta dt {
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-1);
+}
+
+.overview-meta dd {
+  font-size: var(--fs-sm);
+  color: var(--color-text);
+}
+
+.overview-stage {
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-surface-alt);
+  border-radius: var(--radius-md);
+}
+
+.overview-stage .label {
+  display: block;
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-1);
+}
+
+.overview-stage p {
+  font-size: var(--fs-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+/* ---- 状态徽章 ---- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  border-radius: var(--radius-full);
+}
+
+.badge-pending { background: var(--color-surface-alt); color: var(--color-text-secondary); }
+.badge-running { background: var(--color-info-light); color: var(--color-info); }
+.badge-paused { background: var(--color-warning-light); color: var(--color-warning); }
+.badge-completed { background: var(--color-success-light); color: var(--color-success); }
+.badge-failed { background: var(--color-danger-light); color: var(--color-danger); }
+
+/* ---- 失败任务重试条(failed 状态替换底部补充消息输入框位置) ---- */
+.retry-bar {
+  width: 94%;
+  margin: 0 auto var(--space-4);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-3);
+  box-shadow: var(--shadow-md);
+  background: var(--color-danger-light);
+}
+
+.retry-bar-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.retry-bar-label {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--color-danger);
+}
+
+.retry-bar-error {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.retry-btn {
+  flex-shrink: 0;
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--color-text-inverse);
+  background: var(--color-primary);
+  border: none;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.retry-btn:hover:not(:disabled) {
+  background: var(--color-primary-hover);
+}
+
+.retry-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* ---- 提示 ---- */
+.alert {
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  margin-top: var(--space-3);
+}
+
+.alert-error {
+  background: var(--color-danger-light);
+  color: var(--color-danger);
+  border: 1px solid #fecaca;
+}
+
+/* ---- 通用 section ---- */
+/* 对话流:无外框,直接铺在主区背景上(聊天式) */
+.conversation-section {
+  margin-bottom: var(--space-6);
+}
+
+/* 右侧栏分区标题(结果清单/检查点评估,与覆盖度区块一致) */
+.sidebar-results h2,
+.sidebar-checkpoints h2 {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+}
+
+/* 结果清单标题旁的「生成练习题」入口(仅任务完成后可用) */
+.practice-generate-btn {
+  margin-left: auto;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.practice-generate-btn:hover {
+  color: var(--color-text-inverse);
+  background: var(--color-primary);
+}
+
+/* 出题入口旁的「本次出题将使用」提示(位于结果清单标题行下方) */
+.generate-model-hint {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  margin: var(--space-2) 0 var(--space-3);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+
+.generate-model-name {
+  font-weight: var(--fw-semibold);
+  color: var(--color-text);
+}
+
+.generate-model-source {
+  color: var(--color-text-muted);
+}
+
+/* 结果分组头(仅有分组声明时显示) */
+.sidebar-result-group {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-sm);
+  margin: var(--space-3) 0 var(--space-2);
+}
+
+.count {
+  color: var(--color-text-muted);
+  font-weight: var(--fw-normal);
+  font-size: var(--fs-sm);
+}
+
+/* ---- 覆盖度 ---- */
+.coverage-section {
+  margin-bottom: 0;
+}
+
+.coverage-section h2 {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+}
+
+.coverage-round {
+  margin-left: auto;
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+  font-weight: var(--fw-normal);
+}
+
+.coverage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: var(--space-2);
+}
+
+.coverage-card {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  transition: all var(--transition-fast);
+}
+
+.coverage-covered {
+  border-color: var(--color-success);
+  background: var(--color-success-light);
+}
+
+.coverage-covered .coverage-dot {
+  background: var(--color-success);
+}
+
+.coverage-missing {
+  border-color: var(--color-border);
+  background: var(--color-surface-alt);
+}
+
+.coverage-missing .coverage-dot {
+  background: var(--color-text-muted);
+}
+
+.coverage-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-full);
+}
+
+.coverage-name {
+  color: var(--color-text);
+  font-weight: var(--fw-medium);
+  word-break: break-word;
+}
+
+/* ---- 动态验证配置(右侧栏,仅 test_env_url 存在时显示)---- */
+.verifier-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.verifier-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  color: var(--color-text);
+}
+
+.verifier-status {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  padding: 1px 8px;
+  border-radius: var(--radius-full);
+}
+
+.verifier-on {
+  background: var(--color-success-light);
+  color: var(--color-success);
+}
+
+.verifier-off {
+  background: var(--color-surface-alt);
+  color: var(--color-text-muted);
+}
+
+.verifier-env {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--fs-xs);
+}
+
+.verifier-env .label {
+  color: var(--color-text-muted);
+  font-weight: var(--fw-medium);
+}
+
+.verifier-env code {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  color: var(--color-text-secondary);
+  word-break: break-all;
+}
+
+.verifier-toggle-btn {
+  align-self: flex-start;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--color-text-secondary);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.verifier-toggle-btn:hover:not(:disabled) {
+  border-color: var(--color-border-strong);
+  color: var(--color-text);
+}
+
+.verifier-toggle-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 登录凭证列表(只读展示,header_value 脱敏) */
+.verifier-tokens {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+  padding-top: var(--space-2);
+  border-top: 1px dashed var(--color-border);
+  font-size: var(--fs-xs);
+}
+
+.verifier-tokens .label {
+  color: var(--color-text-muted);
+  font-weight: var(--fw-medium);
+}
+
+.verifier-token-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.verifier-token-item .token-label {
+  font-weight: var(--fw-medium);
+  color: var(--color-text);
+}
+
+.verifier-token-item .token-header {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+  word-break: break-all;
+}
+
+/* ---- 结果清单(右侧栏,卡片默认折叠) ---- */
+.severity-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  border-radius: var(--radius-full);
+}
+
+.sev-critical { background: var(--color-sev-critical-bg); color: var(--color-sev-critical-fg); border: 1px solid var(--color-sev-critical-border); }
+.sev-high { background: var(--color-danger-light); color: var(--color-danger); border: 1px solid var(--color-sev-high-border); }
+.sev-medium { background: var(--color-warning-light); color: var(--color-warning); border: 1px solid var(--color-sev-medium-border); }
+.sev-low { background: var(--color-sev-low-bg); color: var(--color-sev-low-fg); border: 1px solid var(--color-sev-low-border); }
+.sev-info { background: var(--color-info-light); color: var(--color-info); border: 1px solid var(--color-sev-info-border); }
+.sev-unknown { background: var(--color-surface-alt); color: var(--color-text-secondary); border: 1px solid var(--color-border); }
+
+.result-cards {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.result-card {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  cursor: pointer;
+  transition: border-color var(--transition-fast);
+}
+
+.result-card:hover {
+  border-color: var(--color-border-strong);
+}
+
+.result-card-expanded {
+  border-color: var(--color-border-strong);
+}
+
+.result-header {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.result-toggle {
+  flex-shrink: 0;
+  margin-top: 2px;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-tight);
+  color: var(--color-text-muted);
+}
+
+.result-header h4 {
+  flex: 1;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-tight);
+  word-break: break-word;
+}
+
+.round-tag {
+  flex-shrink: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+  padding: var(--space-1) var(--space-2);
+  background: var(--color-surface-alt);
+  border-radius: var(--radius-sm);
+}
+
+.result-content {
+  margin-top: var(--space-2);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  word-break: break-word;
+}
+
+/* markdown-body 容器覆盖 pre-wrap:marked 已处理换行 */
+.result-content.markdown-body {
+  white-space: normal;
+}
+
+/* 右侧栏窄宽:代码块横向滚动,避免撑破卡片 */
+.result-content.markdown-body pre {
+  overflow-x: auto;
+}
+
+.result-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.meta-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--fs-xs);
+  font-family: var(--font-mono);
+  color: var(--color-text-secondary);
+  background: var(--color-surface-alt);
+  border-radius: var(--radius-sm);
+}
+
+.meta-file {
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+  cursor: pointer;
+  transition: filter var(--transition-fast);
+}
+
+.meta-file:hover {
+  filter: brightness(0.95);
+}
+
+/* ---- 对话流 ---- */
+/* 用户指令:右对齐气泡,像聊天界面的用户消息(消息卡头部已含"用户指令"标签) */
+.user-directive {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: var(--space-6);
+}
+
+.user-directive :deep(.message) {
+  max-width: 80%;
+}
+
+.round-group {
+  margin-bottom: var(--space-6);
+}
+
+.round-group:last-child {
+  margin-bottom: 0;
+}
+
+/* 检查点位置标记(对话流):平时隐藏;浮现时元素本身高度为 0 不撑开行距,
+   横线由伪元素绝对定位叠加在内容分界线上,继续评估用主题色、打断评估用橙色 */
+.checkpoint-divider {
+  display: none;
+}
+
+.checkpoint-divider-active {
+  display: block;
+  height: 0;
+  position: relative;
+  /* .messages 为带 gap 的纵向 flex,零高项作为子项前后仍各吃一份 gap,
+     用负 margin 精确抵消,保证浮现时布局零变化 */
+  margin: calc(var(--space-3) / -2) 0;
+}
+
+/* step-body 内迭代块相邻无 gap,零高项无需负 margin 抵消(兜底 plain 场景仍用上方规则) */
+.step-body .checkpoint-divider-active {
+  margin: 0;
+}
+
+.checkpoint-divider-active::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -2px;
+  height: 3px;
+  border-radius: var(--radius-full);
+  background: var(--color-primary);
+  animation: checkpoint-flash 1.6s ease-out forwards;
+}
+
+.checkpoint-divider-interrupt.checkpoint-divider-active::after {
+  background: #ea580c;
+}
+
+@keyframes checkpoint-flash {
+  0%, 60% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+.round-label {
+  display: inline-block;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+  border-radius: var(--radius-full);
+  margin-bottom: var(--space-3);
+}
+
+/* ---- 计划清单卡片 ---- */
+.plan-card {
+  margin-bottom: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-plan-bg);
+  border: 1px solid var(--color-plan-border);
+  border-radius: var(--radius-lg);
+}
+
+.plan-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-2);
+}
+
+.plan-title {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--color-plan-title);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.plan-progress {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--color-plan-progress);
+  padding: var(--space-1) var(--space-2);
+  background: var(--color-plan-progress-bg);
+  border-radius: var(--radius-full);
+}
+
+.plan-steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.plan-step {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--fs-sm);
+  border-radius: var(--radius-sm);
+  transition: background 0.15s ease;
+}
+
+.plan-step-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  border-radius: 50%;
+}
+
+.plan-step-text {
+  flex: 1;
+  word-break: break-word;
+}
+
+.plan-step-pending {
+  color: var(--color-text-muted);
+}
+
+.plan-step-pending .plan-step-icon {
+  color: var(--color-text-muted);
+  background: var(--color-surface-alt);
+}
+
+.plan-step-in_progress {
+  color: var(--color-text);
+  background: var(--color-plan-active-bg);
+}
+
+.plan-step-in_progress .plan-step-icon {
+  color: var(--color-plan-active-icon);
+  background: var(--color-plan-active-icon-bg);
+  animation: plan-step-pulse 1.5s ease-in-out infinite;
+}
+
+.plan-step-done {
+  color: var(--color-text-secondary);
+  text-decoration: line-through;
+  text-decoration-color: var(--color-text-muted);
+}
+
+.plan-step-done .plan-step-icon {
+  color: #fff;
+  background: #10b981;
+}
+
+@keyframes plan-step-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(0.9); }
+}
+
+.messages {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding-left: var(--space-4);
+}
+
+/* ---- step 分组(plan step,可折叠,内含多个迭代) ---- */
+/* 左竖线已移除:状态色由 step header 内的状态图标(step-status-*)承载 */
+.step-block {
+  margin-bottom: var(--space-2);
+}
+
+.step-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: background 0.15s ease;
+  user-select: none;
+}
+
+.step-header:hover {
+  background: var(--color-surface-alt);
+}
+
+.step-toggle {
+  flex-shrink: 0;
+  width: 14px;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  text-align: center;
+}
+
+.step-status-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  border-radius: 50%;
+}
+
+.step-status-pending {
+  color: var(--color-text-muted);
+  background: var(--color-surface-alt);
+}
+
+.step-status-in_progress {
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.15);
+  animation: step-pulse 1.5s ease-in-out infinite;
+}
+
+.step-status-done {
+  color: #fff;
+  background: #10b981;
+}
+
+.step-status-none {
+  color: var(--color-text-muted);
+  background: transparent;
+}
+
+@keyframes step-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(0.9); }
+}
+
+.step-text {
+  flex: 1;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.step-done .step-text {
+  color: var(--color-text-secondary);
+  text-decoration: line-through;
+  text-decoration-color: var(--color-text-muted);
+}
+
+.step-iter-count {
+  flex-shrink: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+  padding: var(--space-1) var(--space-2);
+  background: var(--color-surface-alt);
+  border-radius: var(--radius-full);
+}
+
+.step-streaming-tag {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+}
+
+.step-body {
+  padding-left: var(--space-3);
+  padding-top: var(--space-1);
+  padding-bottom: var(--space-1);
+}
+
+/* ---- 迭代块(agent1 一次 ReAct 循环,结构容器:无摘要行、无边框包装) ---- */
+.iteration-block {
+  /* 透明容器,仅承载 iteration-body 的间距 */
+}
+
+.iteration-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+}
+
+/* ---- 工具卡片(agent 子智能体 / toolpair 普通工具:标题行 + 折叠内容) ---- */
+.tool-card {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  overflow: hidden;
+}
+
+/* 子智能体卡片:左边线标示嵌套层级 */
+.tool-card-agent {
+  border-left: 2px solid var(--color-primary, #6366f1);
+}
+
+.tool-card-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s ease;
+}
+
+.tool-card-header:hover {
+  background: var(--color-surface-alt);
+}
+
+.tool-card-title {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--color-text);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  border-top: 1px solid var(--color-border);
+}
+
+.tool-card-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.tool-card-section-label {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--color-text-muted);
+}
+
+.tool-card-think-toggle {
+  cursor: pointer;
+  user-select: none;
+}
+
+.tool-card-mono {
+  padding: var(--space-2);
+  background: var(--color-surface-alt);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.tool-card-think {
+  padding: var(--space-2);
+  background: var(--color-surface-alt);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  font-style: italic;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+/* 子智能体报告正文:Markdown 渲染 */
+.tool-card-markdown {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  max-height: 600px;
+  overflow-y: auto;
+}
+
+.tool-card-running {
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
+.tool-group-toggle {
+  display: inline-block;
+  width: 14px;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  text-align: center;
+}
+
+/* ---- 紧凑工具行(读文件/搜索/列目录:单行摘要 + 轻量展开原始结果) ---- */
+.tool-compact {
+  display: flex;
+  flex-direction: column;
+}
+
+.tool-compact-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  cursor: pointer;
+  user-select: none;
+  border-radius: var(--radius-sm);
+  transition: background 0.15s ease;
+}
+
+.tool-compact-row:hover {
+  background: var(--color-surface-alt);
+}
+
+.tool-compact-summary {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 工具行摘要内的文件路径链接:点击跳转左侧文件树打开 */
+.tool-file-link {
+  color: var(--color-primary);
+  text-decoration: underline;
+  text-decoration-style: dashed;
+  cursor: pointer;
+}
+
+.tool-file-link:hover {
+  color: var(--color-primary-hover);
+}
+
+.tool-compact-result {
+  margin: var(--space-1) var(--space-2) var(--space-1) calc(var(--space-2) + 14px + var(--space-2));
+  padding: var(--space-2);
+  background: var(--color-surface-alt);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono, monospace);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+/* ---- 对话区头部 + 实时指示器(标题已移除,仅在运行时右对齐显示实时徽标) ---- */
+.conv-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-6);
+}
+
+.conv-header-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+}
+
+.conv-header-title {
+  font-size: var(--fs-base);
+  font-weight: 600;
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conv-header-time {
+  flex-shrink: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+.live-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--color-danger);
+  padding: var(--space-1) var(--space-3);
+  background: var(--color-danger-light);
+  border-radius: var(--radius-full);
+}
+
+/* 暂停徽标:橙色,带两条竖线图标(CSS 绘制,不用 emoji) */
+.paused-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--color-warning);
+  padding: var(--space-1) var(--space-3);
+  background: var(--color-warning-light);
+  border-radius: var(--radius-full);
+}
+
+.paused-bars {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  /* 两条竖线 = 暂停符号,用线性渐变绘制 */
+  background:
+    linear-gradient(
+      to right,
+      var(--color-warning) 0,
+      var(--color-warning) 2px,
+      transparent 2px,
+      transparent 3px,
+      var(--color-warning) 3px,
+      var(--color-warning) 5px,
+      transparent 5px
+    );
+}
+
+/* 暂停/恢复按钮:与实时徽标并排 */
+.btn-pause {
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--color-text-secondary);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.btn-pause:hover:not(:disabled) {
+  border-color: var(--color-warning);
+  color: var(--color-warning);
+}
+
+.btn-pause:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  background: var(--color-danger);
+  border-radius: 50%;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.85); }
+}
+
+/* ---- 运行中等待提示 ---- */
+.waiting-hint {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  color: var(--color-text-secondary);
+  font-size: var(--fs-sm);
+  background: var(--color-surface-alt);
+  border-radius: var(--radius-lg);
+}
+
+/* 暂停态:橙色提示,不闪烁 */
+.waiting-hint-paused {
+  color: var(--color-warning);
+  background: var(--color-warning-light);
+}
+
+.typing-dots {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.typing-dots span {
+  width: 6px;
+  height: 6px;
+  background: var(--color-text-muted);
+  border-radius: 50%;
+  animation: typing 1.4s infinite;
+}
+
+.typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+.typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes typing {
+  0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-4px); }
+}
+
+/* ---- 仓库克隆进度条 ---- */
+.clone-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+}
+
+.clone-progress-info {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: var(--fs-sm);
+}
+
+.clone-progress-stage {
+  color: var(--color-text-secondary);
+}
+
+.clone-progress-percent {
+  color: var(--color-primary);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.clone-progress-bar {
+  width: 100%;
+  height: 6px;
+  background: var(--color-border);
+  border-radius: var(--radius-full, 999px);
+  overflow: hidden;
+}
+
+.clone-progress-fill {
+  height: 100%;
+  background: var(--color-primary);
+  border-radius: var(--radius-full, 999px);
+  transition: width 0.3s ease;
+}
+
+.clone-progress-msg {
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+  font-family: var(--font-mono, monospace);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.clone-progress-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.clone-skip-btn {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md, 6px);
+  padding: 2px 10px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.clone-skip-btn:hover:not(:disabled) {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+}
+
+.clone-skip-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ---- 工作区变更(diff/patch 展示) ---- */
+.workspace-changes-section {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-sm);
+  padding: var(--space-6);
+  margin-bottom: var(--space-6);
+}
+.wc-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  cursor: pointer;
+  user-select: none;
+}
+.wc-header h2 {
+  font-size: var(--fs-lg);
+  margin: 0;
+}
+.wc-meta {
+  color: var(--color-text-muted);
+  font-size: var(--fs-sm);
+}
+.wc-truncated {
+  color: var(--color-warning);
+}
+.wc-toggle {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  padding: 0 var(--space-1);
+}
+.diff-view {
+  margin-top: var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  background: var(--color-surface-alt);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  overflow-x: auto;
+  max-height: 70vh;
+}
+.diff-line {
+  white-space: pre;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+}
+.diff-line-add { background: rgba(22, 163, 74, 0.12); }
+.diff-line-del { background: rgba(220, 38, 38, 0.12); }
+.diff-line-hunk { color: var(--color-text-muted); }
+.diff-line-meta { color: var(--color-text-secondary); font-weight: var(--fw-medium); }
+.diff-line-ctx { color: var(--color-text); }
+
+/* ============================================================
+ * 检查点评估聚合列表(右侧栏)
+ * - 按时间聚合 agent2 迭代边界轻量评估
+ * - 打断项橙红左边框高亮;点击条目定位对话流对应轮次
+ * ============================================================ */
+.checkpoint-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.checkpoint-item {
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-surface-alt);
+  border: 1px solid var(--color-border);
+  border-left: 3px solid var(--color-text-muted);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: border-color var(--transition-fast);
+}
+
+.checkpoint-item:hover {
+  border-color: var(--color-border-strong);
+}
+
+.checkpoint-item-interrupt {
+  background: var(--color-checkpoint-interrupt-bg);
+  border-color: var(--color-checkpoint-interrupt-border);
+  border-left-color: #ea580c;
+}
+
+.checkpoint-item-interrupt:hover {
+  border-color: var(--color-checkpoint-interrupt-border);
+}
+
+.checkpoint-item-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-1);
+}
+
+.checkpoint-item-pos {
+  font-weight: var(--fw-medium);
+  color: var(--color-text-secondary);
+}
+
+.checkpoint-item-reason {
+  color: var(--color-text-secondary);
+  line-height: var(--lh-relaxed);
+  word-break: break-word;
+}
+
+.checkpoint-item-interrupt .checkpoint-item-reason {
+  color: #7c2d12;
+}
+
+.checkpoint-item-query {
+  margin-top: var(--space-1);
+  color: var(--color-text);
+  font-weight: var(--fw-medium);
+  word-break: break-word;
+}
+
+.checkpoint-badge {
+  margin-left: auto;
+  padding: 2px var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  border-radius: var(--radius-full);
+}
+
+.checkpoint-badge-continue {
+  color: #059669;
+  background: rgba(5, 150, 105, 0.12);
+}
+
+.checkpoint-badge-interrupt {
+  color: #c2410c;
+  background: rgba(234, 88, 12, 0.15);
+}
+
+.checkpoint-badge-pending {
+  color: var(--color-text-muted);
+  background: var(--color-border);
+}
+
+.checkpoint-badge-cancelled {
+  color: #6b7280;
+  background: rgba(107, 114, 128, 0.15);
+}
+
+.checkpoint-badge-awaiting {
+  color: #c2410c;
+  background: rgba(234, 88, 12, 0.15);
+}
+
+/* 打断取消按钮(侧栏检查点条目内):待生效窗口内的橙色小按钮 */
+.checkpoint-cancel-btn {
+  padding: 1px var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: #c2410c;
+  background: rgba(234, 88, 12, 0.12);
+  border: 1px solid rgba(234, 88, 12, 0.4);
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  transition: filter var(--transition-fast);
+}
+
+.checkpoint-cancel-btn:hover:not(:disabled) {
+  filter: brightness(0.95);
+}
+
+.checkpoint-cancel-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* 检查点思考链(条目内可折叠块;流式中 header 高亮) */
+.checkpoint-thinking {
+  margin-top: var(--space-2);
+  padding-top: var(--space-1);
+  border-top: 1px dashed var(--color-border);
+}
+
+.checkpoint-thinking-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--color-text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.checkpoint-thinking-active .checkpoint-thinking-header {
+  color: var(--color-primary);
+}
+
+.checkpoint-thinking-toggle {
+  font-size: 10px;
+}
+
+.checkpoint-thinking-meta {
+  margin-left: auto;
+}
+
+.checkpoint-thinking-body {
+  margin-top: var(--space-1);
+  max-height: 240px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--color-text-secondary);
+  line-height: var(--lh-relaxed);
+}
+</style>

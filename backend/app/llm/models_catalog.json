@@ -1,0 +1,157 @@
+{
+  "_comment": "LLM / Embedding 厂商清单。阶段 1 起所有 provider 走 OpenAI 兼容后端,差异通过本文件描述。",
+  "_outputLimit": "outputLimit 为模型单次输出上限(token),按官方能力保守取值;未列出的模型用 provider.fallbackOutputLimit,再缺失用系统默认 16384",
+  "_thinkingModes": {
+    "hybrid": "混合思考,可通过 enable_thinking/thinking 参数开关",
+    "only": "仅思考模式,无法关闭",
+    "none": "不支持思考"
+  },
+  "llmProviders": [
+    {
+      "id": "dashscope",
+      "name": "阿里云百炼 DashScope",
+      "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "apiKeyUrl": "https://dashscope.console.aliyun.com/",
+      "supportsThinking": true,
+      "thinkingParam": "enable_thinking",
+      "models": [
+        { "id": "qwen3.7-max", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 8192 },
+        { "id": "qwen3.7-plus", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 8192 },
+        { "id": "qwen3.6-flash", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 8192 },
+        { "id": "qwen3.6-pro", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 8192 },
+        { "id": "deepseek-v4-flash", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 8192 },
+        { "id": "deepseek-v4-pro", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 8192 },
+        { "id": "qwq-plus", "thinking": "only", "thinkingDefault": true, "outputLimit": 8192 }
+      ]
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek 官方",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKeyUrl": "https://platform.deepseek.com/api_keys",
+      "supportsThinking": true,
+      "thinkingParam": "thinking",
+      "models": [
+        { "id": "deepseek-v4-flash", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 8192 },
+        { "id": "deepseek-v4-pro", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 8192 }
+      ]
+    },
+    {
+      "id": "zhipu",
+      "name": "智谱 AI (BigModel)",
+      "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+      "apiKeyUrl": "https://open.bigmodel.cn/usercenter/apikeys",
+      "supportsThinking": true,
+      "thinkingParam": "thinking",
+      "models": [
+        { "id": "glm-5.2", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 16384 },
+        { "id": "glm-5.1", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 16384 }
+      ]
+    },
+    {
+      "id": "moonshot",
+      "name": "月之暗面 Kimi",
+      "baseUrl": "https://api.moonshot.cn/v1",
+      "apiKeyUrl": "https://platform.moonshot.cn/console/api-keys",
+      "supportsThinking": true,
+      "thinkingParam": "thinking",
+      "thinkingEnabledType": "enabled",
+      "thinkingTemperature": 1.0,
+      "nonThinkingTemperature": 0.6,
+      "models": [
+        { "id": "kimi-k2.7-code", "thinking": "only", "thinkingDefault": true, "outputLimit": 16384 },
+        { "id": "kimi-k2.6", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 8192 },
+        { "id": "kimi-k2.5", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 8192 }
+      ]
+    },
+    {
+      "id": "doubao",
+      "name": "火山引擎豆包",
+      "baseUrl": "https://ark.cn-beijing.volces.com/api/v3",
+      "apiKeyUrl": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey",
+      "supportsThinking": true,
+      "thinkingParam": "thinking",
+      "fallbackThinking": "hybrid",
+      "fallbackOutputLimit": 8192,
+      "models": [
+        { "id": "doubao-seed-2-1-pro-260628", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 8192 },
+        { "id": "doubao-seed-2-1-turbo-260628", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 8192 },
+        { "id": "doubao-seed-2-0-mini-260428", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 8192 }
+      ]
+    },
+    {
+      "id": "minimax",
+      "name": "MiniMax",
+      "baseUrl": "https://api.minimaxi.com",
+      "apiKeyUrl": "https://platform.minimaxi.com/user-center/basic-information/interface-key",
+      "supportsThinking": true,
+      "thinkingParam": "thinking",
+      "thinkingEnabledType": "adaptive",
+      "reasoningSplit": true,
+      "fallbackOutputLimit": 8192,
+      "models": [
+        { "id": "MiniMax-M3", "thinking": "hybrid", "thinkingDefault": true, "outputLimit": 8192 },
+        { "id": "MiniMax-M2.7", "thinking": "only", "thinkingDefault": true, "outputLimit": 8192 }
+      ]
+    }
+  ],
+  "embeddingProviders": [
+    {
+      "id": "dashscope",
+      "name": "阿里云百炼 DashScope",
+      "backend": "dashscope",
+      "baseUrl": "https://dashscope.aliyuncs.com/api/v1",
+      "apiKeyUrl": "https://dashscope.console.aliyun.com/",
+      "models": [
+        { "id": "text-embedding-v4", "name": "Text-Embedding-V4 (纯文本)", "dimension": 1024, "multimodal": false },
+        { "id": "qwen3-vl-embedding", "name": "Qwen3-VL-Embedding (多模态,默认2560维,通过dimension参数指定1024)", "dimension": 1024, "multimodal": true, "dimensionsParam": true },
+        { "id": "tongyi-embedding-vision-plus-2026-03-06", "name": "Tongyi-Embedding-Vision-Plus (多模态,默认1152维,通过dimension参数指定1024)", "dimension": 1024, "multimodal": true, "dimensionsParam": true }
+      ]
+    },
+    {
+      "id": "zhipu",
+      "name": "智谱 AI (BigModel)",
+      "backend": "openai",
+      "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+      "apiKeyUrl": "https://open.bigmodel.cn/usercenter/apikeys",
+      "models": [
+        { "id": "embedding-3", "name": "Embedding-3", "dimension": 1024, "multimodal": false, "dimensionsParam": true }
+      ]
+    },
+    {
+      "id": "baidu",
+      "name": "百度千帆",
+      "backend": "openai",
+      "baseUrl": "https://qianfan.baidubce.com/v2",
+      "apiKeyUrl": "https://console.bce.baidu.com/iam/#/iam/apikey/list",
+      "models": [
+        { "id": "bge-large-zh", "name": "BGE-Large-ZH", "dimension": 1024, "multimodal": false },
+        { "id": "bge-large-en", "name": "BGE-Large-EN", "dimension": 1024, "multimodal": false }
+      ]
+    },
+    {
+      "id": "volcengine",
+      "name": "火山引擎豆包",
+      "backend": "openai",
+      "baseUrl": "https://ark.cn-beijing.volces.com/api/v3",
+      "apiKeyUrl": "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey",
+      "fallbackDimension": 1024,
+      "fallbackMultimodal": true,
+      "fallbackMultimodalEndpoint": true,
+      "fallbackDimensionsParam": true,
+      "models": [
+        { "id": "doubao-embedding-vision-251215", "name": "Doubao Embedding Vision 251215", "dimension": 1024, "multimodal": true, "multimodalEndpoint": true, "dimensionsParam": true }
+      ]
+    },
+    {
+      "id": "jina",
+      "name": "Jina AI",
+      "backend": "openai",
+      "baseUrl": "https://api.jina.ai/v1",
+      "apiKeyUrl": "https://jina.ai/api-dashboard/",
+      "models": [
+        { "id": "jina-embeddings-v5-text-small", "name": "Jina Embeddings V5 Text Small", "dimension": 1024, "multimodal": false, "dimensionsParam": true }
+      ]
+    }
+  ]
+}

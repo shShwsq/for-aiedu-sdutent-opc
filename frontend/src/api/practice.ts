@@ -1,0 +1,144 @@
+/**
+ * 练习模块 API(对应后端 app/routers/practice.py)
+ *
+ * 题目来源为审计任务的真实发现,经 LLM 改编为客观题;
+ * 组卷策略:到期复习(SM-2)+ 薄弱点强化 + 难度匹配。
+ */
+import client from './client'
+import type {
+  ActivateQuestionsRequest,
+  ActivateQuestionsResponse,
+  ClearRecordsResponse,
+  ConfirmQuestionsRequest,
+  ConfirmQuestionsResponse,
+  DraftQuestion,
+  GenerateJobResponse,
+  GenerateJobsResponse,
+  GenerateJobStatus,
+  GenerateModelInfo,
+  GenerateRequest,
+  PracticeStats,
+  PracticeSummary,
+  QuestionListItem,
+  SessionDetail,
+  SessionListItem,
+  StartSessionRequest,
+  StartSessionResponse,
+  SubmitAnswerRequest,
+  SubmitAnswerResponse,
+  TrendResponse,
+} from '@/types/practice'
+
+/**
+ * 从审计任务生成候选题(draft,异步)
+ *
+ * 立即返回 job_id,轮询 getGenerateJob 拿进度与结果。
+ */
+export function generateQuestions(req: GenerateRequest): Promise<GenerateJobResponse> {
+  return client.post('/practice/generate', req).then((r) => r.data)
+}
+
+/** 本次出题将使用的模型(任务详情页出题入口附近展示用,与真实出题同一解析) */
+export function getTaskGenerateModel(taskId: string): Promise<GenerateModelInfo> {
+  return client.get(`/practice/tasks/${taskId}/generate-model`).then((r) => r.data)
+}
+
+/** 轮询出题进度与结果 */
+export function getGenerateJob(jobId: string): Promise<GenerateJobStatus> {
+  return client.get(`/practice/generate/${jobId}`).then((r) => r.data)
+}
+
+/**
+ * 当前用户的出题 job 列表(运行中优先,限最近 10 条)
+ *
+ * 练习页侧栏轮询发现正在运行的出题 job(手动与自动来源都含);
+ * 实时进度与流式输出另走 SSE,见 api/practiceStream.ts。
+ */
+export function listGenerateJobs(): Promise<GenerateJobsResponse> {
+  return client.get('/practice/generate/jobs').then((r) => r.data)
+}
+
+/** 待确认候选题完整内容(可按来源任务过滤) */
+export function listDrafts(taskId?: string): Promise<DraftQuestion[]> {
+  return client
+    .get('/practice/drafts', { params: taskId ? { task_id: taskId } : {} })
+    .then((r) => r.data)
+}
+
+/** 确认勾选的候选题入库,丢弃其余 draft */
+export function confirmQuestions(
+  req: ConfirmQuestionsRequest,
+): Promise<ConfirmQuestionsResponse> {
+  return client.post('/practice/questions/confirm', req).then((r) => r.data)
+}
+
+/** 只转正指定 draft(不影响其余 draft) */
+export function activateQuestions(
+  req: ActivateQuestionsRequest,
+): Promise<ActivateQuestionsResponse> {
+  return client.post('/practice/questions/activate', req).then((r) => r.data)
+}
+
+/** 按需即时组卷(答案不下发) */
+export function startSession(req: StartSessionRequest): Promise<StartSessionResponse> {
+  return client.post('/practice/sessions', req).then((r) => r.data)
+}
+
+/** 提交单题答案,返回判分结果与知识点记忆状态更新 */
+export function submitAnswer(
+  sessionId: string,
+  req: SubmitAnswerRequest,
+): Promise<SubmitAnswerResponse> {
+  return client.post(`/practice/sessions/${sessionId}/answers`, req).then((r) => r.data)
+}
+
+/** 练习统计:能力值 / 到期复习数 / 薄弱点分布 */
+export function getPracticeStats(): Promise<PracticeStats> {
+  return client.get('/practice/stats').then((r) => r.data)
+}
+
+/** 题库列表(可按状态 / 知识点筛选;mistake=true 只返回答错过的 active 题) */
+export function listQuestions(params?: {
+  status?: string
+  knowledge_point?: string
+  mistake?: boolean
+}): Promise<QuestionListItem[]> {
+  return client.get('/practice/questions', { params }).then((r) => r.data)
+}
+
+/** 轻量汇总(导航徽章用):到期复习数 + 待确认 draft 数 */
+export function getPracticeSummary(): Promise<PracticeSummary> {
+  return client.get('/practice/summary').then((r) => r.data)
+}
+
+/** 按周聚合的学习趋势(默认最近 8 周) */
+export function getPracticeTrend(weeks = 8): Promise<TrendResponse> {
+  return client.get('/practice/trend', { params: { weeks } }).then((r) => r.data)
+}
+
+/** 历史练习会话列表(新到旧) */
+export function listPracticeSessions(limit = 20): Promise<SessionListItem[]> {
+  return client.get('/practice/sessions', { params: { limit } }).then((r) => r.data)
+}
+
+/** 会话逐题作答明细 */
+export function getSessionDetail(sessionId: string): Promise<SessionDetail> {
+  return client.get(`/practice/sessions/${sessionId}`).then((r) => r.data)
+}
+
+/** 归档题目(不再参与组卷) */
+export function archiveQuestion(questionId: string): Promise<{ archived: boolean }> {
+  return client.post(`/practice/questions/${questionId}/archive`).then((r) => r.data)
+}
+
+/**
+ * 清空练习记录(不可恢复)
+ *
+ * includeQuestions=false:进度归零(流水/会话/记忆状态),题库保留但难度重置;
+ * includeQuestions=true:连题目与知识点词典一并删除。
+ */
+export function clearPracticeRecords(includeQuestions = false): Promise<ClearRecordsResponse> {
+  return client
+    .delete('/practice/records', { params: { include_questions: includeQuestions } })
+    .then((r) => r.data)
+}

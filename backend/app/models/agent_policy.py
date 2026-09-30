@@ -1,0 +1,243 @@
+"""用户级 agent 协作策略 (per-user, 1:1)
+
+检查点评估的用户级默认(评估频率、打断权限、验证权限等),
+任务级可通过 task.params["_agent_policy"] 覆盖。
+字段语义见 agent_checkpoint.DEFAULT_AGENT_POLICY。
+
+设计:
+- 1:1 表(user_id unique),用户首次保存时 get_or_create
+- 结构化列(不再用 JSONB):全部字段非空带 server_default(= DEFAULT_AGENT_POLICY),
+  checkpoint_interval_builtin / checkpoint_interval_cli 可空(null=用统一值)
+- 保存接口(PUT /memory/preferences/agent_policy)总是全字段写入,无"部分保存"状态
+
+迁移:老数据存于 user_preferences.agent_policy JSONB 列,
+migrate_agent_policy_table() 启动时把数据拷入本表后删除旧列(幂等)。
+"""
+import uuid
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Text, func
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.database import Base
+
+
+class AgentPolicy(Base):
+    __tablename__ = "agent_policies"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        unique=True,  # 1:1
+        nullable=False,
+    )
+    # 是否启用 agent2(关闭=单 agent 模式,跳过评估/打断/验证)
+    agent2_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true", default=True
+    )
+    # agent2 协作总轮次(上限由 MAX_MAX_ROUNDS 控制,写入时钳制)
+    max_rounds: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="4", default=4
+    )
+    # 统一 K 值,每 K 个迭代评估一次
+    checkpoint_interval: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="10", default=10
+    )
+    # 高级:内置 react_agent 专用 K 值(null=用统一值)
+    checkpoint_interval_builtin: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    # 高级:CLI agent 专用 K 值(null=用统一值)
+    checkpoint_interval_cli: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    # agent2 是否能打断 react_agent
+    allow_interrupt: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true", default=True
+    )
+    # 每轮最多打断次数(防死锁)
+    max_interrupts_per_round: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="2", default=2
+    )
+    # agent2 是否能调用 verifier_agent 验证(需任务配了 test_env_url)
+    allow_verify: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False
+    )
+    # 验证授权默认模式("direct" 直接执行 / "per_action" 逐动作授权)
+    verifier_auth_mode_default: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="per_action", default="per_action"
+    )
+    # 执行智能体命令确认默认模式("always_approve" / "per_command")
+    executor_command_confirm_default: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        server_default="always_approve",
+        default="always_approve",
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """转成与 DEFAULT_AGENT_POLICY 键对齐的 dict(resolve_agent_policy 合并用)"""
+        return {
+            "agent2_enabled": self.agent2_enabled,
+            "max_rounds": self.max_rounds,
+            "checkpoint_interval": self.checkpoint_interval,
+            "checkpoint_interval_builtin": self.checkpoint_interval_builtin,
+            "checkpoint_interval_cli": self.checkpoint_interval_cli,
+            "allow_interrupt": self.allow_interrupt,
+            "max_interrupts_per_round": self.max_interrupts_per_round,
+            "allow_verify": self.allow_verify,
+            "verifier_auth_mode_default": self.verifier_auth_mode_default,
+            "executor_command_confirm_default": self.executor_command_confirm_default,
+        }
+
+
+# ============================================================
+# 迁移:老 JSONB 数据 → 独立表
+# ============================================================
+
+
+def normalize_policy_dict(
+    raw: dict | None, defaults: dict[str, Any], max_rounds_limit: int
+) -> dict[str, Any]:
+    """把原始策略 dict(可能缺字段/类型错乱)规整为全字段 dict。
+
+    迁移老 user_preferences.agent_policy JSONB 用:逐字段做类型防御,
+    非法值回退 defaults 对应值;max_rounds 钳制到 [1, max_rounds_limit]
+    (与保存路由的钳制逻辑一致)。
+    """
+    raw = raw if isinstance(raw, dict) else {}
+
+    def _bool(key: str) -> bool:
+        v = raw.get(key)
+        return v if isinstance(v, bool) else defaults[key]
+
+    def _int(key: str) -> int:
+        try:
+            return int(raw.get(key))
+        except (TypeError, ValueError):
+            return defaults[key]
+
+    def _opt_int(key: str) -> int | None:
+        v = raw.get(key)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _enum(key: str, allowed: tuple[str, ...]) -> str:
+        v = raw.get(key)
+        return v if v in allowed else defaults[key]
+
+    max_rounds = _int("max_rounds")
+    max_rounds = max(1, min(max_rounds, max_rounds_limit))
+
+    return {
+        "agent2_enabled": _bool("agent2_enabled"),
+        "max_rounds": max_rounds,
+        "checkpoint_interval": _int("checkpoint_interval"),
+        "checkpoint_interval_builtin": _opt_int("checkpoint_interval_builtin"),
+        "checkpoint_interval_cli": _opt_int("checkpoint_interval_cli"),
+        "allow_interrupt": _bool("allow_interrupt"),
+        "max_interrupts_per_round": _int("max_interrupts_per_round"),
+        "allow_verify": _bool("allow_verify"),
+        "verifier_auth_mode_default": _enum("verifier_auth_mode_default", ("direct", "per_action")),
+        "executor_command_confirm_default": _enum(
+            "executor_command_confirm_default", ("always_approve", "per_command")
+        ),
+    }
+
+
+def migrate_agent_policy_table() -> None:
+    """幂等迁移:把 user_preferences.agent_policy JSONB 拷入 agent_policies 表,
+    完成后删除旧列。
+
+    背景:项目用 Base.metadata.create_all(无 Alembic),新表随 create_all 建好,
+    但老库的数据还在 user_preferences.agent_policy 列里。
+
+    - user_preferences 不存在 / 无 agent_policy 列(全新库或已迁过)→ 直接返回
+    - 拷贝用 INSERT ... ON CONFLICT (user_id) DO UPDATE,中途失败重跑安全
+    - 老数据经 normalize_policy_dict 规整(缺字段回退 DEFAULT,与老解析语义等价:
+      老 resolve 里缺失键也是回退 DEFAULT_AGENT_POLICY)
+    """
+    import logging
+
+    from sqlalchemy import inspect, text
+
+    from app.agent_checkpoint import DEFAULT_AGENT_POLICY, MAX_MAX_ROUNDS
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    with engine.connect() as conn:
+        insp = inspect(conn)
+        if not insp.has_table("user_preferences"):
+            return  # 全新库,无老数据
+        cols = {c["name"] for c in insp.get_columns("user_preferences")}
+        if "agent_policy" not in cols:
+            return  # 全新库(新 model 无此列)或已迁过
+
+        rows = conn.execute(
+            text(
+                "SELECT user_id, agent_policy FROM user_preferences "
+                "WHERE agent_policy IS NOT NULL"
+            )
+        ).fetchall()
+        for user_id, raw in rows:
+            if not isinstance(raw, dict):
+                continue  # 脏数据跳过(等价于老行为:非 dict 不参与合并)
+            d = normalize_policy_dict(raw, DEFAULT_AGENT_POLICY, MAX_MAX_ROUNDS)
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO agent_policies (
+                        id, user_id, agent2_enabled, max_rounds, checkpoint_interval,
+                        checkpoint_interval_builtin, checkpoint_interval_cli, allow_interrupt,
+                        max_interrupts_per_round, allow_verify, verifier_auth_mode_default,
+                        executor_command_confirm_default
+                    ) VALUES (
+                        :id, :user_id, :agent2_enabled, :max_rounds, :checkpoint_interval,
+                        :checkpoint_interval_builtin, :checkpoint_interval_cli, :allow_interrupt,
+                        :max_interrupts_per_round, :allow_verify, :verifier_auth_mode_default,
+                        :executor_command_confirm_default
+                    )
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        agent2_enabled = EXCLUDED.agent2_enabled,
+                        max_rounds = EXCLUDED.max_rounds,
+                        checkpoint_interval = EXCLUDED.checkpoint_interval,
+                        checkpoint_interval_builtin = EXCLUDED.checkpoint_interval_builtin,
+                        checkpoint_interval_cli = EXCLUDED.checkpoint_interval_cli,
+                        allow_interrupt = EXCLUDED.allow_interrupt,
+                        max_interrupts_per_round = EXCLUDED.max_interrupts_per_round,
+                        allow_verify = EXCLUDED.allow_verify,
+                        verifier_auth_mode_default = EXCLUDED.verifier_auth_mode_default,
+                        executor_command_confirm_default = EXCLUDED.executor_command_confirm_default,
+                        updated_at = now()
+                    """
+                ),
+                {"id": str(uuid.uuid4()), "user_id": user_id, **d},
+            )
+        conn.execute(
+            text("ALTER TABLE user_preferences DROP COLUMN agent_policy")
+        )
+        conn.commit()
+        log.info(
+            "agent_policy 迁移完成: %d 条记录拷入 agent_policies,旧列已删除",
+            len(rows),
+        )

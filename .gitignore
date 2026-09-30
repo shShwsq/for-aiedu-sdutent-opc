@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+
+# 环境变量
+.env
+.env.local
+
+# IDE
+.vscode/
+.trae/
+.qoder/
+.idea/
+*.swp
+*.swo
+
+# 日志
+*.log
+logs/
+
+# 数据库迁移生成的临时文件
+*.sqlite3
+
+# 运行时数据
+_repos/
+
+# 沙箱镜像构建临时目录(--hermes-local-dir 复制宿主机源码到构建上下文用)
+hermes-local/
+hermes-git-meta/
+
+# 用户上传的 skill(按用户隔离的运行时数据,不入库)
+backend/skills/user_*/
+# 用户上传 skill 的默认存储目录(可经 USER_SKILLS_DIR 环境变量配置)
+backend/user_skills/
+
+# 参考资料
+references/
+

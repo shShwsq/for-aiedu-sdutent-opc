@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180" width="180" height="180">
+  <defs>
+    <linearGradient id="gradA" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6C5CE7"/>
+      <stop offset="100%" stop-color="#4834D4"/>
+    </linearGradient>
+    <linearGradient id="gradB" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#00CEC9"/>
+      <stop offset="100%" stop-color="#0984E3"/>
+    </linearGradient>
+  </defs>
+  <rect width="180" height="180" rx="36" fill="#fff"/>
+  <g transform="translate(90, 90)">
+    <!-- 六边形环:纵向压缩 0.8 倍,使左右梯形更矮、整体更紧凑 -->
+    <g transform="scale(1, 0.8)">
+      <polygon points="-30,-78 30,-78 48,-52 -48,-52" fill="url(#gradA)"/>
+      <polygon points="48,-52 78,0 58,18 30,-48" fill="url(#gradB)"/>
+      <polygon points="58,18 58,54 30,78 30,42" fill="url(#gradA)"/>
+      <polygon points="30,42 30,78 -30,78 -30,42" fill="url(#gradB)"/>
+      <polygon points="-30,42 -30,78 -58,54 -58,18" fill="url(#gradA)"/>
+      <polygon points="-58,18 -78,0 -48,-52 -30,-48" fill="url(#gradB)"/>
+    </g>
+    <!-- 双气泡:放大 1.3 倍并平移至六边形环中心(略偏右以视觉居中) -->
+    <g transform="translate(-4, -22) scale(1.3)">
+      <!-- 左气泡(user_agent / 提问者) -->
+      <g transform="translate(-16, -4)">
+        <path d="M0,0 h22 a6,6 0 0 1 6,6 v14 a6,6 0 0 1 -6,6 h-10 l-8,8 v-8 h-4 a6,6 0 0 1 -6,-6 v-14 a6,6 0 0 1 6,-6 z"
+              fill="url(#gradA)"/>
+        <circle cx="6" cy="13" r="2" fill="#fff"/>
+        <circle cx="11" cy="13" r="2" fill="#fff"/>
+        <circle cx="16" cy="13" r="2" fill="#fff"/>
+      </g>
+      <!-- 右气泡(react_agent / 回应者),下移错位,含勾选符号(审计/总结) -->
+      <g transform="translate(4, 8)">
+        <path d="M0,0 h22 a6,6 0 0 1 6,6 v14 a6,6 0 0 1 -6,6 h-10 l-8,8 v-8 h-4 a6,6 0 0 1 -6,-6 v-14 a6,6 0 0 1 6,-6 z"
+              fill="url(#gradB)"/>
+        <path d="M5,14 l4,4 l8,-8" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </g>
+    </g>
+  </g>
+</svg>
