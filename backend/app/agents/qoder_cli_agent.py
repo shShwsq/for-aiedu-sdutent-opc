@@ -75,16 +75,26 @@ def _quick_verify_pat_print(
     返回 (ok, detail):ok=True 表示 PAT 验证通过,detail 含 CLI 输出摘要。
     """
     cli_bin = _get_bin(agent_type)
-    # 用同步 run_command 执行(带 timeout),环境变量通过 env 内联 export 注入
-    env_exports = " ".join(f'{k}="{v}"' for k, v in credential_envs.items())
-    cmd = f"{env_exports} {cli_bin} -p 'OK' 2>&1"
     logger.info(
         f"[qoder_cli_test] PAT 快速诊断(print 模式): "
         f"cmd={cli_bin} -p 'OK', timeout={timeout}s (会消耗少量 credits)"
     )
 
     try:
-        output = session.run_command(cmd, timeout=timeout, check=False)
+        if getattr(session, "mode", "") == "local":
+            # local 模式:argv 启动 + envs 注入(不走 shell;
+            # export/单引号在 Windows cmd.exe 不可用)
+            # 注:仅取 stdout,CLI 的 stderr 诊断信息不在此合并
+            output = session.run_command_argv(
+                [cli_bin, "-p", "OK"],
+                envs=credential_envs,
+                timeout=timeout,
+            )
+        else:
+            # sandbox 模式:环境变量通过 env 内联 export 注入
+            env_exports = " ".join(f'{k}="{v}"' for k, v in credential_envs.items())
+            cmd = f"{env_exports} {cli_bin} -p 'OK' 2>&1"
+            output = session.run_command(cmd, timeout=timeout, check=False)
         output = (output or "").strip()
         logger.info(
             f"[qoder_cli_test] print 模式返回: 输出长度={len(output)}, "

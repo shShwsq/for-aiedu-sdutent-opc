@@ -166,6 +166,10 @@ class Settings(BaseSettings):
     # False=不做原生隔离,仅靠路径策略 + 命令白名单(软隔离)
     # Windows 无原生沙箱,此配置项无效
     SANDBOX_LOCAL_NATIVE_ISOLATION: bool = True
+    # local 模式是否允许外部 CLI 执行器(qoder_cli/deepseek_cli/codex_cli)
+    # True=允许,bridge/CLI 直接跑在宿主机真实环境(无隔离,仅开发/调试)
+    # False=维持禁止,CLI 执行器仅 sandbox 模式可用
+    SANDBOX_LOCAL_ALLOW_CLI: bool = True
 
     # ACP CLI 挂死兜底(session/prompt 无数据 idle 超时,按事件状态分级):
     # - 无活动工具(等待模型输出/最终响应):超过 ACP_IDLE_TIMEOUT_OUTPUT_SECONDS

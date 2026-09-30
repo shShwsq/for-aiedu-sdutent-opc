@@ -47,10 +47,15 @@ _DEFAULT_MODEL = "gpt-5"
 
 def _codex_pre_bridge_hook(
     session, credentials: dict[str, str], agent_type: str, task: Task | None = None
-) -> None:
-    """bridge 启动前:向沙箱写入 ~/.codex/config.toml
+) -> dict[str, str] | None:
+    """bridge 启动前:写入 codex 的 config.toml
 
-    Codex 从 ~/.codex/config.toml 读取模型/provider 配置,
+    sandbox 模式:写沙箱内 ~/.codex/config.toml(容器独立 home)。
+    local 模式:写 local_dir/.codex/config.toml,并返回 CODEX_HOME 环境变量
+    指向该目录(acp_base 合并注入 bridge 进程)——codex 支持 CODEX_HOME 重定向,
+    确保 CLI 完全不碰宿主机真实 ~/.codex(读不到任务配置/不会覆盖用户配置)。
+
+    Codex 从 config.toml 读取模型/provider 配置,
     环境变量 CODEX_API_KEY 作为 API Key(config.toml 的 env_key 指向它)。
 
     config.toml 关键字段:
@@ -67,6 +72,8 @@ def _codex_pre_bridge_hook(
     - always_approve(默认 / task=None 测试场景):approval_policy="never"
     - per_command:codex exec --json 是非交互模式,无法暂停等待用户审批,
       强制降级为 approval_policy="never" 并警告(codex exec 不支持 request_permission 透传)
+
+    返回:需额外注入 bridge 进程的环境变量(local 模式 CODEX_HOME),sandbox 返回 None。
     """
     api_key = credentials.get("api_key", "")
     base_url = (credentials.get("base_url") or "").strip()
@@ -128,13 +135,27 @@ approval_policy = "never"
 sandbox_mode = "danger-full-access"
 """
 
-    # 写入沙箱
+    # 写入配置
+    if getattr(session, "mode", "") == "local":
+        # local 模式:写 local_dir/.codex/(write_file 自动建父目录),
+        # CODEX_HOME 重定向后 codex 不读/不写宿主机真实 ~/.codex
+        session.write_file(".codex/config.toml", config_toml)
+        codex_home = str(session.local_dir / ".codex")
+        logger.info(
+            f"[codex_cli] config.toml 已写入(local: CODEX_HOME={codex_home}, "
+            f"model={model}, base_url={'自定义' if base_url else 'OpenAI默认'}, "
+            f"wire_api={wire_api}, approval_mode={approval_mode})"
+        )
+        return {"CODEX_HOME": codex_home}
+
+    # sandbox 模式:写沙箱内 ~/.codex(容器独立 home)
     # 先创建 ~/.codex 目录
     session.run_command("mkdir -p ~/.codex", timeout=5)
     session.write_file("~/.codex/config.toml", config_toml)
     logger.info(
         f"[codex_cli] config.toml 已写入(model={model}, base_url={'自定义' if base_url else 'OpenAI默认'}, wire_api={wire_api}, approval_mode={approval_mode})"
     )
+    return None
 
 
 # ============================================================

@@ -26,6 +26,7 @@ ACP 协议(JSON-RPC 2.0 over stdio):
 """
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import threading
@@ -59,7 +60,11 @@ class ACPCLIProcess:
 
     def start(self) -> None:
         """启动 ACP CLI 子进程"""
-        cmd = [self.bin_name, *self.args]
+        # Windows:npm 全局产物是 xxx.cmd,Popen 列表模式不走 PATHEXT,
+        # 必须 which 预解析为实际路径;非 Windows 下 which 失败则原样传回
+        # (交由 Popen 按 PATH 解析,行为与原先一致)
+        bin_path = shutil.which(self.bin_name) or self.bin_name
+        cmd = [bin_path, *self.args]
         print(f"[bridge] 启动 ACP CLI: {' '.join(cmd)}", flush=True)
         self.proc = subprocess.Popen(
             cmd,
@@ -516,7 +521,13 @@ def main():
         sys.exit(1)
 
     # 启动 HTTP 服务器
-    server = ThreadingHTTPServer((args.host, args.port), BridgeHandler)
+    # Windows:SO_REUSEADDR 语义允许两个进程绑定同一端口(不是 POSIX 的
+    # "重启复用"),并发任务的 bridge 健康检查可能打到别的实例,必须禁用
+    class _BridgeServer(ThreadingHTTPServer):
+        if sys.platform == "win32":
+            allow_reuse_address = False
+
+    server = _BridgeServer((args.host, args.port), BridgeHandler)
     print(f"[bridge] HTTP 服务监听 {args.host}:{args.port}", flush=True)
 
     try:

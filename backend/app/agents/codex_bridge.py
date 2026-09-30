@@ -62,7 +62,9 @@ class CodexExecSession:
     """
 
     def __init__(self, bin_name: str, extra_args: list[str] | None = None):
-        self.bin_name = bin_name
+        # Windows:npm 全局产物是 xxx.cmd,Popen 列表模式不走 PATHEXT,
+        # 必须 which 预解析为实际路径;非 Windows 下 which 失败则原样传回
+        self.bin_name = shutil.which(bin_name) or bin_name
         self.extra_args = extra_args or []
         self.thread_id: str | None = None  # 从 thread.started 事件提取
         self._proc: subprocess.Popen | None = None
@@ -720,7 +722,13 @@ def main():
         print(f"[codex_bridge] 警告: {args.bin} 未在 PATH 中找到", file=sys.stderr, flush=True)
 
     # 启动 HTTP 服务器
-    server = ThreadingHTTPServer((args.host, args.port), BridgeHandler)
+    # Windows:SO_REUSEADDR 语义允许两个进程绑定同一端口(不是 POSIX 的
+    # "重启复用"),并发任务的 bridge 健康检查可能打到别的实例,必须禁用
+    class _BridgeServer(ThreadingHTTPServer):
+        if sys.platform == "win32":
+            allow_reuse_address = False
+
+    server = _BridgeServer((args.host, args.port), BridgeHandler)
     print(f"[codex_bridge] HTTP 服务监听 {args.host}:{args.port}", flush=True)
 
     try:

@@ -9,8 +9,9 @@
 2. 查本任务缓存的 bridge + ACP session(命中则直接跳到 7;bridge/CLI 进程驻留
    沙箱,会话上下文随 session 在轮次/追问间自然延续)
 3. 未命中:从 user_agent_configs 加载用户凭证(加密存储),经 registry 映射为环境变量
-4. 将 acp_bridge.py 写入沙箱,后台启动(监听端口 ACP_BRIDGE_PORT),凭证经 envs 注入
-5. 通过 get_endpoint(ACP_BRIDGE_PORT) 获取转发地址 + headers
+4. 将 acp_bridge.py 写入沙箱/local 临时目录,后台启动
+   (sandbox:沙箱内固定 ACP_BRIDGE_PORT;local:宿主机动态端口),凭证经 envs 注入
+5. 通过 get_endpoint(port) 获取转发地址 + headers(local 直接 127.0.0.1:port)
 6. ACP 客户端:initialize → session/new → [post_session_setup],随后写入缓存
 7. session/prompt 流式接收 session/update 通知,翻译为 event_bus 事件
 8. 收集最终 summary,提取 plan,返回 (results, summary, plan)
@@ -33,6 +34,10 @@ import json
 import logging
 import queue
 import re
+import shutil
+import socket
+import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -92,6 +97,30 @@ _ACP_LOG_DIR = Path(__file__).resolve().parents[2] / "logs" / "acp"
 
 # idle 看门狗轮询间隔(秒):queue.get 超时粒度,也是 idle 检查粒度
 _IDLE_POLL_SECONDS = 5.0
+
+# local 模式 bridge 动态端口分配:宿主机端口空间全局共享,
+# 固定 ACP_BRIDGE_PORT(8088)在并发 CLI 任务间会冲突。
+# 已分配端口集合防同进程内两次探测撞车(bind(0) 关闭后可能返回同一端口);
+# 进程生命周期内不回收(dev 场景任务量级小,重启即重置)
+_used_bridge_ports: set[int] = set()
+_used_ports_lock = threading.Lock()
+
+
+def _alloc_local_bridge_port() -> int:
+    """local 模式:探测一个空闲 TCP 端口供 bridge 监听
+
+    探测与 bridge 实际 bind 之间存在外部竞态(其他进程抢注端口),
+    概率极小且 fail-loud:bind 失败 bridge 退出,健康检查超时报错可见。
+    """
+    with _used_ports_lock:
+        for _ in range(20):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+                if port not in _used_bridge_ports:
+                    _used_bridge_ports.add(port)
+                    return int(port)
+        raise RuntimeError("无法分配空闲 bridge 端口(连续 20 次探测冲突)")
 
 
 class PromptIdleTimeout(Exception):
@@ -704,20 +733,39 @@ def _write_bridge_script(session, agent_type: str = "") -> None:
 
 
 def _ensure_cli_env(session, agent_type: str) -> None:
-    """准备沙箱内 CLI 运行环境
+    """准备 CLI 运行环境(sandbox:沙箱内 / local:宿主机)
 
-    1. 创建 bridge 脚本目录
-    2. 写入 acp_bridge.py
-    3. 检查 CLI 是否可用,不可用则尝试安装
+    1. 写入 bridge 脚本(local 模式落 local_dir/.acp/,write_file 自动建父目录)
+    2. 检查 CLI 是否可用:
+       - sandbox:`command -v` / `which` shell 检查,未装则执行安装命令
+       - local:Python shutil.which 检查(跨平台,可解析 Windows .cmd/.exe),
+         未装直接报错要求预装 —— 不自动 npm install -g,避免修改宿主机全局环境
     """
-    # 创建脚本目录
-    session.run_command(f"mkdir -p {Path(BRIDGE_SCRIPT_PATH).parent.as_posix()}")
+    cli_bin = _get_bin(agent_type)
+    is_local = getattr(session, "mode", "") == "local"
+
+    if not is_local:
+        # 创建脚本目录(local 模式 _local_write_file 自动建父目录,跳过)
+        session.run_command(f"mkdir -p {Path(BRIDGE_SCRIPT_PATH).parent.as_posix()}")
 
     # 写入 bridge 脚本(per-agent,默认 acp_bridge.py)
     _write_bridge_script(session, agent_type)
 
-    # 检查 CLI 是否可用
-    cli_bin = _get_bin(agent_type)
+    if is_local:
+        # local 模式:宿主机 PATH 检查(Python 端,不走 shell)
+        if not shutil.which(cli_bin):
+            raise RuntimeError(
+                f"宿主机未找到 {cli_bin}(local 模式 CLI 直接跑在宿主机)。"
+                f"请先在宿主机预装(如 npm install -g),"
+                f"或在配置中将对应 *_CLI_BIN 设为可执行文件绝对路径。"
+            )
+        logger.info(
+            f"[{agent_type}] 环境就绪(local): {cli_bin} 可用,"
+            f"bridge 脚本已写入 {session.local_dir / '.acp'}"
+        )
+        return
+
+    # sandbox 模式:shell 检查 + 未装自动安装
     check_cmd = f"command -v {cli_bin} || which {cli_bin} 2>/dev/null"
     result = session.run_command(check_cmd, timeout=10)
     if not result.strip():
@@ -782,6 +830,18 @@ def _inject_git_credentials_to_cache(session, db: Session, task: Task | None) ->
       这种调用很显眼,容易被审计日志捕获
     """
     if task is None or task.user_id is None:
+        return
+
+    # local 模式:跳过注入(降级为无 token)
+    # - `git config --global` 会写宿主机真实 ~/.gitconfig(污染用户环境)
+    # - chmod / /tmp 路径 / git credential approve 均为 Unix 写法
+    # - Windows git 不带 credential-cache(Unix socket 依赖)
+    if getattr(session, "mode", "") == "local":
+        logger.warning(
+            f"[task={task.id}] local 模式跳过 git credential 注入"
+            f"(避免污染宿主机 ~/.gitconfig):CLI 会话内克隆/拉取私有仓库将不可用,"
+            f"预 clone 不受影响"
+        )
         return
 
     # 延迟导入避免循环依赖
@@ -850,11 +910,16 @@ def _start_acp_bridge(
     task: Task | None = None,
     agent_type: str = "",
     extra_acp_args: list[str] | None = None,
-) -> str:
-    """后台启动 ACP bridge,返回 execution_id
+) -> tuple[str, int]:
+    """后台启动 ACP bridge,返回 (execution_id, port)
+
+    sandbox 模式:python3 + 沙箱内路径 + 固定 ACP_BRIDGE_PORT(每容器独立端口空间)
+    local 模式:sys.executable + 宿主机本地路径 + 动态分配端口
+              (宿主机端口空间全局共享,固定 8088 并发任务会冲突),
+              argv 列表启动(不经 shell,绕开 Windows cmd.exe 的引号问题)
 
     bridge 启动命令:
-        python3 acp_bridge.py --port {port} --bin {bin} --args '{json}'
+        python acp_bridge.py --port {port} --bin {bin} --args '{json}'
     凭证经 envs 注入到 bridge 进程,bridge 子进程(CLI)继承这些环境变量,
     实现凭证不在命令行明文出现。
 
@@ -865,6 +930,30 @@ def _start_acp_bridge(
     acp_args = _get_acp_args(task, agent_type, extra_acp_args)
     args_json = json.dumps(acp_args, ensure_ascii=False)
 
+    if getattr(session, "mode", "") == "local":
+        # local 模式:bridge 脚本经 _write_bridge_script 写入
+        # local_dir/.acp/acp_bridge.py(路径映射,与 sandbox 同名,含 codex_bridge)
+        bridge_path = session.local_dir / ".acp" / "acp_bridge.py"
+        port = _alloc_local_bridge_port()
+        argv = [
+            sys.executable, str(bridge_path),
+            "--port", str(port),
+            "--bin", cli_bin,
+            # args_json 作为单个 argv 元素传递,JSON 中的引号不经 shell 解析
+            "--args", args_json,
+        ]
+        execution_id = session.run_command_background(
+            envs=credential_envs,  # 凭证注入 bridge 进程,继承给 CLI
+            work_dir=str(session.local_dir),
+            argv=argv,
+        )
+        logger.info(
+            f"[{agent_type}] ACP bridge 后台启动(local): "
+            f"execution_id={execution_id}, port={port}"
+        )
+        return execution_id, port
+
+    # sandbox 模式:沙箱内 python3 + 固定端口
     # shell 中 JSON 数组含双引号,需单引号包裹
     cmd = (
         f"python3 {BRIDGE_SCRIPT_PATH}"
@@ -878,7 +967,7 @@ def _start_acp_bridge(
         work_dir=BRIDGE_WORK_DIR,
     )
     logger.info(f"[{agent_type}] ACP bridge 后台启动: execution_id={execution_id}")
-    return execution_id
+    return execution_id, ACP_BRIDGE_PORT
 
 
 def _wait_for_bridge_ready(
@@ -2394,10 +2483,19 @@ def run_acp_agent(
         raise RuntimeError(f"agent 类型未注册: {agent_type}")
 
     # ---- 检查沙箱模式 ----
-    if settings.SANDBOX_MODE == "local":
+    # local 模式:bridge/CLI 直接跑在宿主机真实环境(无隔离,仅开发/调试),
+    # 由 SANDBOX_LOCAL_ALLOW_CLI 控制是否放行
+    if settings.SANDBOX_MODE == "local" and not settings.SANDBOX_LOCAL_ALLOW_CLI:
         raise RuntimeError(
-            "外部 CLI 执行器需要沙箱模式(SANDBOX_MODE=sandbox),"
-            "local 模式不支持(沙箱内无 CLI)。"
+            "外部 CLI 执行器在 local 模式下被禁用(SANDBOX_LOCAL_ALLOW_CLI=false)。"
+            "可设 SANDBOX_LOCAL_ALLOW_CLI=true 启用(bridge/CLI 将直接运行在宿主机),"
+            "或使用 SANDBOX_MODE=sandbox。"
+        )
+    if settings.SANDBOX_MODE == "local":
+        logger.warning(
+            f"[task={task.id}] local 模式运行外部 CLI 执行器({agent_type}):"
+            f"bridge/CLI 直接跑在宿主机真实环境,无隔离边界;"
+            f"凭证经环境变量注入 CLI 进程,请勿用于生产"
         )
 
     # ---- 加载凭证 + 映射为环境变量 ----
@@ -2448,14 +2546,17 @@ def run_acp_agent(
         # ---- wrapper 层钩子:bridge 启动前的沙箱文件准备 ----
         # codex 用此回调写入 ~/.codex/config.toml(按 task.params 决定 approval_policy)
         # deepseek 不需要(凭证/权限均经环境变量注入,无配置文件)
+        # hook 可返回额外环境变量 dict(如 codex local 模式返回 CODEX_HOME),合并注入 bridge
         if pre_bridge_hook:
             _t0 = time.perf_counter()
-            pre_bridge_hook(session, credentials, agent_type, task)
+            hook_envs = pre_bridge_hook(session, credentials, agent_type, task)
+            if hook_envs:
+                credential_envs = {**credential_envs, **hook_envs}
             perf_log(task.id, "acp_pre_bridge_hook", time.perf_counter() - _t0, agent_type=agent_type)
 
         # ---- 启动 ACP bridge ----
         _t0 = time.perf_counter()
-        bridge_exec_id = _start_acp_bridge(session, credential_envs, task, agent_type=agent_type)
+        bridge_exec_id, bridge_port = _start_acp_bridge(session, credential_envs, task, agent_type=agent_type)
         perf_log(task.id, "acp_start_bridge", time.perf_counter() - _t0, agent_type=agent_type)
     else:
         bridge_exec_id = reused["bridge_exec_id"]
@@ -2466,7 +2567,9 @@ def run_acp_agent(
         endpoint_url, endpoint_headers = reused["endpoint_url"], reused["endpoint_headers"]
     else:
         _t0 = time.perf_counter()
-        endpoint_url, endpoint_headers = session.get_endpoint(ACP_BRIDGE_PORT)
+        # local 模式 bridge 用动态分配端口(_start_acp_bridge 返回),
+        # sandbox 模式固定 ACP_BRIDGE_PORT
+        endpoint_url, endpoint_headers = session.get_endpoint(bridge_port)
         perf_log(task.id, "acp_get_endpoint", time.perf_counter() - _t0, agent_type=agent_type)
 
     try:
@@ -2529,7 +2632,11 @@ def run_acp_agent(
                     )
 
                 # 创建会话(cwd 设为仓库路径)
-                cwd = repo_path or BRIDGE_WORK_DIR
+                # local 模式 fallback 用 local_dir(宿主机上无 /home/user)
+                if getattr(session, "mode", "") == "local":
+                    cwd = repo_path or str(session.local_dir)
+                else:
+                    cwd = repo_path or BRIDGE_WORK_DIR
                 _t0 = time.perf_counter()
                 try:
                     acp_session_id = client.new_session(cwd=cwd)
@@ -2818,9 +2925,22 @@ def test_credential_streaming(
         yield done(False, "凭证映射为空(请检查 registry 配置)")
         return
 
+    # ---- 模式检查 ----
+    # local 模式:测试连接直接在宿主机跑 bridge + CLI(临时目录承载 bridge 脚本),
+    # 由 SANDBOX_LOCAL_ALLOW_CLI 控制是否放行
     if settings.SANDBOX_MODE == "local":
-        yield done(False, "测试连接需要 SANDBOX_MODE=sandbox(local 模式无 CLI)")
-        return
+        if not settings.SANDBOX_LOCAL_ALLOW_CLI:
+            yield done(
+                False,
+                "测试连接在 local 模式下被禁用(SANDBOX_LOCAL_ALLOW_CLI=false)。"
+                "可设 SANDBOX_LOCAL_ALLOW_CLI=true 启用(需宿主机预装 CLI),"
+                "或使用 SANDBOX_MODE=sandbox。",
+            )
+            return
+        logger.warning(
+            f"[{agent_type}_test] local 模式测试连接:bridge/CLI 直接跑在宿主机,"
+            f"需宿主机预装 CLI(bridge 脚本/临时文件在本地临时目录,不碰宿主机 home)"
+        )
 
     # ---- 创建临时沙箱 ----
     from app.sandbox.client import create_sandbox
@@ -2829,6 +2949,7 @@ def test_credential_streaming(
     logger.info(f"[{agent_type}_test] 开始流式测试:创建临时沙箱")
     session = create_sandbox()
     bridge_exec_id: str | None = None
+    is_local = settings.SANDBOX_MODE == "local"
 
     try:
         # ---- 准备 CLI 环境 ----
@@ -2841,15 +2962,20 @@ def test_credential_streaming(
             return
 
         # 清理可能残留的旧登录态
-        session.run_command("rm -rf ~/.qoder ~/.dsh ~/.codex 2>/dev/null", timeout=5)
+        # local 模式跳过:~ 是宿主机真实 home,rm -rf 会删掉用户真实 CLI 登录态
+        if not is_local:
+            session.run_command("rm -rf ~/.qoder ~/.dsh ~/.codex 2>/dev/null", timeout=5)
 
         # ---- wrapper 层钩子:bridge 启动前的沙箱文件准备 ----
         # codex 用此回调写入 ~/.codex/config.toml(模型/审批策略配置)
         # deepseek 不需要(凭证/权限均经环境变量注入,无配置文件)
         # task=None(测试场景):wrapper 默认 always_approve
+        # hook 可返回额外环境变量 dict(如 codex local 模式返回 CODEX_HOME)
         if pre_bridge_hook:
             try:
-                pre_bridge_hook(session, credentials, agent_type, None)
+                hook_envs = pre_bridge_hook(session, credentials, agent_type, None)
+                if hook_envs:
+                    credential_envs = {**credential_envs, **hook_envs}
             except Exception as e:
                 yield done(False, f"沙箱配置文件准备失败: {e}")
                 return
@@ -2857,12 +2983,12 @@ def test_credential_streaming(
         # ---- 启动 ACP bridge ----
         yield stage("bridge_start", "启动 ACP bridge(注入凭证,等待就绪)...")
         try:
-            bridge_exec_id = _start_acp_bridge(
+            bridge_exec_id, bridge_port = _start_acp_bridge(
                 session, credential_envs,
                 agent_type=agent_type,
                 extra_acp_args=test_acp_args,
             )
-            endpoint_url, endpoint_headers = session.get_endpoint(ACP_BRIDGE_PORT)
+            endpoint_url, endpoint_headers = session.get_endpoint(bridge_port)
             _wait_for_bridge_ready(
                 session, bridge_exec_id, endpoint_url, endpoint_headers, agent_type
             )
@@ -2894,8 +3020,10 @@ def test_credential_streaming(
 
             # ---- 创建会话 ----
             yield stage("session_new", "创建 ACP 会话...")
+            # local 模式宿主机无 /tmp(Windows),用平台临时目录
+            test_cwd = tempfile.gettempdir() if is_local else "/tmp"
             try:
-                acp_session_id = client.new_session(cwd="/tmp")
+                acp_session_id = client.new_session(cwd=test_cwd)
                 logger.info(
                     f"[{agent_type}_test] session/new 返回: sessionId={acp_session_id}"
                 )

@@ -21,6 +21,7 @@ import logging
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,35 @@ from urllib.parse import urlparse
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _kill_bg_proc_tree(proc: subprocess.Popen) -> None:
+    """终止后台进程及其整个子进程树(local 模式宿主机上运行时使用)
+
+    Windows:taskkill /PID {pid} /T /F(terminate 只杀父进程,
+    bridge spawn 的 CLI 子进程会成孤儿)
+    POSIX:优先 killpg 杀进程组(配合 Popen 的 start_new_session),
+    失败回退 terminate
+    """
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True, timeout=10, check=False,
+            )
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                if proc.poll() is None:
+                    proc.terminate()
+    except Exception:
+        # 兜底:直接 terminate(可能留孤儿,但避免清理流程本身失败)
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -106,6 +136,48 @@ class SandboxSession:
             return self._sandbox_run_command(cmd, timeout, check=check)
         else:
             return self._local_run_command(cmd, timeout, check=check)
+
+    def run_command_argv(
+        self,
+        argv: list[str],
+        envs: dict[str, str] | None = None,
+        timeout: int = 60,
+        check: bool = False,
+    ) -> str:
+        """以 argv 列表执行命令(不经 shell),返回 stdout
+
+        local 模式:subprocess.run(argv)(绕开 shell 引号/单引号在
+        Windows cmd.exe 不可用的问题;envs 合并进 os.environ 注入)
+        sandbox 模式:退化为 export 前缀 + shlex.join 拼成 cmd 走沙箱 shell
+
+        供 ACP PAT 快速诊断等需要精确 argv + 环境变量注入的调用使用。
+        """
+        if self._closed:
+            raise RuntimeError("沙箱已关闭")
+
+        if self.mode == "sandbox":
+            cmd = shlex.join(argv)
+            if envs:
+                exports = " ".join(f'{k}="{v}"' for k, v in envs.items())
+                cmd = f"export {exports} && {cmd}"
+            return self._sandbox_run_command(cmd, timeout, check=check)
+        else:
+            assert self._local_dir is not None
+            merged_env = {**os.environ, **(envs or {})}
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                cwd=self._local_dir,
+                timeout=timeout,
+                env=merged_env,
+            )
+            if check and result.returncode != 0:
+                raise RuntimeError(
+                    f"命令退出码 {result.returncode}: {' '.join(argv)}"
+                    f"\nstdout: {result.stdout}\nstderr: {result.stderr[:500]}"
+                )
+            return result.stdout
 
     def write_file(self, path: str, content: str) -> None:
         """写入文件"""
@@ -206,25 +278,31 @@ class SandboxSession:
 
     def run_command_background(
         self,
-        cmd: str,
+        cmd: str = "",
         envs: dict[str, str] | None = None,
         work_dir: str | None = None,
+        argv: list[str] | None = None,
     ) -> str:
         """后台启动命令(非阻塞),返回 execution_id 供后续查询日志/中断
 
         用于启动 ACP bridge 等长驻服务。命令在沙箱内 detached 运行,
         本方法立即返回,不等待命令结束。
 
-        envs: 注入命令进程的环境变量(如 QODER_PERSONAL_ACCESS_TOKEN)
-        work_dir: 工作目录(沙箱内绝对路径)
+        envs:注入命令进程的环境变量(如 QODER_PERSONAL_ACCESS_TOKEN)
+        work_dir:工作目录(沙箱内绝对路径)
+        argv:以参数列表启动(不经 shell)。local 模式下用 Popen(list)
+             绕开 Windows cmd.exe 的引号/单引号问题;sandbox 模式退化为
+             shlex.join 拼成 cmd 字符串。传 argv 时 cmd 被忽略。
         """
         if self._closed:
             raise RuntimeError("沙箱已关闭")
 
         if self.mode == "sandbox":
+            if argv is not None:
+                cmd = shlex.join(argv)
             return self._sandbox_run_background(cmd, envs, work_dir)
         else:
-            return self._local_run_background(cmd, envs, work_dir)
+            return self._local_run_background(cmd, envs, work_dir, argv=argv)
 
     def get_background_logs(self, execution_id: str, cursor: int | None = None) -> tuple[str, int | None]:
         """获取后台命令的累积日志
@@ -272,9 +350,9 @@ class SandboxSession:
         if self.mode == "sandbox":
             self.sandbox.commands.interrupt(execution_id)
         else:
-            proc = self._local_bg_procs.pop(execution_id, None)
-            if proc:
-                proc.terminate()
+            entry = self._local_bg_procs.pop(execution_id, None)
+            if entry:
+                _kill_bg_proc_tree(entry[0])
 
     def renew(self, timeout_minutes: int | None = None) -> bool:
         """续期沙箱 TTL:新过期时间 = 当前时间 + timeout(SDK renew 语义)
@@ -345,13 +423,10 @@ class SandboxSession:
             return
         self._closed = True
 
-        # local 模式:终止所有后台进程
+        # local 模式:终止所有后台进程(含子进程树,防 CLI 孤儿)
         if self._local_bg_procs:
-            for proc in self._local_bg_procs.values():
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+            for proc, _ in self._local_bg_procs.values():
+                _kill_bg_proc_tree(proc)
             self._local_bg_procs.clear()
 
         if self.mode == "sandbox" and self.sandbox:
@@ -570,8 +645,14 @@ class SandboxSession:
         cmd: str,
         envs: dict[str, str] | None,
         work_dir: str | None,
+        argv: list[str] | None = None,
     ) -> str:
-        """local 模式:用 subprocess.Popen 后台启动,跟踪进程"""
+        """local 模式:用 subprocess.Popen 后台启动,跟踪进程
+
+        argv 模式:不经 shell 直接以参数列表启动(Windows cmd.exe 无单引号/
+        引号转义规则不同,JSON 参数经 shell 会损坏);POSIX 下 start_new_session
+        建立进程组,配合 _kill_bg_proc_tree 的 killpg 杀整组。
+        """
         assert self._local_dir is not None
         exec_id = f"local_bg_{uuid.uuid4().hex[:8]}"
         merged_env = {**os.environ, **(envs or {})}
@@ -579,15 +660,21 @@ class SandboxSession:
         # local 模式下 work_dir 可能是 /home/user/xxx,映射到本地
         if cwd.startswith("/home/user"):
             cwd = str(self._local_dir / cwd[len("/home/user/"):])
-        proc = subprocess.Popen(
-            cmd,
-            shell=True,
+        popen_kwargs: dict[str, Any] = dict(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             cwd=cwd if Path(cwd).exists() else str(self._local_dir),
             env=merged_env,
         )
+        if argv is not None:
+            proc = subprocess.Popen(
+                argv, shell=False,
+                start_new_session=(os.name == "posix"),
+                **popen_kwargs,
+            )
+        else:
+            proc = subprocess.Popen(cmd, shell=True, **popen_kwargs)
         self._local_bg_procs[exec_id] = (proc, [])
         # 启动后台线程持续读取 stdout(避免 pipe 满死锁)
         def _drain():
