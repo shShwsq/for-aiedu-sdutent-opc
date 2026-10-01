@@ -16,6 +16,7 @@
 import { getAccessToken } from './client'
 import { clientLog } from '@/utils/clientLog'
 import type {
+  Agent1DoneEventData,
   CloneProgressEventData,
   CommandConfirmEventData,
   ConnectedData,
@@ -23,6 +24,7 @@ import type {
   ConversationUpdateEventData,
   DoneEventData,
   PlanEventData,
+  ReviewDoneEventData,
   SSEEvent,
   SSEEventType,
   StatusEventData,
@@ -47,6 +49,13 @@ export interface StreamCallbacks {
   onVerifyAction?: (data: VerifyActionEventData) => void
   /** 危险命令确认(local 模式安全策略,LLM 执行危险命令时需用户确认) */
   onCommandConfirm?: (data: CommandConfirmEventData) => void
+  /**
+   * agent1 结束即任务完成(双 agent 模式):主界面收尾展示临时结果,
+   * 后台审查继续,审查事件(conversation/thinking_delta)继续送达侧栏
+   */
+  onAgent1Done?: (data: Agent1DoneEventData) => void
+  /** 后台审查结束(拉快照:done=重点与知识点替换临时结果 / failed=保留执行结果) */
+  onReviewDone?: (data: ReviewDoneEventData) => void
   onDone?: (data: DoneEventData) => void
   onError?: (data: DoneEventData) => void
 }
@@ -78,6 +87,8 @@ export function subscribeTaskStream(
     'plan',
     'verify_action',
     'command_confirm',
+    'agent1_done',
+    'review_done',
     'done',
     'error',
   ]
@@ -125,6 +136,18 @@ export function subscribeTaskStream(
             break
           case 'command_confirm':
             callbacks.onCommandConfirm?.(data as unknown as CommandConfirmEventData)
+            break
+          case 'agent1_done':
+            // agent1 结束即任务完成;总线保持打开,审查事件继续送达
+            clientLog(taskId, 'sse_agent1_done', { status: data.status })
+            callbacks.onAgent1Done?.(data as unknown as Agent1DoneEventData)
+            break
+          case 'review_done':
+            // 后台审查结束(仍在 done 终止事件前)
+            clientLog(taskId, 'sse_review_done', {
+              review_status: data.review_status,
+            })
+            callbacks.onReviewDone?.(data as unknown as ReviewDoneEventData)
             break
           case 'done':
             // [诊断] done 事件:任务结束,记录触发时前端是否在 resume 窗口

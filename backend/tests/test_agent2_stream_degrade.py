@@ -52,8 +52,8 @@ def test_stream_fail_once_retry_success(monkeypatch):
     assert result.get("followup_query") == "继续检查"
 
 
-def test_stream_fail_twice_returns_degraded(monkeypatch):
-    """两次流式调用都失败 → 返回降级结果(不抛异常),保留用户原始意图。"""
+def test_stream_fail_twice_returns_degraded_review(monkeypatch):
+    """审查模式:两次流式调用都失败 → 降级结果(无轮次语义,审查失败标记)。"""
     def _fake_stream(client, messages, *, task_id, round_idx, tools=None):
         raise RuntimeError("boom")
 
@@ -61,6 +61,28 @@ def test_stream_fail_twice_returns_degraded(monkeypatch):
 
     result = agent2.run_agent2(
         "审计这个仓库", [], task_id="task-1", round_idx=1, client=MagicMock(),
+    )
+
+    assert result["degraded"] is True
+    assert result["degrade_reason"] == "boom"
+    assert result["results"] == []          # 空 results → 调用方标记审查失败
+    assert result["suggestions"] == []
+    assert "降级" in result["reasoning"]
+    # 审查模式无 followup_query/done 轮次语义(一次性完整审查)
+    assert "followup_query" not in result
+    assert "done" not in result
+
+
+def test_stream_fail_twice_returns_degraded_analyze(monkeypatch):
+    """分析模式:两次流式调用都失败 → 降级结果,用户原始意图透传给 agent1。"""
+    def _fake_stream(client, messages, *, task_id, round_idx, tools=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(agent2, "_stream_agent2_llm", _fake_stream)
+
+    result = agent2.run_agent2(
+        "审计这个仓库", [], task_id="task-1", round_idx=1, client=MagicMock(),
+        mode="analyze",
     )
 
     assert result["degraded"] is True
@@ -167,18 +189,18 @@ def test_resume_analyze_degraded_passes_user_message(monkeypatch):
 
 
 def test_resume_collab_degraded_ends_round(monkeypatch):
-    """resume 协作轮评估降级 → 不再追问,以当前进度收尾结束。"""
+    """resume 后台审查降级 → review_status=failed,任务仍 COMPLETED(保留临时结果)。"""
     task = _mk_resume_task()
     analyze = {"covered": [], "missing": [], "reasoning": "分析",
                "followup_query": "查依赖", "done": False}
-    degraded = {"covered": [], "missing": [], "reasoning": "评估失败降级",
-                "followup_query": "", "done": False,
-                "degraded": True, "degrade_reason": "boom"}
+    degraded_review = {"covered": [], "missing": [], "reasoning": "审查失败降级",
+                       "suggestions": [], "results": [], "grouping": None,
+                       "degraded": True, "degrade_reason": "boom"}
     ua_calls = []
 
     def _ua(*args, **kwargs):
         ua_calls.append(kwargs)
-        return analyze if len(ua_calls) == 1 else degraded
+        return analyze if len(ua_calls) == 1 else degraded_review
 
     executor = MagicMock()
     executor.name = "builtin"
@@ -188,10 +210,12 @@ def test_resume_collab_degraded_ends_round(monkeypatch):
 
     orchestrator.resume_audit_with_message(task, MagicMock(), "再查依赖")
 
-    # 只跑一轮,不因降级继续追问执行
+    # agent1 只跑一轮(按分析指令);审查降级不触发再执行
     executor.run.assert_called_once()
     assert executor.run.call_args.kwargs["followup_query"] == "查依赖"
     assert task.status == TaskStatus.COMPLETED
+    # 审查降级 → 子状态 failed(任务本身不失败)
+    assert task.review_status == "failed"
 
 
 def test_resume_except_typed_error_message(monkeypatch):
@@ -248,7 +272,10 @@ def _patch_dual_env(monkeypatch, executor, ua_side_effect):
     monkeypatch.setattr(orchestrator, "_prepare_repo_context",
                         lambda *a, **k: (None, ""))  # 无仓库:跳过 clone
     monkeypatch.setattr(orchestrator, "_publish_status", lambda *a, **k: None)
-    monkeypatch.setattr(orchestrator, "_record_agent2", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "_record_agent2_review", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "_record_agent2_analyze", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "_replace_interim_results",
+                        lambda *a, **k: 1)
     monkeypatch.setattr(orchestrator, "_add_conversation", lambda *a, **k: None)
     monkeypatch.setattr(orchestrator, "wait_if_paused", lambda *a, **k: None)
     monkeypatch.setattr(orchestrator, "finish_task", lambda *a, **k: None)
@@ -269,16 +296,17 @@ def _patch_dual_env(monkeypatch, executor, ua_side_effect):
 
 
 def test_dual_starts_with_react_agent_no_initial_eval(monkeypatch):
-    """任务开始时无 agent2 初始评估:agent1 第 1 轮直接按用户意图执行。"""
+    """任务开始时无 agent2 初始评估:agent1 第 1 轮直接按用户意图执行,
+    agent2 只在 agent1 结束后做一次后台审查。"""
     task = _mk_dual_task()
-    done = {"covered": [], "missing": [], "reasoning": "完成",
-            "followup_query": "", "done": True,
-            "results": [{"title": "发现", "content": "内容"}], "grouping": None}
+    review = {"covered": [], "missing": [], "reasoning": "审查完成",
+              "suggestions": [], "results": [{"title": "发现", "content": "内容"}],
+              "grouping": None}
     ua_calls = []
 
     def _ua(*args, **kwargs):
         ua_calls.append(kwargs)
-        return done
+        return review
 
     executor = MagicMock()
     executor.name = "builtin"
@@ -288,29 +316,29 @@ def test_dual_starts_with_react_agent_no_initial_eval(monkeypatch):
 
     orchestrator.run_dual_agent_audit(task, MagicMock())
 
-    # agent1 先执行:第 1 轮、followup_query=None(直接用用户意图)
+    # agent1 先执行:第 1 轮、followup_query=None(直接用用户意图),只此一轮
     executor.run.assert_called_once()
     assert executor.run.call_args.kwargs["round_idx"] == 1
     assert executor.run.call_args.kwargs["followup_query"] is None
-    # agent2 首次评估发生在 agent1 执行之后(第 1 轮评估)
+    # agent2 审查发生在 agent1 执行之后,且为 review 模式(单次完整审查)
     assert len(ua_calls) == 1
-    assert ua_calls[0]["round_idx"] == 1
+    assert ua_calls[0]["mode"] == "review"
     assert task.status == TaskStatus.COMPLETED
+    assert task.review_status == "done"
 
 
 def test_dual_collab_degraded_ends_round(monkeypatch):
-    """dual 协作轮评估降级 → 结束协作循环,以当前进度收尾。"""
+    """dual 后台审查降级 → review_status=failed,任务仍 COMPLETED,
+    agent1 只跑一轮(多轮由用户驱动,降级不触发再执行)。"""
     task = _mk_dual_task()
-    normal = {"covered": [], "missing": [], "reasoning": "第 1 轮评估",
-              "followup_query": "查依赖", "done": False}
-    degraded = {"covered": [], "missing": [], "reasoning": "评估失败降级",
-                "followup_query": "", "done": False,
-                "degraded": True, "degrade_reason": "boom"}
+    degraded_review = {"covered": [], "missing": [], "reasoning": "审查失败降级",
+                       "suggestions": [], "results": [], "grouping": None,
+                       "degraded": True, "degrade_reason": "boom"}
     ua_calls = []
 
     def _ua(*args, **kwargs):
         ua_calls.append(kwargs)
-        return normal if len(ua_calls) == 1 else degraded
+        return degraded_review
 
     executor = MagicMock()
     executor.name = "builtin"
@@ -320,11 +348,12 @@ def test_dual_collab_degraded_ends_round(monkeypatch):
 
     orchestrator.run_dual_agent_audit(task, MagicMock())
 
-    # 第 1 轮按用户意图执行 + 第 2 轮按追问执行;降级后不再继续
-    assert executor.run.call_count == 2
-    assert executor.run.call_args_list[0].kwargs["followup_query"] is None
-    assert executor.run.call_args_list[1].kwargs["followup_query"] == "查依赖"
+    # 初始运行只有 1 轮 agent1(协作循环已移除)
+    assert executor.run.call_count == 1
+    assert executor.run.call_args.kwargs["followup_query"] is None
     assert task.status == TaskStatus.COMPLETED
+    # 审查降级 → 子状态 failed(任务本身不失败,保留临时结果)
+    assert task.review_status == "failed"
 
 
 # ============================================================

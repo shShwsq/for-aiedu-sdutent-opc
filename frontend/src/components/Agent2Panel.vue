@@ -3,8 +3,13 @@
  * 检查助手(agent2)核查过程侧栏面板
  *
  * 主对话流只保留 用户↔AI助手 对话与追问修正卡(见 TaskDetailView 的
- * roundGroups 过滤);检查助手的思考流/评估/工具核查(读码/PoC/引用复核)/
+ * roundGroups 过滤);检查助手的思考流/审查结论/工具核查(读码/PoC/引用复核)/
  * 最终总结全部在本面板按轮折叠展示。
+ *
+ * 后台审查流程(agent1 结束即任务完成):
+ * - reviewStatus=running:头部"检查中"badge,审查流式实时可见
+ * - reviewStatus=done:头部"检查完成"badge;建议深挖卡(suggestions)可点"深挖"
+ * - reviewStatus=failed:头部"检查失败"badge(保留 AI助手执行结果)
  *
  * 数据来源:
  * - conversations:任务 Conversation 列表(role=agent2 的历史消息)
@@ -12,7 +17,7 @@
  *   共用同一 reactive Map,本组件只读消费)
  */
 import { computed, nextTick, ref, watch } from 'vue'
-import type { Conversation } from '@/types/task'
+import type { Conversation, ReviewStatus } from '@/types/task'
 import { renderMarkdown } from '@/utils/markdown'
 
 /** 与 TaskDetailView 内部 StreamingItem 对齐(本组件只读消费) */
@@ -37,6 +42,7 @@ interface RoundGroup {
   streaming: StreamingLike[]
   tools: ToolEntry[]
   evaluations: Conversation[]
+  reviews: Conversation[]
   summaries: Conversation[]
   others: Conversation[]
 }
@@ -45,6 +51,13 @@ const props = defineProps<{
   conversations: Conversation[]
   streamingItems: Map<string, StreamingLike>
   isRunning: boolean
+  /** 后台审查状态(null=未审查:单 agent 模式/老任务) */
+  reviewStatus?: ReviewStatus | null
+}>()
+
+/** 用户点击"深挖"建议:交给父组件走现有发消息流程(resume) */
+const emit = defineEmits<{
+  (e: 'send-suggestion', text: string): void
 }>()
 
 // 后端落库的 tool_call 首行意图前缀(agents/agent2.py),展示时剥离
@@ -61,7 +74,7 @@ const rounds = computed<RoundGroup[]>(() => {
     if (!g) {
       g = {
         round_idx: r, thinking: [], streaming: [], tools: [],
-        evaluations: [], summaries: [], others: [],
+        evaluations: [], reviews: [], summaries: [], others: [],
       }
       byRound.set(r, g)
     }
@@ -79,8 +92,12 @@ const rounds = computed<RoundGroup[]>(() => {
       if (hit) hit.result = c
       else g.others.push(c) // 孤立结果(调用记录缺失)兜底展示
     } else if (c.type === 'evaluation') g.evaluations.push(c)
+    else if (c.type === 'review') g.reviews.push(c)
     else if (c.type === 'summary') g.summaries.push(c)
-    else if (c.type) g.others.push(c) // 未知 type 容错(老数据形态)
+    else if (c.type === 'suggestions') {
+      // suggestions 不进轮组:由下方独立区块渲染(深挖卡片)
+      continue
+    } else if (c.type) g.others.push(c) // 未知 type 容错(老数据形态)
   }
   for (const s of props.streamingItems.values()) {
     if (s.role !== 'agent2') continue
@@ -88,6 +105,48 @@ const rounds = computed<RoundGroup[]>(() => {
   }
   return [...byRound.values()].sort((a, b) => a.round_idx - b.round_idx)
 })
+
+/** 建议深挖方向(取最新一条 type=suggestions 的 JSON,旧版整块覆盖) */
+const suggestions = computed<string[]>(() => {
+  let latest: Conversation | null = null
+  for (const c of props.conversations) {
+    if (c.role === 'agent2' && c.type === 'suggestions') latest = c
+  }
+  if (!latest) return []
+  try {
+    const payload = JSON.parse(latest.content) as { suggestions?: unknown }
+    if (!Array.isArray(payload.suggestions)) return []
+    return payload.suggestions.filter(
+      (s): s is string => typeof s === 'string' && !!s.trim(),
+    )
+  } catch {
+    return [] // JSON 解析失败(老数据/异常形态)静默容错
+  }
+})
+
+/** 深挖按钮防重复(点击后由父组件发消息,审查重新开始) */
+const diggingSuggestion = ref<string | null>(null)
+
+/** 点击"深挖":把建议文本作为用户消息发出(emit 给父组件走 resume 链路) */
+function handleDig(text: string): void {
+  if (diggingSuggestion.value) return
+  diggingSuggestion.value = text
+  emit('send-suggestion', text)
+}
+
+/** 头部审查 badge 文案 */
+const reviewBadge = computed<{ text: string; cls: string } | null>(() => {
+  if (props.reviewStatus === 'running') return { text: '检查中', cls: 'is-running' }
+  if (props.reviewStatus === 'done') return { text: '检查完成', cls: 'is-done' }
+  if (props.reviewStatus === 'failed') return { text: '检查失败', cls: 'is-failed' }
+  return null
+})
+
+// 新一轮审查开始(resume 深挖/追加消息)→ 解除深挖按钮的防重复锁
+watch(
+  () => props.reviewStatus,
+  () => { diggingSuggestion.value = null },
+)
 
 /** 轮组展开状态;默认展开最新一轮(含运行中新轮自动展开) */
 const expanded = ref<Set<number>>(new Set())
@@ -177,7 +236,10 @@ function charCount(text: string | null | undefined): number {
   <section class="agent2-panel" data-onboarding="detail-agent2">
     <h2 class="panel-title">
       检查助手核查
-      <span v-if="isRunning" class="panel-live-dot" aria-hidden="true" />
+      <span v-if="reviewBadge" :class="['panel-review-badge', reviewBadge.cls]">
+        {{ reviewBadge.text }}
+      </span>
+      <span v-else-if="isRunning" class="panel-live-dot" aria-hidden="true" />
     </h2>
 
     <div v-for="g in rounds" :key="g.round_idx" class="panel-round">
@@ -211,7 +273,13 @@ function charCount(text: string | null | undefined): number {
           <div v-if="tool.result" class="panel-tool-result">{{ truncate(tool.result.content, 1500) }}</div>
         </details>
 
-        <!-- 评估:结论行 + 展开完整评估 -->
+        <!-- 审查结论(后台审查模式):结论行 + 展开完整审查 -->
+        <details v-for="rv in g.reviews" :key="rv.id" class="panel-item panel-review">
+          <summary>{{ firstLine(rv.content) || '审查结论' }}</summary>
+          <pre class="panel-full-text">{{ rv.reasoning || rv.content }}</pre>
+        </details>
+
+        <!-- 评估(resume 消息分析):结论行 + 展开完整评估 -->
         <details v-for="e in g.evaluations" :key="e.id" class="panel-item panel-eval">
           <summary>{{ evalDigest(e) }}</summary>
           <pre class="panel-full-text">{{ e.reasoning || e.content }}</pre>
@@ -228,6 +296,24 @@ function charCount(text: string | null | undefined): number {
           <summary>{{ o.type }} · {{ truncate(firstLine(o.content), 50) }}</summary>
           <pre class="panel-full-text">{{ o.content }}</pre>
         </details>
+      </div>
+    </div>
+
+    <!-- 建议深挖方向(审查完成后;点击"深挖"作为用户消息发出去走 resume) -->
+    <div v-if="suggestions.length > 0" class="panel-suggestions">
+      <p class="panel-suggestions-title">建议深挖方向</p>
+      <div
+        v-for="(s, i) in suggestions"
+        :key="i"
+        :class="['panel-suggestion-card', { 'is-digging': diggingSuggestion === s }]"
+      >
+        <p class="panel-suggestion-text">{{ s }}</p>
+        <button
+          type="button"
+          class="panel-suggestion-btn"
+          :disabled="!!diggingSuggestion"
+          @click="handleDig(s)"
+        >{{ diggingSuggestion === s ? '已发起深挖…' : '深挖' }}</button>
       </div>
     </div>
   </section>
@@ -256,6 +342,94 @@ function charCount(text: string | null | undefined): number {
   border-radius: 50%;
   background: var(--color-success);
   animation: panel-pulse 1.4s ease-in-out infinite;
+}
+
+/* 后台审查状态 badge(检查中/检查完成/检查失败) */
+.panel-review-badge {
+  padding: 1px var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+}
+
+.panel-review-badge.is-running {
+  color: var(--color-info);
+  border-color: var(--color-info);
+  animation: panel-pulse 1.4s ease-in-out infinite;
+}
+
+.panel-review-badge.is-done {
+  color: var(--color-success);
+  border-color: var(--color-success);
+}
+
+.panel-review-badge.is-failed {
+  color: var(--color-warning);
+  border-color: var(--color-warning);
+}
+
+/* 审查结论(与评估同结构,中性色:审查不是修正指令) */
+.panel-review summary {
+  color: var(--color-text-secondary);
+  font-weight: var(--fw-medium);
+}
+
+/* 建议深挖卡片 */
+.panel-suggestions {
+  margin-top: var(--space-3);
+}
+
+.panel-suggestions-title {
+  margin: 0 0 var(--space-2);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--color-text-primary);
+}
+
+.panel-suggestion-card {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-2);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+.panel-suggestion-card.is-digging {
+  border-color: var(--color-primary-border);
+  background: var(--color-primary-light);
+}
+
+.panel-suggestion-text {
+  flex: 1;
+  margin: 0;
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+}
+
+.panel-suggestion-btn {
+  flex-shrink: 0;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--color-primary);
+  background: transparent;
+  border: 1px solid var(--color-primary-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.panel-suggestion-btn:hover:not(:disabled) {
+  background: var(--color-primary-light);
+}
+
+.panel-suggestion-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 @keyframes panel-pulse {

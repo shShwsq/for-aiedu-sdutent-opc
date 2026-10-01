@@ -1097,6 +1097,12 @@ defineExpose({ openTaskFile })
                 <span :class="['task-status-tag', statusClass(t.status)]">
                   {{ statusLabel(t.status) }}
                 </span>
+                <!-- 后台审查进行中(任务已完成但检查助手仍在核查) -->
+                <span
+                  v-if="t.review_status === 'running'"
+                  class="task-review-tag"
+                  title="检查助手正在后台核查"
+                >检查中</span>
                 <span class="task-time">{{ formatTaskTime(t.created_at) }}</span>
               </div>
               <!-- 标题:编辑态显示输入框,非编辑态显示文本 -->

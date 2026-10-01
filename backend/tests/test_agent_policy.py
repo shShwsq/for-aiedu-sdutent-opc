@@ -59,7 +59,6 @@ def test_default_policy_has_all_required_fields():
     """DEFAULT_AGENT_POLICY 应包含所有必需字段,默认值符合设计。"""
     expected_keys = {
         "agent2_enabled",
-        "max_rounds",
         "allow_verify",
         "allow_reference_check",
         "verifier_auth_mode_default",
@@ -68,11 +67,12 @@ def test_default_policy_has_all_required_fields():
     assert set(DEFAULT_AGENT_POLICY.keys()) == expected_keys
     # 关键默认值(与设计文档 / 前端 DEFAULT_POLICY 对齐)
     assert DEFAULT_AGENT_POLICY["agent2_enabled"] is True
-    assert DEFAULT_AGENT_POLICY["max_rounds"] == 2  # 核查优先、追问兜底
     assert DEFAULT_AGENT_POLICY["allow_verify"] is False
     assert DEFAULT_AGENT_POLICY["allow_reference_check"] is True
     assert DEFAULT_AGENT_POLICY["verifier_auth_mode_default"] == "per_action"
     assert DEFAULT_AGENT_POLICY["executor_command_confirm_default"] == "always_approve"
+    # max_rounds(协作总轮次)已随后台审查重构移除:初始运行单轮,多轮由用户 resume 驱动
+    assert "max_rounds" not in DEFAULT_AGENT_POLICY
 
 
 # ============================================================
@@ -85,8 +85,8 @@ def test_resolve_returns_defaults_for_anonymous_task(fake_task):
     db = _mock_db_with_policy(policy_row=None)
     policy = resolve_agent_policy(fake_task, db)
 
-    # 应等于默认值
-    assert policy["max_rounds"] == 2
+    # 应等于默认值(无 max_rounds 键:协作总轮次已移除)
+    assert "max_rounds" not in policy
     assert policy["allow_verify"] is False
     assert policy["allow_reference_check"] is True
     assert policy["verifier_auth_mode_default"] == "per_action"
@@ -97,14 +97,14 @@ def test_resolve_uses_user_level_defaults_when_no_overrides():
     task = _make_task_with_overrides(user_id=uuid.uuid4(), params=None)
     policy_row = MagicMock()
     policy_row.to_dict.return_value = {
-        "max_rounds": 6,
         "allow_verify": True,
+        "allow_reference_check": False,
     }
     db = _mock_db_with_policy(policy_row=policy_row)
 
     policy = resolve_agent_policy(task, db)
-    assert policy["max_rounds"] == 6
     assert policy["allow_verify"] is True
+    assert policy["allow_reference_check"] is False
     # 未覆盖的字段仍用 DEFAULT
     assert policy["verifier_auth_mode_default"] == "per_action"
 
@@ -113,19 +113,19 @@ def test_resolve_task_overrides_win_over_user_defaults():
     """任务级覆盖应优先于用户级默认。"""
     task = _make_task_with_overrides(
         user_id=uuid.uuid4(),
-        params={"_agent_policy": {"allow_verify": False, "max_rounds": 8}},
+        params={"_agent_policy": {"allow_verify": False, "allow_reference_check": True}},
     )
     policy_row = MagicMock()
     policy_row.to_dict.return_value = {
-        "max_rounds": 6,
         "allow_verify": True,  # 应被任务级 False 覆盖
+        "allow_reference_check": False,  # 应被任务级 True 覆盖
         "verifier_auth_mode_default": "direct",  # 任务级未覆盖,应保留用户级
     }
     db = _mock_db_with_policy(policy_row=policy_row)
 
     policy = resolve_agent_policy(task, db)
-    assert policy["max_rounds"] == 8          # 任务级覆盖
-    assert policy["allow_verify"] is False    # 任务级覆盖
+    assert policy["allow_verify"] is False          # 任务级覆盖
+    assert policy["allow_reference_check"] is True  # 任务级覆盖
     assert policy["verifier_auth_mode_default"] == "direct"  # 用户级保留
 
 
@@ -133,13 +133,13 @@ def test_resolve_task_overrides_win_over_defaults_for_anonymous():
     """匿名任务 + 任务级覆盖 → 任务级覆盖 DEFAULT。"""
     task = _make_task_with_overrides(
         user_id=None,
-        params={"_agent_policy": {"max_rounds": 7}},
+        params={"_agent_policy": {"allow_verify": True}},
     )
     db = _mock_db_with_policy(policy_row=None)
 
     policy = resolve_agent_policy(task, db)
-    assert policy["max_rounds"] == 7
-    assert policy["allow_verify"] is False  # 未覆盖,用默认
+    assert policy["allow_verify"] is True
+    assert policy["allow_reference_check"] is True  # 未覆盖,用默认
 
 
 def test_resolve_handles_saved_default_policy():
@@ -150,7 +150,6 @@ def test_resolve_handles_saved_default_policy():
     db = _mock_db_with_policy(policy_row=policy_row)
 
     policy = resolve_agent_policy(task, db)
-    assert policy["max_rounds"] == 2
     assert policy["allow_verify"] is False
 
 
@@ -160,7 +159,7 @@ def test_resolve_handles_no_policy_row():
     db = _mock_db_with_policy(policy_row=None)
 
     policy = resolve_agent_policy(task, db)
-    assert policy["max_rounds"] == 2
+    assert policy["agent2_enabled"] is True
 
 
 def test_resolve_handles_empty_params_dict():
@@ -169,7 +168,7 @@ def test_resolve_handles_empty_params_dict():
     db = _mock_db_with_policy(policy_row=None)
 
     policy = resolve_agent_policy(task, db)
-    assert policy["max_rounds"] == 2
+    assert policy["agent2_enabled"] is True
 
 
 def test_resolve_handles_empty_agent_policy_in_params():
@@ -178,18 +177,20 @@ def test_resolve_handles_empty_agent_policy_in_params():
     db = _mock_db_with_policy(policy_row=None)
 
     policy = resolve_agent_policy(task, db)
-    assert policy["max_rounds"] == 2
+    assert policy["agent2_enabled"] is True
 
 
-def test_resolve_invalid_max_rounds_falls_back_to_default():
-    """max_rounds 非法(不可转 int)→ 回退默认 2 并钳制。"""
+def test_resolve_ignores_legacy_max_rounds_override():
+    """老任务 params 里残留 max_rounds → 忽略该键(不进结果,不影响其他覆盖)。"""
     task = _make_task_with_overrides(
-        user_id=None, params={"_agent_policy": {"max_rounds": "abc"}}
+        user_id=None,
+        params={"_agent_policy": {"max_rounds": 9, "allow_verify": True}},
     )
     db = _mock_db_with_policy(policy_row=None)
 
     policy = resolve_agent_policy(task, db)
-    assert policy["max_rounds"] == 2
+    assert "max_rounds" not in policy
+    assert policy["allow_verify"] is True  # 同级其他覆盖正常生效
 
 
 # ============================================================
@@ -207,7 +208,6 @@ def test_security_scenario_auto_enables_allow_verify():
     policy = resolve_agent_policy(task, db)
     assert policy["allow_verify"] is True
     # 其他字段不受影响
-    assert policy["max_rounds"] == 2
     assert policy["allow_reference_check"] is True
 
 
@@ -228,7 +228,7 @@ def test_security_scenario_user_saved_policy_wins():
     )
     policy_row = MagicMock()
     policy_row.to_dict.return_value = {
-        "agent2_enabled": True, "max_rounds": 4, "allow_verify": False,
+        "agent2_enabled": True, "allow_verify": False,
         "allow_reference_check": True,
         "verifier_auth_mode_default": "per_action",
         "executor_command_confirm_default": "always_approve",
@@ -410,6 +410,56 @@ def test_migration_skips_when_table_missing(monkeypatch):
     )
 
     migrate_agent_policy_add_reference_check_column()
+
+    conn.execute.assert_not_called()
+    conn.commit.assert_not_called()
+
+
+# ============================================================
+# 迁移:agent_policies.max_rounds 旧列幂等删除(协作总轮次移除)
+# ============================================================
+
+
+def test_drop_max_rounds_migration_drops_when_exists(monkeypatch):
+    """老库存在 max_rounds 列 → DROP 并提交。"""
+    conn = _migration_env(
+        monkeypatch, columns=["id", "user_id", "agent2_enabled", "max_rounds"],
+    )
+    from app.models.agent_policy import (
+        migrate_agent_policy_drop_max_rounds_column,
+    )
+
+    migrate_agent_policy_drop_max_rounds_column()
+
+    conn.execute.assert_called_once()
+    sql = str(conn.execute.call_args.args[0])
+    assert "DROP COLUMN max_rounds" in sql
+    conn.commit.assert_called_once()
+
+
+def test_drop_max_rounds_migration_skips_when_absent(monkeypatch):
+    """全新库无 max_rounds 列 → 幂等跳过,不执行 DROP 不提交。"""
+    conn = _migration_env(
+        monkeypatch, columns=["id", "user_id", "agent2_enabled"],
+    )
+    from app.models.agent_policy import (
+        migrate_agent_policy_drop_max_rounds_column,
+    )
+
+    migrate_agent_policy_drop_max_rounds_column()
+
+    conn.execute.assert_not_called()
+    conn.commit.assert_not_called()
+
+
+def test_drop_max_rounds_migration_skips_when_table_missing(monkeypatch):
+    """表不存在 → 直接返回。"""
+    conn = _migration_env(monkeypatch, has_table=False)
+    from app.models.agent_policy import (
+        migrate_agent_policy_drop_max_rounds_column,
+    )
+
+    migrate_agent_policy_drop_max_rounds_column()
 
     conn.execute.assert_not_called()
     conn.commit.assert_not_called()

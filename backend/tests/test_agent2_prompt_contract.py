@@ -1,57 +1,100 @@
-"""agent2 system prompt 输出契约锚点测试
+"""agent2 双 prompt(审查/分析)输出契约锚点测试
 
-阶段重构(检查助手移居侧栏 + 结果清单改重点与知识点)后,AGENT2_SYSTEM_PROMPT
-的关键契约:
-- done=true 时 results 为重点与知识点形态(3-8 条精选,learning_note 必有)
-- grouping 默认 null
-- "敢不敢上线"不再是无条件硬性要求(仅用户意图涉及上线决策时)
-- 核查优先、追问兜底原则保留
+后台审查重构后,agent2 拆成两个模式:
+- AGENT2_REVIEW_PROMPT(审查模式):agent1 结束后的单次完整后台审查,
+  输出 covered/missing/reasoning/suggestions/results/grouping,
+  无 followup_query/done 轮次语义;追问降级为"建议深挖方向"
+- AGENT2_ANALYZE_PROMPT(分析模式):resume 时分析用户追加消息,
+  输出 followup_query(执行指令)或 done=true(无需执行),无工具
 
-本测试锚定这些关键词,防止后续误改导致契约回归。
+AGENT2_SYSTEM_PROMPT 为审查模式的兼容别名。
+
+本测试锚定关键契约关键词,防止后续误改导致契约回归。
 """
 import pytest
 
-from app.agents.agent2 import AGENT2_SYSTEM_PROMPT
+from app.agents.agent2 import (
+    AGENT2_ANALYZE_PROMPT,
+    AGENT2_REVIEW_PROMPT,
+    AGENT2_SYSTEM_PROMPT,
+)
 
 
-def test_prompt_contains_knowledge_results_contract():
+def test_system_prompt_alias_points_to_review():
+    """兼容别名指向审查模式 prompt(旧引用不破坏)。"""
+    assert AGENT2_SYSTEM_PROMPT is AGENT2_REVIEW_PROMPT
+
+
+# ============================================================
+# 审查模式契约
+# ============================================================
+
+
+def test_review_prompt_contains_knowledge_results_contract():
     """results 契约:重点与知识点形态 + learning_note + practice_worthy。"""
-    assert "重点与知识点" in AGENT2_SYSTEM_PROMPT
-    assert "3-8" in AGENT2_SYSTEM_PROMPT
-    assert "learning_note" in AGENT2_SYSTEM_PROMPT
-    assert "practice_worthy" in AGENT2_SYSTEM_PROMPT
+    assert "重点与知识点" in AGENT2_REVIEW_PROMPT
+    assert "3-8" in AGENT2_REVIEW_PROMPT
+    assert "learning_note" in AGENT2_REVIEW_PROMPT
+    assert "practice_worthy" in AGENT2_REVIEW_PROMPT
     # 不是全量发现清单的语义
-    assert "不是全量发现清单" in AGENT2_SYSTEM_PROMPT
+    assert "不是全量发现清单" in AGENT2_REVIEW_PROMPT
 
 
-def test_prompt_grouping_defaults_to_null():
+def test_review_prompt_grouping_defaults_to_null():
     """grouping 契约:默认输出 null(平铺)。"""
-    assert "默认输出 null" in AGENT2_SYSTEM_PROMPT
-    assert "默认 null" in AGENT2_SYSTEM_PROMPT
+    assert "默认输出 null" in AGENT2_REVIEW_PROMPT
+    assert "默认 null" in AGENT2_REVIEW_PROMPT
 
 
-def test_prompt_ship_conclusion_is_conditional():
+def test_review_prompt_ship_conclusion_is_conditional():
     """「敢不敢上线」结论:仅当用户意图涉及上线/采用决策时才要求,非硬性。"""
-    assert "仅当用户意图" in AGENT2_SYSTEM_PROMPT
+    assert "仅当用户意图" in AGENT2_REVIEW_PROMPT
     # 旧的硬性要求表述已移除
-    assert "必须给出「敢不敢上线" not in AGENT2_SYSTEM_PROMPT
+    assert "必须给出「敢不敢上线" not in AGENT2_REVIEW_PROMPT
 
 
-def test_prompt_keeps_verify_first_followup_fallback():
-    """核查优先、追问兜底原则保留。"""
-    assert "核查优先、追问兜底" in AGENT2_SYSTEM_PROMPT
-    assert "最后手段" in AGENT2_SYSTEM_PROMPT
+def test_review_prompt_has_suggestions_contract():
+    """建议深挖契约:0-3 条、具体可执行、最后手段(能自查的不列建议)。"""
+    assert "suggestions" in AGENT2_REVIEW_PROMPT
+    assert "0-3" in AGENT2_REVIEW_PROMPT
+    assert "最后手段" in AGENT2_REVIEW_PROMPT
+    assert "你能自己核查确认的,一律不列建议" in AGENT2_REVIEW_PROMPT
 
 
-def test_prompt_behind_scenes_positioning():
-    """幕后质检定位:agent1 是台前回答者,agent2 过程经侧栏呈现。"""
-    assert "幕后质检" in AGENT2_SYSTEM_PROMPT
-    assert "台前回答者" in AGENT2_SYSTEM_PROMPT
-    assert "侧栏" in AGENT2_SYSTEM_PROMPT
+def test_review_prompt_no_round_or_followup_semantics():
+    """审查模式无轮次/追问语义:只审不改,多轮由用户驱动。"""
+    assert "只审不改" in AGENT2_REVIEW_PROMPT
+    assert "followup_query" not in AGENT2_REVIEW_PROMPT
 
 
-def test_prompt_reference_and_verify_sections_kept():
+def test_review_prompt_behind_scenes_positioning():
+    """幕后审查定位:agent1 是台前回答者,agent2 过程经侧栏呈现。"""
+    assert "幕后审查者" in AGENT2_REVIEW_PROMPT
+    assert "台前回答者" in AGENT2_REVIEW_PROMPT
+    assert "侧栏" in AGENT2_REVIEW_PROMPT
+
+
+def test_review_prompt_reference_and_verify_sections_kept():
     """引用复核与动态验证章节保留(核查手段不变)。"""
-    assert "引用复核" in AGENT2_SYSTEM_PROMPT
-    assert "动态验证" in AGENT2_SYSTEM_PROMPT
-    assert "check_reference" in AGENT2_SYSTEM_PROMPT
+    assert "引用复核" in AGENT2_REVIEW_PROMPT
+    assert "动态验证" in AGENT2_REVIEW_PROMPT
+    assert "check_reference" in AGENT2_REVIEW_PROMPT
+
+
+# ============================================================
+# 分析模式契约
+# ============================================================
+
+
+def test_analyze_prompt_output_contract():
+    """分析模式输出:followup_query(执行指令)或 done=true(无需执行)。"""
+    assert "followup_query" in AGENT2_ANALYZE_PROMPT
+    assert "done" in AGENT2_ANALYZE_PROMPT
+    # 分析模式无 results/suggestions(不产出知识点,只判断是否执行)
+    assert "results" not in AGENT2_ANALYZE_PROMPT
+    assert "suggestions" not in AGENT2_ANALYZE_PROMPT
+
+
+def test_analyze_prompt_lean_to_execute_when_uncertain():
+    """不确定时倾向执行(多跑一轮代价小于忽略用户诉求)。"""
+    assert "不确定时倾向执行" in AGENT2_ANALYZE_PROMPT

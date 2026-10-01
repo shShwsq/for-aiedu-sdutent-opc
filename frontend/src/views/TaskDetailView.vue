@@ -39,6 +39,7 @@ import {
   pauseTask,
   resumeTask,
   retryTask,
+  sendTaskMessage,
   skipPreClone,
   submitVerifyAction,
   submitCommandConfirm,
@@ -460,7 +461,15 @@ async function initTask(): Promise<void> {
     }
 
     // 2. 若任务仍在进行(含暂停态),连接 SSE 接收实时事件
-    if (task.value && (task.value.status === 'pending' || task.value.status === 'running' || task.value.status === 'paused')) {
+    //    双 agent 模式:任务 COMPLETED 但后台审查未结束(review_status=running)
+    //    时事件总线仍打开,刷新页面后同样需要重连接收审查事件
+    if (
+      task.value &&
+      (task.value.status === 'pending' ||
+        task.value.status === 'running' ||
+        task.value.status === 'paused' ||
+        task.value.review_status === 'running')
+    ) {
       connectSSE(taskId)
       // 恢复可能存在的待授权验证动作弹窗(per_action 模式刷新页面后)
       void restorePendingVerifyAction(taskId)
@@ -521,6 +530,32 @@ async function exportPdf(): Promise<void> {
     error.value = extractErrorMessage(err)
   } finally {
     exporting.value = false
+  }
+}
+
+/**
+ * 用最新快照替换本地任务并重建派生状态(plan 提取 + 轮对话计数)
+ *
+ * - clearStreaming=true:任务全部结束,清空所有流式卡片(历史对话接管)
+ * - clearStreaming=false:agent1_done 时调用,只清 agent1 流式卡片,
+ *   保留 agent2 的(后台审查的实时思考继续由流式卡片展示)
+ */
+function applyTaskSnapshot(fresh: TaskDetail, clearStreaming: boolean): void {
+  task.value = fresh
+  // 重新提取 plan(快照可能含最新一轮的 plan 更新)
+  extractPlanFromHistory(fresh.conversations)
+  // 恢复 convCountPerRound(与 roundGroups 里 localIdx 的基准一致:跳过 user question)
+  convCountPerRound.clear()
+  for (const c of fresh.conversations) {
+    if (c.role === 'user' && c.type === 'question') continue
+    convCountPerRound.set(c.round_idx, (convCountPerRound.get(c.round_idx) ?? 0) + 1)
+  }
+  if (clearStreaming) {
+    streamingItems.clear()
+  } else {
+    for (const [key, s] of streamingItems) {
+      if (s.role === 'agent1') streamingItems.delete(key)
+    }
   }
 }
 
@@ -603,6 +638,40 @@ function connectSSE(taskId: string): void {
     onCommandConfirm: (data) => {
       commandConfirmData.value = data
     },
+    onAgent1Done: async () => {
+      // agent1 结束即任务完成:本地置 completed 并拉快照展示临时结果
+      // (后端已落 1 条"检查助手整理中"临时结果);事件总线保持打开,
+      // 后台审查的 conversation/thinking_delta 事件继续送达侧栏
+      if (task.value) {
+        task.value.status = 'completed'
+        task.value.current_stage = '检查助手后台核查中'
+      }
+      try {
+        const fresh = await getTask(taskId)
+        if (fresh && !unmountedFlag) {
+          // 只清 agent1 流式卡片(其思考已落库);agent2 审查流式尚未开始,
+          // 保留 Map 不影响后续 thinking_delta 继续累积
+          applyTaskSnapshot(fresh, false)
+        }
+      } catch {
+        // 快照拉取失败:保持本地状态,onReviewDone/onDone 会再拉
+      }
+    },
+    onReviewDone: async (data) => {
+      // 后台审查结束:done=重点与知识点已替换临时结果 / failed=保留执行结果
+      // 拉快照同步最终 results 与 suggestions(终止 done 事件随后到达)
+      if (task.value) {
+        task.value.review_status = data.review_status
+      }
+      try {
+        const fresh = await getTask(taskId)
+        if (fresh && !unmountedFlag) {
+          applyTaskSnapshot(fresh, false)
+        }
+      } catch {
+        // 快照拉取失败:onDone 兜底再拉一次
+      }
+    },
     onDone: async () => {
       // [诊断] done 事件处理:记录是否走了 resume 竞态校验分支
       clientLog(taskId, 'view_on_done', { resuming: resumingRef.value })
@@ -631,21 +700,10 @@ function connectSSE(taskId: string): void {
       }
       // 任务完成:拉取最终结果(含 results)
       try {
-        task.value = await getTask(taskId)
-        if (task.value) {
-          // 重新提取 plan(最终快照可能含最后一轮的 plan 更新)
-          extractPlanFromHistory(task.value.conversations)
-          // 恢复 convCountPerRound(最终快照含所有 thinking,跳过 user question,与 localIdx 对齐)
-          convCountPerRound.clear()
-          for (const c of task.value.conversations) {
-            if (c.role === 'user' && c.type === 'question') continue
-            convCountPerRound.set(
-              c.round_idx,
-              (convCountPerRound.get(c.round_idx) ?? 0) + 1,
-            )
-          }
-          // 清空流式卡片(已完成,由历史对话接管显示)
-          streamingItems.clear()
+        const fresh = await getTask(taskId)
+        if (fresh) {
+          // 全部结束:清空流式卡片(历史对话接管显示)
+          applyTaskSnapshot(fresh, true)
         }
       } catch (err) {
         console.error('拉取最终结果失败:', err)
@@ -1857,9 +1915,10 @@ const isRunning = computed(
 const isPaused = computed(() => task.value?.status === 'paused')
 
 // ---- 检查助手侧栏面板(阶段重构:agent2 过程输出全部移入右侧栏)----
-/** 检查助手是否有活动内容(历史消息或流式思考);无则隐藏面板(单 agent 模式/未开始) */
+/** 检查助手是否有活动内容(历史消息或流式思考/审查状态);无则隐藏面板(单 agent 模式/未开始) */
 const hasAgent2Activity = computed(
   () =>
+    !!task.value?.review_status ||
     !!task.value?.conversations?.some((c) => c.role === 'agent2') ||
     [...streamingItems.values()].some((s) => s.role === 'agent2'),
 )
@@ -2039,6 +2098,9 @@ function handleMessageSent(_resp: SendMessageResponse): void {
     // 后端 resume 线程已把状态改回 RUNNING,本地同步 + 重连 SSE
     task.value.status = 'running'
     task.value.current_stage = '用户追加消息,重启执行'
+    // 重置审查状态:新一轮 agent1 执行 → 后台审查尚未开始,
+    // 旧值(done/failed)会误导侧栏 badge(等后端事件再更新)
+    task.value.review_status = null
     // 标记 resume 窗口:onDone 若在窗口内触发,需校验是否竞态误推
     resumingRef.value = true
     connectSSE(String(task.value.id))
@@ -2049,6 +2111,32 @@ function handleMessageSent(_resp: SendMessageResponse): void {
 /** 用户消息发送失败:展示错误提示 */
 function handleMessageError(message: string): void {
   error.value = message
+}
+
+/**
+ * 侧栏"建议深挖":把检查助手的建议文本作为用户消息发出
+ *
+ * 任务已 COMPLETED(agent1 结束即完成),后端走 resume 链路:
+ * agent1 追加执行一轮 → 新一轮后台审查。发送成功后同 handleMessageSent
+ * 的 completed 分支(置 running + 标记 resume 窗口 + 重连 SSE)。
+ * 审查仍在进行时后端返回 accepted=false(检查助手仍在核查中),提示稍后再试。
+ */
+async function handleSuggestionDig(text: string): Promise<void> {
+  if (!task.value?.id) return
+  try {
+    const resp = await sendTaskMessage(String(task.value.id), { content: text })
+    clientLog(String(task.value.id), 'suggestion_dig', {
+      accepted: resp.accepted,
+      message: resp.message,
+    })
+    if (resp.accepted) {
+      handleMessageSent(resp)
+    } else {
+      error.value = resp.message || '检查助手仍在核查中,请稍后再试'
+    }
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+  }
 }
 
 /** 运行时设置(模型/协作策略)保存成功:回填后端最新快照 */
@@ -2775,6 +2863,8 @@ function toggleResult(id: string): void {
           :conversations="task.conversations"
           :streaming-items="streamingItems"
           :is-running="isAgent2Running"
+          :review-status="task.review_status"
+          @send-suggestion="handleSuggestionDig"
         />
 
         <!-- 重点与知识点(原"结果清单";分组由 task.params._grouping 驱动,卡片默认折叠;置底展示) -->
@@ -2785,6 +2875,14 @@ function toggleResult(id: string): void {
         >
           <h2>
             重点与知识点 <span class="count">({{ task.results.length }})</span>
+            <!-- 后台审查进行中:当前为临时结果,审查完成后由检查助手整理的重点与知识点替换 -->
+            <span
+              v-if="task.review_status === 'running'"
+              class="review-interim-hint"
+              title="检查助手正在后台核查,当前为临时结果,完成后自动更新"
+            >
+              检查助手整理中
+            </span>
             <!-- 本任务的出题 job 运行中时,隐藏「生成练习题」入口,改为展示跳转练习页看实时进度 -->
             <button
               v-if="runningGenJob"
@@ -3089,6 +3187,26 @@ function toggleResult(id: string): void {
 /* ---- 任务详情概览(扁平化) ---- */
 .overview-section {
   padding: var(--space-2) 0;
+}
+
+/* 临时结果提示(后台审查进行中,结果清单标题行;呼吸点提示将自动更新) */
+.review-interim-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--color-text-secondary);
+}
+
+.review-interim-hint::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-primary);
+  animation: gen-pulse 1.4s ease-in-out infinite;
 }
 
 /* 出题进度跳转入口(位于结果清单标题行,与「生成练习题」按钮互斥;呼吸红点提示运行中) */

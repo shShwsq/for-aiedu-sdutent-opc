@@ -189,6 +189,8 @@ export interface TaskListItem {
   title: string | null
   user_input: string
   status: TaskStatus
+  /** 后台审查状态(running 时列表项显示"检查中"角标;null=未审查) */
+  review_status?: ReviewStatus | null
   current_stage: string | null
   error_message: string | null
   created_at: string
@@ -210,6 +212,8 @@ export type SSEEventType =
   | 'plan'
   | 'verify_action'
   | 'command_confirm'
+  | 'agent1_done'
+  | 'review_done'
   | 'done'
   | 'error'
 
@@ -303,6 +307,17 @@ export interface ThinkingDeltaEventData {
 export interface DoneEventData {
   status: TaskStatus
   error_message?: string
+}
+
+/** agent1_done 事件 data(agent1 结束即任务完成,审查仍在后台) */
+export interface Agent1DoneEventData {
+  status: TaskStatus
+}
+
+/** review_done 事件 data(后台审查结束,前端拉快照替换临时结果) */
+export interface ReviewDoneEventData {
+  /** done: 审查完成(重点与知识点已替换临时结果)/ failed: 审查失败(保留执行结果) */
+  review_status: 'done' | 'failed'
 }
 
 /**
@@ -428,39 +443,35 @@ export interface VerifyConfigUpdateRequest {
   verifier_auth_tokens?: VerifierAuthToken[]
 }
 
-/** 运行时可调整的协作策略字段(任务级覆盖,增量合并到 task.params._agent_policy) */
-export interface RuntimePolicyUpdate {
-  /** agent2 协作总轮次(1-10) */
-  max_rounds?: number
-}
-
 /**
  * 更新任务运行时配置请求(PATCH /tasks/{id}/runtime_config)
  *
- * 任务进行中修改 agent1 / agent2 模型与协作策略。
+ * 任务进行中修改 agent1 / agent2 模型。
  * 生效时机:running/paused 的当前执行仍用启动时配置,
  * 修改在下一轮执行(completed 后追加消息 / failed 重试)时生效。
+ *
+ * 历史:曾有 agent_policy.max_rounds(协作总轮次)子对象,
+ * 已随后台审查重构移除(初始运行单轮,多轮由用户 resume 驱动)。
  */
 export interface RuntimeConfigUpdateRequest {
   /** agent2 模型配置 id;空字符串=清除(回退 env 默认);undefined=不修改 */
   llm_config_id?: string
   /** agent1 模型配置 id(仅 executor=builtin);空字符串=清除(回退 llm_config_id) */
   react_llm_config_id?: string
-  /** 协作策略(增量合并) */
-  agent_policy?: RuntimePolicyUpdate
 }
 
 /**
- * agent 策略配置(agent2 启停、协作轮次、验证权限)
+ * agent 策略配置(agent2 启停、验证权限)
  *
  * 用户级默认存储在 UserPreference.agent_policy,任务级覆盖存储在
  * task.params["_agent_policy"]。resolve_agent_policy 合并两者后生效。
+ *
+ * 历史:曾有 max_rounds(协作总轮次)字段,已随后台审查重构移除
+ * (初始运行单轮,多轮由用户 resume 驱动)。
  */
 export interface AgentPolicy {
   /** 是否启用 agent2(关闭=单 agent 模式,跳过评估/验证) */
   agent2_enabled: boolean
-  /** agent2 协作总轮次(1-10,仅 agent2 启用时生效) */
-  max_rounds: number
   /** agent2 是否能自己在测试环境验证(实验性,先留开关) */
   allow_verify: boolean
   /** 验证授权默认模式:"direct" 直接执行 / "per_action" 逐动作授权(任务级可覆盖) */
