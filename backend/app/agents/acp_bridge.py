@@ -26,6 +26,7 @@ ACP 协议(JSON-RPC 2.0 over stdio):
 """
 import argparse
 import json
+import queue
 import shutil
 import subprocess
 import sys
@@ -57,6 +58,11 @@ class ACPCLIProcess:
         # 响应回写通过 _stdin_lock 与 /rpc 的请求写入互斥。
         self._rpc_lock = threading.Lock()
         self._stdin_lock = threading.Lock()
+        # stdout 行队列:常驻读线程(_pump_stdout)推入,/rpc 消费。
+        # 不用 select 轮询:Windows 的 select 只支持 socket,作用于管道 fd
+        # 会抛 WinError 10038(local 模式 bridge 跑在宿主机 Windows Python 上,
+        # 每个 /rpc 请求都会崩在 select 上,CLI 响应永远无法转发)。
+        self._stdout_q: queue.Queue = queue.Queue()
 
     def start(self) -> None:
         """启动 ACP CLI 子进程"""
@@ -74,8 +80,26 @@ class ACPCLIProcess:
             text=True,
             bufsize=1,  # 行缓冲
         )
+        # 启动 stdout 读取线程(阻塞 readline 推入队列,跨平台替代 select)
+        threading.Thread(target=self._pump_stdout, daemon=True).start()
         # 启动 stderr 监控线程(把 CLI 的 stderr 转发到 bridge 的 stderr)
         threading.Thread(target=self._pump_stderr, daemon=True).start()
+
+    def _pump_stdout(self) -> None:
+        """常驻读线程:阻塞式逐行读取 CLI stdout,推入 _stdout_q 供 /rpc 消费
+
+        行的语义分发(JSON-RPC 最终响应/通知/request_permission)由 /rpc 的
+        SSE 循环处理,这里只负责搬运。EOF/读异常以哨兵入队,让消费方感知
+        流结束(等价于原先 select + readline 的 EOF 检测)。
+        """
+        if not self.proc or not self.proc.stdout:
+            return
+        try:
+            for line in self.proc.stdout:
+                self._stdout_q.put(("line", line))
+            self._stdout_q.put(("end", None))
+        except Exception as e:
+            self._stdout_q.put(("error", e))
 
     def _pump_stderr(self) -> None:
         """把 CLI 的 stderr 输出到 bridge 的 stderr(调试用)"""
@@ -88,47 +112,10 @@ class ACPCLIProcess:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def send_and_collect(self, request: dict) -> list[str]:
-        """发送 JSON-RPC 请求,收集所有响应行(通知 + 最终响应)
-
-        返回行列表,每行是一个 JSON 字符串。最后一行是匹配 id 的最终响应。
-        通知(无 id)在最终响应之前返回。
-
-        线程安全:用 _rpc_lock 保护整个 send+collect 串行(ACP 协议串行)。
-        """
-        if not self.alive:
-            raise RuntimeError("ACP CLI 进程未运行或已退出")
-
-        request_id = request.get("id")
-        request_line = json.dumps(request, ensure_ascii=False)
-        collected: list[str] = []
-
-        with self._rpc_lock:
-            # 写入请求(加换行符,ACP 用 newline-delimited JSON)
-            self._write_stdin(request_line)
-
-            # 逐行读取响应,直到收到匹配 id 的最终响应
-            assert self.proc is not None
-            assert self.proc.stdout is not None
-            for line in self.proc.stdout:
-                line = line.strip()
-                if not line:
-                    continue
-                collected.append(line)
-                # 检查是否是最终响应(有 id 且匹配)
-                try:
-                    msg = json.loads(line)
-                    if request_id is not None and msg.get("id") == request_id:
-                        break
-                except json.JSONDecodeError:
-                    continue  # 非 JSON 行(如日志),跳过
-
-        return collected
-
     def _write_stdin(self, line: str) -> None:
         """写一行到 CLI stdin(线程安全,用 _stdin_lock 保护)。
 
-        供 send_and_collect 和 request_permission 响应回写共用。
+        供 /rpc 的请求写入和 request_permission 响应回写共用。
         """
         assert self.proc is not None
         assert self.proc.stdin is not None
@@ -228,6 +215,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         print(f"[bridge] >>> 发送到 CLI: method={request_method}, id={request_id}", file=sys.stderr, flush=True)
 
         # 发送请求 + 流式读取响应(持 _rpc_lock,串行)
+        headers_sent = False
         try:
             with _cli._rpc_lock:
                 if not _cli.alive:
@@ -242,24 +230,26 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "keep-alive")
                 self.end_headers()
+                headers_sent = True
 
                 # 逐行读取 stdout,立即推送 SSE
-                # 使用 readline + 超时检测,避免 CLI 无输出时永久挂起
-                assert _cli.proc is not None
-                assert _cli.proc.stdout is not None
-                import select as _select
-                stdout_fd = _cli.proc.stdout.fileno()
+                # stdout 由常驻读线程(_pump_stdout)阻塞 readline 后推入
+                # _stdout_q,这里 queue.get(timeout) 轮询:有行即转发,超时则
+                # 检查进程存活 + 推 idle 心跳。
+                # 不用 select:Windows 的 select 只支持 socket,作用于管道 fd
+                # 会抛 WinError 10038(local 模式 bridge 跑在宿主机 Windows
+                # Python 上,每个 /rpc 请求都会崩,CLI 响应永远无法转发)。
                 # 不设硬性 deadline:CLI 可能在等异步子 agent(数十秒~数分钟无输出)。
                 # 只在 CLI 进程退出或 stdout EOF 时结束,确保不丢失后续响应。
-                # select 用 5s 超时,便于周期性检查进程存活 + 推送 idle 心跳。
                 line_count = 0
                 idle_secs = 0.0
                 last_idle_log = 0.0
 
                 while True:
-                    # 用 select 检查 stdout 是否有数据(5s 超时,便于周期性检查进程存活)
-                    ready, _, _ = _select.select([stdout_fd], [], [], 5.0)
-                    if not ready:
+                    # 从队列取一行(5s 超时,便于周期性检查进程存活)
+                    try:
+                        kind, payload = _cli._stdout_q.get(timeout=5.0)
+                    except queue.Empty:
                         # 暂无数据,检查 CLI 进程是否还活着
                         if not _cli.alive:
                             print(f"[bridge] CLI 进程在等待响应时退出(method={request_method})", file=sys.stderr, flush=True)
@@ -280,16 +270,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
                             break  # 客户端断开连接
                         continue
 
+                    if kind == "end":
+                        # EOF,CLI 进程关闭了 stdout(读线程哨兵)
+                        print(f"[bridge] CLI stdout EOF(method={request_method})", file=sys.stderr, flush=True)
+                        break
+                    if kind == "error":
+                        print(f"[bridge] 读 CLI stdout 失败(method={request_method}): {payload}", file=sys.stderr, flush=True)
+                        break
+
                     # 有数据,重置 idle 计数
                     idle_secs = 0.0
                     last_idle_log = 0.0
 
-                    raw_line = _cli.proc.stdout.readline()
-                    if not raw_line:
-                        # EOF,CLI 进程关闭了 stdout
-                        print(f"[bridge] CLI stdout EOF(method={request_method})", file=sys.stderr, flush=True)
-                        break
-
+                    raw_line = payload
                     line = raw_line.strip()
                     if not line:
                         continue
@@ -331,11 +324,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 if line_count == 0:
                     print(f"[bridge] 警告:CLI 未输出任何响应行(method={request_method})", file=sys.stderr, flush=True)
         except Exception as e:
-            # 响应头未发时返回 JSON 错误;已发则只能日志记录
-            try:
-                self._send_json(500, json.dumps({"error": str(e)}))
-            except Exception:
+            if headers_sent:
+                # SSE 响应头已发出,无法再返回 HTTP 错误状态;只能记录日志并
+                # 强制关闭连接,让客户端的流式读取收到 EOF 而非无限等待
+                # (写 500 会在同一响应里出现两个状态行,客户端也解析不出)
                 print(f"[bridge] 流式响应异常: {e}", file=sys.stderr, flush=True)
+                self.close_connection = True
+            else:
+                # 响应头未发,可正常返回 JSON 错误
+                try:
+                    self._send_json(500, json.dumps({"error": str(e)}))
+                except Exception:
+                    print(f"[bridge] 流式响应异常: {e}", file=sys.stderr, flush=True)
 
     def _handle_request_permission(self, msg: dict) -> None:
         """处理 CLI 发来的 request_permission JSON-RPC 请求。

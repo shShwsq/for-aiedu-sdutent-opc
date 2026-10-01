@@ -421,12 +421,16 @@ class ACPClient:
         except Exception as e:
             logger.warning(f"[acp] 提交 permission_response 失败(perm_id={perm_id}): {e}")
 
-    def initialize(self) -> dict:
+    def initialize(self, timeout: httpx.Timeout | float | None = 60) -> dict:
         """ACP 握手:交换协议版本和能力
 
         返回的 result 可能含 authMethods(若 Agent 要求认证),
         此时客户端须先调 authenticate(methodId) 才能创建 session。
         见 https://agentclientprotocol.com/protocol/authentication
+
+        timeout: 超时(秒),默认 60s。握手是 bridge 就绪后的快速往返,
+        传有限值让 bridge 异常时快速失败——client 默认 read=None 会无限
+        等待,bridge 崩溃/CLI 挂死时前端会永远停在握手阶段。
         """
         return self._rpc({
             "jsonrpc": "2.0",
@@ -437,7 +441,7 @@ class ACPClient:
                 "clientInfo": {"name": "SecondLook", "version": "1.0.0"},
             },
             "id": self._next_id(),
-        })
+        }, timeout=timeout)
 
     def authenticate(
         self,
@@ -460,11 +464,18 @@ class ACPClient:
             "id": self._next_id(),
         }, timeout=timeout)
 
-    def new_session(self, cwd: str | None = None) -> str:
+    def new_session(
+        self,
+        cwd: str | None = None,
+        timeout: httpx.Timeout | float | None = 60,
+    ) -> str:
         """创建 ACP 会话,返回 session_id
 
         params 按 ACP 规范必须含 mcpServers(可为空数组),cwd 为可选工作目录。
         见 https://agentclientprotocol.com/protocol/session-setup
+
+        timeout: 超时(秒),默认 60s(与 initialize 同理,快速往返传有限值,
+        bridge 异常时快速失败而非无限挂起)。
         """
         params: dict[str, Any] = {"mcpServers": []}
         if cwd:
@@ -474,7 +485,7 @@ class ACPClient:
             "method": "session/new",
             "params": params,
             "id": self._next_id(),
-        })
+        }, timeout=timeout)
         session_id = result.get("sessionId") or result.get("session_id") or ""
         if not session_id:
             raise RuntimeError(f"ACP session/new 未返回 sessionId: {result}")
