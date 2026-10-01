@@ -93,6 +93,38 @@ class Settings(BaseSettings):
     # 任务交付物上传目录(ZIP 解压存树 / 单文件原样存,带 meta.json;
     # 任务创建后长期保留,供失败重试 / 完成后追问 resume 复用)
     UPLOADS_DIR: str = "./uploads_data"
+
+    # ---- 引用复核(check_reference,agent2 用)----
+    # 场景命中且任务级 _agent_policy 未显式设置 allow_verify 时,自动开启
+    # PoC 验证开关(实际跑 PoC 仍需任务配 test_env_url)。逗号分隔场景 id。
+    VERIFY_DEFAULT_SCENARIOS: str = "code_security_audit"
+    # 引用复核抓取超时(秒,单跳 socket 级)
+    REFERENCE_CHECK_TIMEOUT: int = 15
+    # 引用复核响应体读取上限(字符,超出截断)
+    REFERENCE_MAX_BODY_CHARS: int = 50000
+    # 引用复核最大重定向跳数(每一跳都过 SSRF 校验)
+    REFERENCE_MAX_REDIRECTS: int = 3
+    # TIER1 权威域名(逗号分隔;条目可含路径前缀限定,如 github.com/advisories;
+    # 纯域名为后缀匹配,带路径条目要求域名精确匹配且路径前缀命中)
+    REFERENCE_TIER1_DOMAINS: str = (
+        "github.com/advisories,nvd.nist.gov,cve.org,cve.mitre.org,"
+        "cisa.gov,cert.org,us-cert.gov,kb.cert.org,owasp.org,"
+        "docs.python.org,nodejs.org,php.net,kotlinlang.org,doc.rust-lang.org,"
+        "go.dev,django.readthedocs.io,flask.palletsprojects.com,"
+        "fastapi.tiangolo.com,expressjs.com,react.dev,vuejs.org,"
+        "developer.mozilla.org,java.com,dev.java,openjdk.org,"
+        "docs.oracle.com,spring.io,ruby-doc.org,docs.ruby-lang.org,"
+        "dart.dev,flutter.dev,docs.gradle.org,maven.apache.org,"
+        "nginx.org,httpd.apache.org,postgresql.org,dev.mysql.com,"
+        "portswigger.net,snyk.io,gitlab.com/advisories"
+    )
+    # TIER2 可信域名(逗号分隔;github.com 整域在此,advisories 路径才算 TIER1)
+    REFERENCE_TIER2_DOMAINS: str = (
+        "github.com,wikipedia.org,stackoverflow.com,reddit.com,"
+        "cloud.google.com,aws.amazon.com,azure.microsoft.com,"
+        "learn.microsoft.com,docs.microsoft.com"
+    )
+
     # 任务上传限制(安全边界,详见 app/services/uploads.py)
     # 单次上传体上限(zip 本体或单文件,默认 100MB)
     UPLOAD_MAX_FILE_MB: int = 100

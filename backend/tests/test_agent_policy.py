@@ -24,16 +24,18 @@ def fake_task():
     task = MagicMock()
     task.user_id = None
     task.params = None
+    task.scenario = "general"
     task.id = "test-task-id"
     task.user_input = "测试用户输入"
     return task
 
 
-def _make_task_with_overrides(user_id=None, params=None):
-    """构造 fake task,指定 user_id 和 params。"""
+def _make_task_with_overrides(user_id=None, params=None, scenario="general"):
+    """构造 fake task,指定 user_id / params / scenario。"""
     task = MagicMock()
     task.user_id = user_id
     task.params = params
+    task.scenario = scenario
     task.id = "test-task-id"
     task.user_input = "测试用户输入"
     return task
@@ -59,21 +61,24 @@ def test_default_policy_has_all_required_fields():
         "agent2_enabled",
         "max_rounds",
         "allow_verify",
+        "allow_reference_check",
         "verifier_auth_mode_default",
         "executor_command_confirm_default",
     }
     assert set(DEFAULT_AGENT_POLICY.keys()) == expected_keys
     # 关键默认值(与设计文档 / 前端 DEFAULT_POLICY 对齐)
     assert DEFAULT_AGENT_POLICY["agent2_enabled"] is True
-    assert DEFAULT_AGENT_POLICY["max_rounds"] == 4
+    assert DEFAULT_AGENT_POLICY["max_rounds"] == 2  # 核查优先、追问兜底
     assert DEFAULT_AGENT_POLICY["allow_verify"] is False
+    assert DEFAULT_AGENT_POLICY["allow_reference_check"] is True
     assert DEFAULT_AGENT_POLICY["verifier_auth_mode_default"] == "per_action"
     assert DEFAULT_AGENT_POLICY["executor_command_confirm_default"] == "always_approve"
 
 
 # ============================================================
-# resolve_agent_policy:优先级 DEFAULT > user > task
+# resolve_agent_policy:优先级 DEFAULT > 场景默认 > user > task
 # ============================================================
+
 
 def test_resolve_returns_defaults_for_anonymous_task(fake_task):
     """匿名任务(user_id=None)+ 无 params → 纯默认值。"""
@@ -81,8 +86,9 @@ def test_resolve_returns_defaults_for_anonymous_task(fake_task):
     policy = resolve_agent_policy(fake_task, db)
 
     # 应等于默认值
-    assert policy["max_rounds"] == 4
+    assert policy["max_rounds"] == 2
     assert policy["allow_verify"] is False
+    assert policy["allow_reference_check"] is True
     assert policy["verifier_auth_mode_default"] == "per_action"
 
 
@@ -144,7 +150,7 @@ def test_resolve_handles_saved_default_policy():
     db = _mock_db_with_policy(policy_row=policy_row)
 
     policy = resolve_agent_policy(task, db)
-    assert policy["max_rounds"] == 4
+    assert policy["max_rounds"] == 2
     assert policy["allow_verify"] is False
 
 
@@ -154,7 +160,7 @@ def test_resolve_handles_no_policy_row():
     db = _mock_db_with_policy(policy_row=None)
 
     policy = resolve_agent_policy(task, db)
-    assert policy["max_rounds"] == 4
+    assert policy["max_rounds"] == 2
 
 
 def test_resolve_handles_empty_params_dict():
@@ -163,7 +169,7 @@ def test_resolve_handles_empty_params_dict():
     db = _mock_db_with_policy(policy_row=None)
 
     policy = resolve_agent_policy(task, db)
-    assert policy["max_rounds"] == 4
+    assert policy["max_rounds"] == 2
 
 
 def test_resolve_handles_empty_agent_policy_in_params():
@@ -172,7 +178,90 @@ def test_resolve_handles_empty_agent_policy_in_params():
     db = _mock_db_with_policy(policy_row=None)
 
     policy = resolve_agent_policy(task, db)
-    assert policy["max_rounds"] == 4
+    assert policy["max_rounds"] == 2
+
+
+def test_resolve_invalid_max_rounds_falls_back_to_default():
+    """max_rounds 非法(不可转 int)→ 回退默认 2 并钳制。"""
+    task = _make_task_with_overrides(
+        user_id=None, params={"_agent_policy": {"max_rounds": "abc"}}
+    )
+    db = _mock_db_with_policy(policy_row=None)
+
+    policy = resolve_agent_policy(task, db)
+    assert policy["max_rounds"] == 2
+
+
+# ============================================================
+# 场景默认:安全类场景自动 allow_verify(用户/任务级显式值优先)
+# ============================================================
+
+
+def test_security_scenario_auto_enables_allow_verify():
+    """code_security_audit 场景 + 从未显式设置 → allow_verify 自动开。"""
+    task = _make_task_with_overrides(
+        user_id=uuid.uuid4(), params=None, scenario="code_security_audit"
+    )
+    db = _mock_db_with_policy(policy_row=None)
+
+    policy = resolve_agent_policy(task, db)
+    assert policy["allow_verify"] is True
+    # 其他字段不受影响
+    assert policy["max_rounds"] == 2
+    assert policy["allow_reference_check"] is True
+
+
+def test_non_security_scenario_keeps_allow_verify_off():
+    """非安全场景(general)→ allow_verify 保持默认关。"""
+    task = _make_task_with_overrides(user_id=uuid.uuid4(), params=None,
+                                     scenario="general")
+    db = _mock_db_with_policy(policy_row=None)
+
+    policy = resolve_agent_policy(task, db)
+    assert policy["allow_verify"] is False
+
+
+def test_security_scenario_user_saved_policy_wins():
+    """用户显式保存过策略(allow_verify=False)→ 优先于场景默认。"""
+    task = _make_task_with_overrides(
+        user_id=uuid.uuid4(), params=None, scenario="code_security_audit"
+    )
+    policy_row = MagicMock()
+    policy_row.to_dict.return_value = {
+        "agent2_enabled": True, "max_rounds": 4, "allow_verify": False,
+        "allow_reference_check": True,
+        "verifier_auth_mode_default": "per_action",
+        "executor_command_confirm_default": "always_approve",
+    }
+    db = _mock_db_with_policy(policy_row=policy_row)
+
+    policy = resolve_agent_policy(task, db)
+    assert policy["allow_verify"] is False
+
+
+def test_security_scenario_task_override_wins():
+    """任务级显式设置 allow_verify → 优先于场景默认。"""
+    task = _make_task_with_overrides(
+        user_id=None,
+        params={"_agent_policy": {"allow_verify": False}},
+        scenario="code_security_audit",
+    )
+    db = _mock_db_with_policy(policy_row=None)
+
+    policy = resolve_agent_policy(task, db)
+    assert policy["allow_verify"] is False
+
+
+def test_task_level_can_disable_reference_check():
+    """任务级可显式关闭 allow_reference_check。"""
+    task = _make_task_with_overrides(
+        user_id=None,
+        params={"_agent_policy": {"allow_reference_check": False}},
+    )
+    db = _mock_db_with_policy(policy_row=None)
+
+    policy = resolve_agent_policy(task, db)
+    assert policy["allow_reference_check"] is False
 
 
 # ============================================================
@@ -254,3 +343,73 @@ def test_tool_window_skips_empty_content():
     section = build_tool_window_section(db, "t", 1, None, title="[窗口]")
     assert "有效意图" in section
     assert section.count("\n- ") == 1
+
+
+# ============================================================
+# 迁移:agent_policies.allow_reference_check 幂等补列
+# ============================================================
+
+
+def _migration_env(monkeypatch, has_table=True, columns=None):
+    """构造 migrate_agent_policy_add_reference_check_column 的假环境。
+
+    monkeypatch app.database.engine(函数内 from-import 在调用时取属性)
+    与 sqlalchemy.inspect;返回 mock conn 供断言。
+    """
+    import app.database as database_module
+
+    conn = MagicMock()
+    inspector = MagicMock()
+    inspector.has_table.return_value = has_table
+    inspector.get_columns.return_value = [{"name": c} for c in (columns or [])]
+    engine = MagicMock()
+    engine.connect.return_value.__enter__.return_value = conn
+
+    monkeypatch.setattr(database_module, "engine", engine)
+    monkeypatch.setattr("sqlalchemy.inspect", lambda c: inspector)
+    return conn
+
+
+def test_migration_adds_column_when_missing(monkeypatch):
+    """表存在但缺 allow_reference_check 列 → ALTER 补列并提交。"""
+    conn = _migration_env(
+        monkeypatch, columns=["id", "user_id", "agent2_enabled", "max_rounds"],
+    )
+    from app.models.agent_policy import (
+        migrate_agent_policy_add_reference_check_column,
+    )
+
+    migrate_agent_policy_add_reference_check_column()
+
+    conn.execute.assert_called_once()
+    sql = str(conn.execute.call_args.args[0])
+    assert "allow_reference_check" in sql
+    conn.commit.assert_called_once()
+
+
+def test_migration_skips_when_column_exists(monkeypatch):
+    """列已存在 → 幂等跳过,不执行 ALTER 不提交。"""
+    conn = _migration_env(
+        monkeypatch, columns=["id", "agent2_enabled", "allow_reference_check"],
+    )
+    from app.models.agent_policy import (
+        migrate_agent_policy_add_reference_check_column,
+    )
+
+    migrate_agent_policy_add_reference_check_column()
+
+    conn.execute.assert_not_called()
+    conn.commit.assert_not_called()
+
+
+def test_migration_skips_when_table_missing(monkeypatch):
+    """表不存在(全新库,create_all 已带新列)→ 直接返回。"""
+    conn = _migration_env(monkeypatch, has_table=False)
+    from app.models.agent_policy import (
+        migrate_agent_policy_add_reference_check_column,
+    )
+
+    migrate_agent_policy_add_reference_check_column()
+
+    conn.execute.assert_not_called()
+    conn.commit.assert_not_called()

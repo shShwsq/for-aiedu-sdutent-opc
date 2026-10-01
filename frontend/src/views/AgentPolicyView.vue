@@ -39,8 +39,9 @@ const MAX_ROUNDS_LIMIT = ref(10)
 
 const DEFAULT_POLICY = {
   agent2_enabled: true,
-  max_rounds: 4,
+  max_rounds: 2,
   allow_verify: false,
+  allow_reference_check: true,
   verifier_auth_mode_default: 'per_action' as 'direct' | 'per_action',
   executor_command_confirm_default: 'always_approve' as 'always_approve' | 'per_command',
 }
@@ -54,6 +55,8 @@ const policyAgent2Enabled = ref(DEFAULT_POLICY.agent2_enabled)
 const policyMaxRounds = ref(DEFAULT_POLICY.max_rounds)
 /** agent2 是否能自己验证(实验性) */
 const policyAllowVerify = ref(DEFAULT_POLICY.allow_verify)
+/** agent2 是否能复核 AI助手引用的网址(后端安全抓取,结果仅供参考信号) */
+const policyAllowReference = ref(DEFAULT_POLICY.allow_reference_check)
 /** 验证授权默认模式(任务级可覆盖) */
 const policyVerifierAuthMode = ref<'direct' | 'per_action'>(DEFAULT_POLICY.verifier_auth_mode_default)
 /** 执行智能体命令确认默认模式(任务级 _executor_command_confirm 可覆盖) */
@@ -76,6 +79,7 @@ const originalPolicy = ref({
   agent2Enabled: DEFAULT_POLICY.agent2_enabled,
   maxRounds: DEFAULT_POLICY.max_rounds,
   allowVerify: DEFAULT_POLICY.allow_verify,
+  allowReference: DEFAULT_POLICY.allow_reference_check,
   verifierAuthMode: DEFAULT_POLICY.verifier_auth_mode_default,
   executorCommandConfirm: DEFAULT_POLICY.executor_command_confirm_default,
 })
@@ -86,6 +90,7 @@ const policyDirty = computed(() => {
     policyAgent2Enabled.value !== originalPolicy.value.agent2Enabled ||
     policyMaxRounds.value !== originalPolicy.value.maxRounds ||
     policyAllowVerify.value !== originalPolicy.value.allowVerify ||
+    policyAllowReference.value !== originalPolicy.value.allowReference ||
     policyVerifierAuthMode.value !== originalPolicy.value.verifierAuthMode ||
     policyExecutorCommandConfirm.value !== originalPolicy.value.executorCommandConfirm
   )
@@ -99,6 +104,7 @@ function resetPolicyToDefault(): void {
   policyAgent2Enabled.value = DEFAULT_POLICY.agent2_enabled
   policyMaxRounds.value = DEFAULT_POLICY.max_rounds
   policyAllowVerify.value = DEFAULT_POLICY.allow_verify
+  policyAllowReference.value = DEFAULT_POLICY.allow_reference_check
   policyVerifierAuthMode.value = DEFAULT_POLICY.verifier_auth_mode_default
   policyExecutorCommandConfirm.value = DEFAULT_POLICY.executor_command_confirm_default
 }
@@ -164,6 +170,7 @@ async function loadPolicy(): Promise<void> {
     policyAgent2Enabled.value = policy?.agent2_enabled ?? DEFAULT_POLICY.agent2_enabled
     policyMaxRounds.value = policy?.max_rounds ?? DEFAULT_POLICY.max_rounds
     policyAllowVerify.value = policy?.allow_verify ?? DEFAULT_POLICY.allow_verify
+    policyAllowReference.value = policy?.allow_reference_check ?? DEFAULT_POLICY.allow_reference_check
     policyVerifierAuthMode.value = policy?.verifier_auth_mode_default ?? DEFAULT_POLICY.verifier_auth_mode_default
     policyExecutorCommandConfirm.value = policy?.executor_command_confirm_default ?? DEFAULT_POLICY.executor_command_confirm_default
     // 同步原始值(脏检查基准)
@@ -171,6 +178,7 @@ async function loadPolicy(): Promise<void> {
       agent2Enabled: policyAgent2Enabled.value,
       maxRounds: policyMaxRounds.value,
       allowVerify: policyAllowVerify.value,
+      allowReference: policyAllowReference.value,
       verifierAuthMode: policyVerifierAuthMode.value,
       executorCommandConfirm: policyExecutorCommandConfirm.value,
     }
@@ -189,6 +197,7 @@ async function handleSave(): Promise<boolean> {
       agent2_enabled: policyAgent2Enabled.value,
       max_rounds: policyMaxRounds.value,
       allow_verify: policyAllowVerify.value,
+      allow_reference_check: policyAllowReference.value,
       verifier_auth_mode_default: policyVerifierAuthMode.value,
       executor_command_confirm_default: policyExecutorCommandConfirm.value,
     }
@@ -200,6 +209,7 @@ async function handleSave(): Promise<boolean> {
       policyAgent2Enabled.value = policy.agent2_enabled
       policyMaxRounds.value = policy.max_rounds
       policyAllowVerify.value = policy.allow_verify
+      policyAllowReference.value = policy.allow_reference_check ?? DEFAULT_POLICY.allow_reference_check
       policyVerifierAuthMode.value = policy.verifier_auth_mode_default
       policyExecutorCommandConfirm.value = policy.executor_command_confirm_default
     }
@@ -207,6 +217,7 @@ async function handleSave(): Promise<boolean> {
       agent2Enabled: policyAgent2Enabled.value,
       maxRounds: policyMaxRounds.value,
       allowVerify: policyAllowVerify.value,
+      allowReference: policyAllowReference.value,
       verifierAuthMode: policyVerifierAuthMode.value,
       executorCommandConfirm: policyExecutorCommandConfirm.value,
     }
@@ -240,9 +251,11 @@ const FIELD_HELP: Record<string, string> = {
   agent2_enabled:
     '开启后,检查助手参与协作(每轮执行后的质检评估、验证)。关闭后退化为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做质检评估、不验证。适合简单任务或用户完全信任 AI助手的场景。',
   max_rounds:
-    '检查助手与 AI助手之间的协作总轮次。每轮含 AI助手执行 + 检查助手评估。轮次越多覆盖越全面但耗时越长。仅检查助手启用时生效。上限为 10。',
+    '检查助手与 AI助手之间的协作总轮次。每轮含 AI助手执行 + 检查助手评估。默认 2(检查助手已改为「核查优先、追问兜底」,优先自己读代码/验证/复核引用,很少需要追问);老账号保存过的旧值不会被自动修改。仅检查助手启用时生效,上限为 10。',
   allow_verify:
-    '开启后,检查助手可自行调用工具验证 AI助手的产出。目前为实验性开关,默认关闭。任务还需在提交时配置测试环境 URL 才会真正触发验证。',
+    '开启后,检查助手可自行调用工具验证 AI助手的产出。安全审计类任务会在未显式设置时自动开启(实际验证仍需任务配置测试环境 URL)。开启后对"疑似但不确定"的安全发现会优先发送 PoC 到测试环境确认。',
+  allow_reference_check:
+    '开启后,检查助手会抽查复核 AI助手结论中引用的外部依据链接(CVE / 安全公告 / 官方文档):链接是否存在、来源是否权威(域名分级参考信号)、内容是否与其说法相符。抓取在后端进行并有 SSRF 防护;无法访问时仅标注"复核无法完成",不会因此否定结论。',
   verifier_auth_mode:
     '仅在开启「自行验证」时生效。逐动作授权:每个验证动作(HTTP 请求 / PoC 脚本)执行前弹窗让用户确认;直接执行:验证动作自动执行不弹窗。此为用户级默认,任务创建或运行时可单独覆盖。',
   executor_command_confirm:
@@ -394,7 +407,23 @@ onUnmounted(() => {
                 </Transition>
               </div>
             </label>
-  
+
+            <label class="policy-toggle-row">
+              <input v-model="policyAllowReference" class="switch" type="checkbox" :disabled="saving || !policyAgent2Enabled" />
+              <span>复核 AI助手引用的网址</span>
+              <div
+                :ref="(el) => { if (el) fieldHelpRefs.set('allow_reference_check', el as HTMLElement); else fieldHelpRefs.delete('allow_reference_check') }"
+                class="field-help-wrap"
+              >
+                <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('allow_reference_check')">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
+                </button>
+                <Transition name="help-fade">
+                  <div v-if="openHelpKey === 'allow_reference_check'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.allow_reference_check }}</div>
+                </Transition>
+              </div>
+            </label>
+
             <Transition name="collapse">
               <div v-show="policyAllowVerify" class="verifier-config">
                 <label class="policy-field">

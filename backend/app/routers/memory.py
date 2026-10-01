@@ -170,8 +170,9 @@ def save_agent_policy(
     get_or_create:若用户无策略记录,自动创建。
     """
     policy_dict = req.model_dump()
-    # 钳制 max_rounds 到 [1, MAX_MAX_ROUNDS](防御前端送超界值)
-    policy_dict["max_rounds"] = max(1, min(int(policy_dict.get("max_rounds", 4)), MAX_MAX_ROUNDS))
+    # 钳制 max_rounds 到 [1, MAX_MAX_ROUNDS](防御前端送超界值;
+    # fallback 与 SaveAgentPolicyRequest/DEFAULT_AGENT_POLICY 默认一致)
+    policy_dict["max_rounds"] = max(1, min(int(policy_dict.get("max_rounds", 2)), MAX_MAX_ROUNDS))
     row = (
         db.query(AgentPolicy)
         .filter(AgentPolicy.user_id == current_user.id)

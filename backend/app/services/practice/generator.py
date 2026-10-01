@@ -738,6 +738,44 @@ _FINDING_TEMPLATE = """以下是代码审计任务的一条真实发现:
 
 请基于这条发现出题(1~3 道)。"""
 
+# agent2 标记的学习点(practice_worthy=true)附加提示:引导出题
+# 聚焦 agent2 认为值得学的点,而非泛泛复述发现本身
+_LEARNING_NOTE_TEMPLATE = (
+    "\n\n【学习价值提示】质检 agent 已判定这条发现对用户有学习价值:"
+    "{note}\n请让题目围绕这个学习点展开考察。"
+)
+
+
+def _is_practice_worthy(finding: Result) -> bool:
+    """finding 是否被 agent2 标记为有学习价值(metadata.practice_worthy)"""
+    meta = finding.metadata_
+    return isinstance(meta, dict) and meta.get("practice_worthy") is True
+
+
+def _select_findings(
+    db: Session, task: Task, max_findings: int,
+) -> list[Result]:
+    """选取出题素材:practice_worthy 标记的优先,不足再补未标记的
+
+    标记由 agent2 在 done=true 整理 results 时写入 metadata
+    (practice_worthy=true + learning_note=考察点说明)。
+    无标记(单 agent 模式 / 老任务 / agent2 未标)时,
+    行为与按 created_at 顺序取前 N 条完全一致,向后兼容。
+    两组内部均保持 created_at 顺序(agent2 的标记顺序即结果顺序)。
+    """
+    all_findings = (
+        db.query(Result)
+        .filter(Result.task_id == task.id)
+        .order_by(Result.created_at)
+        .all()
+    )
+    marked = [f for f in all_findings if _is_practice_worthy(f)]
+    if not marked:
+        return all_findings[:max_findings]
+    rest = [f for f in all_findings if not _is_practice_worthy(f)]
+    return (marked + rest)[:max_findings]
+
+
 # 工作区可用但生成的题目全部缺代码上下文时,追加到 user prompt 重试的质量反馈
 _NO_CODE_FEEDBACK = (
     "\n\n【质量反馈】上一轮生成的题目缺少真实代码上下文,不看代码也能作答,不合格。"
@@ -782,9 +820,9 @@ def generate_questions_for_task(
     system_prompt = build_system_prompt(topic, workspace_available=bool(repo_path))
     task_id_str = str(task.id)
 
-    findings = (
-        db.query(Result).filter(Result.task_id == task.id).order_by(Result.created_at).all()
-    )[:max_findings]
+    # 选题:agent2 标记的学习点(practice_worthy)优先,不足补未标记的;
+    # 无标记时与按 created_at 取前 N 条等价(向后兼容)
+    findings = _select_findings(db, task, max_findings)
     total_findings = len(findings)
 
     # 出题起始快照:模型/主题/工作区/发现数(排查无题产出时的第一手上下文)
@@ -820,6 +858,12 @@ def generate_questions_for_task(
             content=(finding.content or "")[:4000],
             metadata=meta,
         )
+        # agent2 标记的学习点:注入考察方向,引导出题聚焦值得学的点
+        learning_note = (
+            meta.get("learning_note") if isinstance(meta, dict) else None
+        )
+        if _is_practice_worthy(finding) and learning_note:
+            prompt += _LEARNING_NOTE_TEMPLATE.format(note=str(learning_note)[:500])
 
         questions: list[dict] = []
         user_prompt = prompt

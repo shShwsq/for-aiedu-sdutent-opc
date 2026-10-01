@@ -40,12 +40,18 @@ class AgentPolicy(Base):
         Boolean, nullable=False, server_default="true", default=True
     )
     # agent2 协作总轮次(上限由 MAX_MAX_ROUNDS 控制,写入时钳制)
+    # 默认 2(核查优先、追问兜底);不回写已有用户数据,仅影响新行
     max_rounds: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default="4", default=4
+        Integer, nullable=False, server_default="2", default=2
     )
     # agent2 是否能调用 verifier_agent 验证(需任务配了 test_env_url)
     allow_verify: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false", default=False
+    )
+    # agent2 是否能调用 check_reference 复核 agent1 引用的网址
+    # (后端安全抓取,SSRF 防护;独立于 repo_path / test_env_url)
+    allow_reference_check: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true", default=True
     )
     # 验证授权默认模式("direct" 直接执行 / "per_action" 逐动作授权)
     verifier_auth_mode_default: Mapped[str] = mapped_column(
@@ -75,6 +81,7 @@ class AgentPolicy(Base):
             "agent2_enabled": self.agent2_enabled,
             "max_rounds": self.max_rounds,
             "allow_verify": self.allow_verify,
+            "allow_reference_check": self.allow_reference_check,
             "verifier_auth_mode_default": self.verifier_auth_mode_default,
             "executor_command_confirm_default": self.executor_command_confirm_default,
         }
@@ -118,6 +125,8 @@ def normalize_policy_dict(
         "agent2_enabled": _bool("agent2_enabled"),
         "max_rounds": max_rounds,
         "allow_verify": _bool("allow_verify"),
+        # 老数据无此键 → 回退 defaults(True)
+        "allow_reference_check": _bool("allow_reference_check"),
         "verifier_auth_mode_default": _enum("verifier_auth_mode_default", ("direct", "per_action")),
         "executor_command_confirm_default": _enum(
             "executor_command_confirm_default", ("always_approve", "per_command")
@@ -169,17 +178,20 @@ def migrate_agent_policy_table() -> None:
                     """
                     INSERT INTO agent_policies (
                         id, user_id, agent2_enabled, max_rounds,
-                        allow_verify, verifier_auth_mode_default,
+                        allow_verify, allow_reference_check,
+                        verifier_auth_mode_default,
                         executor_command_confirm_default
                     ) VALUES (
                         :id, :user_id, :agent2_enabled, :max_rounds,
-                        :allow_verify, :verifier_auth_mode_default,
+                        :allow_verify, :allow_reference_check,
+                        :verifier_auth_mode_default,
                         :executor_command_confirm_default
                     )
                     ON CONFLICT (user_id) DO UPDATE SET
                         agent2_enabled = EXCLUDED.agent2_enabled,
                         max_rounds = EXCLUDED.max_rounds,
                         allow_verify = EXCLUDED.allow_verify,
+                        allow_reference_check = EXCLUDED.allow_reference_check,
                         verifier_auth_mode_default = EXCLUDED.verifier_auth_mode_default,
                         executor_command_confirm_default = EXCLUDED.executor_command_confirm_default,
                         updated_at = now()
@@ -195,6 +207,39 @@ def migrate_agent_policy_table() -> None:
             "agent_policy 迁移完成: %d 条记录拷入 agent_policies,旧列已删除",
             len(rows),
         )
+
+
+def migrate_agent_policy_add_reference_check_column() -> None:
+    """幂等迁移:agent_policies 表补 allow_reference_check 列
+
+    背景:项目用 Base.metadata.create_all(无 Alembic),已存在的表不会
+    自动加新列。模型新增 allow_reference_check(引用复核开关,默认 true),
+    老库需显式 ALTER 补列;不回写已有行数据(server_default 兜底 true)。
+
+    - 表不存在(全新库,create_all 已带新列)→ 直接返回
+    - 列已存在 → 直接返回(幂等)
+    """
+    import logging
+
+    from sqlalchemy import inspect, text
+
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    with engine.connect() as conn:
+        insp = inspect(conn)
+        if not insp.has_table("agent_policies"):
+            return
+        cols = {c["name"] for c in insp.get_columns("agent_policies")}
+        if "allow_reference_check" in cols:
+            return
+        conn.execute(text(
+            "ALTER TABLE agent_policies ADD COLUMN allow_reference_check "
+            "BOOLEAN NOT NULL DEFAULT true"
+        ))
+        conn.commit()
+        log.info("agent_policies.allow_reference_check 列已补齐")
 
 
 def migrate_agent_policy_rename_columns() -> None:

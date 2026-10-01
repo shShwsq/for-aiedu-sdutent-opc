@@ -287,18 +287,19 @@ def test_origin_and_kp_languages_persisted_in_pipeline(monkeypatch):
 # ============================================================
 
 
-def _gen_db(finding_count=1):
-    """构造 mock db:按查询目标返回不同链(可指定 finding 条数)"""
+def _gen_db(finding_count=1, findings=None):
+    """构造 mock db:按查询目标返回不同链(可指定 finding 条数/列表)"""
     db = MagicMock()
-    findings = [
-        SimpleNamespace(
-            id=f"r{i}",
-            title="SQL 注入风险",
-            content="cursor.execute(sql) 直接拼接用户输入构造查询",
-            metadata_={"cwe": "CWE-89"},
-        )
-        for i in range(finding_count)
-    ]
+    if findings is None:
+        findings = [
+            SimpleNamespace(
+                id=f"r{i}",
+                title="SQL 注入风险",
+                content="cursor.execute(sql) 直接拼接用户输入构造查询",
+                metadata_={"cwe": "CWE-89"},
+            )
+            for i in range(finding_count)
+        ]
 
     def _query(model):
         q = MagicMock()
@@ -928,3 +929,98 @@ def test_thinking_mode_no_settings_or_unknown_value():
     client2 = _thinking_client(meta=None, enable_thinking=True)
     _apply_thinking_mode(client2, _pref_mode("off"))
     assert client2.enable_thinking is False
+
+
+# ============================================================
+# 选题:agent2 学习点标记(practice_worthy)优先
+# ============================================================
+
+
+def _mk_finding(fid, marked=False, note=None):
+    """构造一条 finding;marked=True 时带 practice_worthy + learning_note"""
+    meta = {"cwe": "CWE-89"}
+    if marked:
+        meta["practice_worthy"] = True
+        if note is not None:
+            meta["learning_note"] = note
+    return SimpleNamespace(
+        id=fid,
+        title=f"发现 {fid}",
+        content="cursor.execute(sql) 直接拼接用户输入构造查询",
+        metadata_=meta,
+    )
+
+
+def test_select_findings_marked_first_preserving_order():
+    """标记的优先且保持 agent2 给出的原顺序,未标记的排在后面。"""
+    a, b, c, d = (
+        _mk_finding("a"), _mk_finding("b", marked=True),
+        _mk_finding("c", marked=True), _mk_finding("d"),
+    )
+    out = gen._select_findings(_gen_db(findings=[a, b, c, d]), _gen_task(), 10)
+    assert [f.id for f in out] == ["b", "c", "a", "d"]
+
+
+def test_select_findings_backfills_unmarked_when_insufficient():
+    """标记的不足 max_findings → 按原顺序补未标记的。"""
+    a, b, c = (
+        _mk_finding("a", marked=True), _mk_finding("b"), _mk_finding("c"),
+    )
+    out = gen._select_findings(_gen_db(findings=[a, b, c]), _gen_task(), 3)
+    assert [f.id for f in out] == ["a", "b", "c"]
+
+
+def test_select_findings_no_marking_keeps_legacy_behavior():
+    """无任何标记(单 agent 模式 / 老任务)→ 与按 created_at 取前 N 条一致。"""
+    findings = [_mk_finding(f"r{i}") for i in range(5)]
+    out = gen._select_findings(_gen_db(findings=findings), _gen_task(), 3)
+    assert [f.id for f in out] == ["r0", "r1", "r2"]
+
+
+def test_select_findings_marked_exceeding_max_truncated():
+    """标记数超过 max_findings → 截断(标记内部保持原顺序)。"""
+    findings = [_mk_finding(f"m{i}", marked=True) for i in range(4)]
+    out = gen._select_findings(_gen_db(findings=findings), _gen_task(), 2)
+    assert [f.id for f in out] == ["m0", "m1"]
+
+
+# ============================================================
+# learning_note 注入出题提示
+# ============================================================
+
+
+def test_learning_note_injected_into_finding_prompt(monkeypatch):
+    """practice_worthy + learning_note → 出题 prompt 注入学习价值提示。
+
+    同批未标记的 finding 不注入;标记但缺 learning_note 也不注入。
+    """
+    import json
+
+    monkeypatch.setattr(
+        gen.sandbox_tools, "get_workspace_info", lambda tid: None,
+    )
+    prompts = []
+
+    def fake_call_llm(client, system_prompt, finding_text, task_id, repo_path, on_event=None):
+        prompts.append(finding_text)
+        return json.dumps([_raw()], ensure_ascii=False)
+
+    monkeypatch.setattr(gen, "_call_llm", fake_call_llm)
+
+    findings = [
+        _mk_finding("marked", marked=True, note="考察 SQL 注入的参数化修复方式"),
+        _mk_finding("marked-no-note", marked=True),
+        _mk_finding("plain"),
+    ]
+    created, _ = gen.generate_questions_for_task(
+        _gen_db(findings=findings), _gen_task(), "u1", client=MagicMock(),
+    )
+    assert created  # 正常出题
+    assert len(prompts) == 3
+
+    marked_prompt = prompts[0]
+    assert "【学习价值提示】" in marked_prompt
+    assert "考察 SQL 注入的参数化修复方式" in marked_prompt
+    # 标记但缺 note / 未标记:均不注入
+    assert "【学习价值提示】" not in prompts[1]
+    assert "【学习价值提示】" not in prompts[2]

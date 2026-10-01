@@ -97,8 +97,11 @@ class SaveAgentPolicyRequest(BaseModel):
 
     结构与 agent_policy.DEFAULT_AGENT_POLICY 对齐:
     - agent2_enabled: 是否启用 agent2(关闭=单 agent 模式)
-    - max_rounds: agent2 协作总轮次(上限由 MAX_MAX_ROUNDS 控制)
+    - max_rounds: agent2 协作总轮次(默认 2:核查优先、追问兜底;
+      上限由 MAX_MAX_ROUNDS 控制)
     - allow_verify: agent2 是否能调用 verifier_agent 验证(需任务配了 test_env_url)
+    - allow_reference_check: agent2 是否能复核 agent1 引用的网址
+      (后端安全抓取 + SSRF 防护;结果仅供参考信号)
     - verifier_auth_mode_default: 验证授权默认模式("direct"直接执行 / "per_action"逐动作授权)
     - executor_command_confirm_default: 执行智能体命令确认默认模式
         "always_approve" 自动批准所有命令 / "per_command" 每个危险命令弹窗确认
@@ -106,8 +109,9 @@ class SaveAgentPolicyRequest(BaseModel):
 
     agent2_enabled: bool = True
     # 上界在路由层用 MAX_MAX_ROUNDS 动态校验(schema 层只校验下界)
-    max_rounds: int = Field(default=4, ge=1)
+    max_rounds: int = Field(default=2, ge=1)
     allow_verify: bool = False
+    allow_reference_check: bool = True
     verifier_auth_mode_default: str = Field(default="per_action", pattern="^(direct|per_action)$")
     executor_command_confirm_default: str = Field(
         default="always_approve", pattern="^(always_approve|per_command)$"
