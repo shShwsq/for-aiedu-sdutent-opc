@@ -1,7 +1,7 @@
 """长期记忆管理路由
 
 用户可编辑三类记忆:
-- User Profile (1:1,自由文本):影响 agent2 评判标准与 checklist 生成
+- User Profile (1:1,自由文本):影响 agent2 评判标准与审查维度
 - 全局长期记忆(1:1,自由文本):跨项目通用经验,注入 agent2
 - 分项目记忆(1:N,按 repo_url 聚合):注入 react_agent,影响审计方向
 

@@ -97,18 +97,13 @@ class _TaskBus:
         这类事件数量极大(每个 token / 每个进度行一条),会挤掉 conversation/status
         等重要事件。流式效果只对在线订阅者有意义,迟到的订阅者直接看完整 conversation
         即可(clone 进度是瞬时的,过时无意义)。
-
-        question 不入历史缓存:
-        这是一次性触发事件(弹窗),迟到订阅者(刷新页面)应通过
-        GET /pending_question API 恢复弹窗,而非通过事件补播。
-        若补播,已回答的旧 question 会再次弹窗(API 已返回 None,但事件仍触发)。
         """
         with self._lock:
             if self._finished:
                 return
             etype = event.get("type")
             # 高频瞬时事件不缓存,只推给在线订阅者
-            if etype not in ("thinking_delta", "question", "clone_progress"):
+            if etype not in ("thinking_delta", "clone_progress"):
                 self._history.append(event)
                 # 限制历史长度
                 if len(self._history) > 500:

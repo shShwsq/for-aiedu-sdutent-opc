@@ -1184,8 +1184,9 @@ def _build_history_context(
     if not convs:
         return ""
 
-    # 按 round_idx 分组(只取 >= 1 的轮次;第 0 轮是 agent2 初始评估,
-    # 内容已通过 task.user_input 传给第 1 轮 react_agent,这里不重复注入)
+    # 按 round_idx 分组(只取 >= 1 的轮次;存量数据里第 0 轮是旧版
+    # agent2 初始评估,内容已通过 task.user_input 传给第 1 轮 react_agent,
+    # 这里不重复注入)
     by_round: dict[int, list[Conversation]] = {}
     for c in convs:
         if c.round_idx >= 1:

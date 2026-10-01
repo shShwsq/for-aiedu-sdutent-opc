@@ -2,7 +2,7 @@
 
 借鉴 deepseek-harness(Cordis)的"事件即扩展点"思想:
 - 领域事件 = agent 协作流程在阶段边界产生的客观事实
-  (任务启动/完成/失败、checklist 确认、追问、轮完成、验证完成等)
+  (任务启动/完成/失败、轮完成、验证完成等)
 - 扩展代码(审计日志、统计、未来 webhook/通知)通过 subscribe() 挂载,
   不需要修改 orchestrator / agent2 主流程
 - 订阅是可逆的:subscribe() 返回退订函数,调用即回滚该订阅
@@ -40,14 +40,11 @@ TASK_COMPLETED = "task.completed"        # 任务正常完成(单/双 agent、re
 TASK_FAILED = "task.failed"              # 任务失败(主流程与 resume 的 except 路径)
 
 # 协作流程边界
-CHECKLIST_CONFIRMED = "checklist.confirmed"      # 用户确认覆盖度清单,已落库 task.checklist
-QUESTION_RAISED = "question.raised"              # agent2 向用户发起澄清提问(弹窗)
 AGENT1_ROUND_COMPLETED = "agent1.round_completed"  # agent1(执行器)完成一轮执行
 VERIFIER_COMPLETED = "verifier.completed"        # verifier_agent 完成一次动态验证(含失败)
 
 ALL_EVENT_TYPES = frozenset({
     TASK_STARTED, TASK_COMPLETED, TASK_FAILED,
-    CHECKLIST_CONFIRMED, QUESTION_RAISED,
     AGENT1_ROUND_COMPLETED, VERIFIER_COMPLETED,
 })
 

@@ -11,7 +11,6 @@
 - POST /tasks/{task_id}/retry  重试失败任务(断点续跑优先)
 - GET /scenarios  列出可用场景
 """
-import ast
 import html
 import json
 import logging
@@ -58,11 +57,6 @@ from app.pause_controller import (
 from app.perf import perf_log
 from app.scenarios.base import list_scenarios
 from app.schemas.task import (
-    AnswerRequest,
-    AnswerResponse,
-    ChecklistDimension,
-    ChecklistReviewRequest,
-    PendingQuestion,
     ScenarioInfo,
     SendMessageRequest,
     CommandConfirmRequest,
@@ -82,15 +76,9 @@ from app.schemas.task_artifact import TaskArtifactOut
 from app.services.uploads import UploadError, validate_upload_for_task
 from app.tools import sandbox_tools
 from app.user_interaction import (
-    clear_pending_checklist,
-    clear_pending_question,
     clear_pending_verify_action,
-    get_pending_checklist,
     get_pending_command_confirm,
-    get_pending_question,
     get_pending_verify_action,
-    submit_answers,
-    submit_checklist,
     submit_command_confirm,
     submit_verify_authorization,
 )
@@ -322,207 +310,6 @@ def get_task_artifact(
     if not artifact:
         raise HTTPException(status_code=404, detail="产物不存在")
     return TaskArtifactOut.model_validate(artifact)
-
-
-# ============================================================
-# 阶段 8:用户澄清(agent2 向用户提问)
-# ============================================================
-
-
-@router.get("/tasks/{task_id}/pending_question")
-def get_task_pending_question(
-    task_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    current_user: User | None = Depends(get_optional_user),
-) -> PendingQuestion | None:
-    """查询任务当前待回答的问题(刷新页面后恢复弹窗用)
-
-    纯查数据库,不依赖 in-memory 状态(避免多 worker/时序窗口导致的残留)。
-    判定逻辑:最新一条 agent2 question 是否已有对应 ask_round 的 answer。
-    无待回答问题时返回 None。
-    """
-    task = db.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if task.user_id is not None:
-        if current_user is None or current_user.id != task.user_id:
-            raise HTTPException(status_code=403, detail="无权访问此任务")
-
-    # 任务已结束,不恢复弹窗
-    if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-        return None
-
-    # 查最新一条 agent2 question(提问记录,reasoning 存 JSON payload)
-    latest_question = (
-        db.query(Conversation)
-        .filter(
-            Conversation.task_id == task_id,
-            Conversation.role == "agent2",
-            Conversation.type == "question",
-        )
-        .order_by(Conversation.created_at.desc())
-        .first()
-    )
-    if not latest_question or not latest_question.reasoning:
-        return None
-
-    try:
-        payload = json.loads(latest_question.reasoning)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-    ask_round = payload.get("ask_round", 0)
-
-    # 查最新一条 user answer,若其 ask_round >= 当前提问的 ask_round,说明已回答
-    latest_answer = (
-        db.query(Conversation)
-        .filter(
-            Conversation.task_id == task_id,
-            Conversation.role == "user",
-            Conversation.type == "answer",
-        )
-        .order_by(Conversation.created_at.desc())
-        .first()
-    )
-    if latest_answer and latest_answer.reasoning:
-        try:
-            ans_data = json.loads(latest_answer.reasoning)
-            if int(ans_data.get("ask_round", -1)) >= ask_round:
-                return None  # 已回答,不弹窗
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
-
-    return PendingQuestion(
-        ask_round=ask_round,
-        questions=payload.get("questions", []),
-        reasoning=payload.get("reasoning", ""),
-        conversation_id=str(latest_question.id),
-    )
-
-
-@router.post("/tasks/{task_id}/answer", response_model=AnswerResponse)
-def submit_task_answer(
-    task_id: uuid.UUID,
-    req: AnswerRequest,
-    db: Session = Depends(get_db),
-    current_user: User | None = Depends(get_optional_user),
-) -> AnswerResponse:
-    """提交用户对澄清问题的答案
-
-    同步落库 answer(确保刷新时数据库已有记录),再唤醒后台线程。
-    若当前 task 没有待回答问题(重复提交或任务已结束),返回 accepted=false。
-    """
-    task = db.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if task.user_id is not None:
-        if current_user is None or current_user.id != task.user_id:
-            raise HTTPException(status_code=403, detail="无权操作此任务")
-
-    if task.status not in (TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.PAUSED):
-        return AnswerResponse(
-            accepted=False,
-            message=f"任务已结束({task.status.value}),无法提交答案",
-        )
-
-    # 拿 pending payload(含 questions,用于落库 answer)
-    payload = get_pending_question(task_id)
-    if payload is None:
-        return AnswerResponse(
-            accepted=False,
-            message="当前没有待回答的问题(可能已回答或任务已结束)",
-        )
-
-    # 转换为 dict 列表(submit_answers 期望的格式)
-    answers = [
-        {"question_id": a.question_id, "value": a.value}
-        for a in req.answers
-    ]
-    ask_round = payload.get("ask_round", 0)
-    questions = payload.get("questions", [])
-
-    # 同步落库 answer(在唤醒后台线程之前,确保刷新时数据库已有记录)。
-    _record_answer(db, task, questions, answers, ask_round)
-
-    # 唤醒后台线程
-    ok = submit_answers(task_id, answers)
-    if not ok:
-        return AnswerResponse(
-            accepted=False,
-            message="提交失败:可能已被回答过或状态异常",
-        )
-    return AnswerResponse(accepted=True, message="答案已提交,智能体将继续评估")
-
-
-# ============================================================
-# 覆盖度清单动态生成 + 用户编辑(场景降级后)
-# ============================================================
-
-
-@router.get("/tasks/{task_id}/pending_checklist")
-def get_task_pending_checklist(
-    task_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    current_user: User | None = Depends(get_optional_user),
-) -> list[ChecklistDimension] | None:
-    """查询任务当前待确认的覆盖度清单(刷新页面后恢复弹窗用)
-
-    无待确认清单返回 None。
-    """
-    task = db.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if task.user_id is not None:
-        if current_user is None or current_user.id != task.user_id:
-            raise HTTPException(status_code=403, detail="无权访问此任务")
-
-    if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-        return None
-
-    payload = get_pending_checklist(task_id)
-    if payload is None:
-        return None
-    return [ChecklistDimension(**d) if isinstance(d, dict) else d for d in payload]
-
-
-@router.post("/tasks/{task_id}/checklist")
-def submit_task_checklist(
-    task_id: uuid.UUID,
-    req: ChecklistReviewRequest,
-    db: Session = Depends(get_db),
-    current_user: User | None = Depends(get_optional_user),
-) -> dict[str, Any]:
-    """提交编辑后的覆盖度清单,唤醒后台线程
-
-    req.checklist 为 None 表示"直接采用 LLM 生成结果"。
-    返回 {"accepted": bool, "message": str}。
-    """
-    task = db.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if task.user_id is not None:
-        if current_user is None or current_user.id != task.user_id:
-            raise HTTPException(status_code=403, detail="无权操作此任务")
-
-    if task.status not in (TaskStatus.PENDING, TaskStatus.RUNNING, TaskStatus.PAUSED):
-        return {"accepted": False, "message": f"任务已结束({task.status.value})"}
-
-    # 转为 dict 列表(None 保持 None,表示直接采用)
-    edited = None
-    if req.checklist is not None:
-        edited = [d.model_dump() for d in req.checklist]
-
-    ok = submit_checklist(task_id, edited)
-    if not ok:
-        return {"accepted": False, "message": "当前没有待确认的清单(可能已确认或任务已结束)"}
-
-    # 同步落库到 task.checklist(确保刷新时数据库已有记录)
-    final_checklist = edited if edited is not None else get_pending_checklist(task_id)
-    if final_checklist:
-        task.checklist = final_checklist
-        db.commit()
-
-    return {"accepted": True, "message": "覆盖度清单已确认,智能体将继续执行"}
 
 
 # ============================================================
@@ -773,68 +560,6 @@ def update_task_runtime_config(
     return task
 
 
-def _record_answer(
-    db: Session,
-    task: Task,
-    questions: list[dict],
-    answers: list[dict],
-    ask_round: int,
-) -> None:
-    """同步落库用户答案为 Conversation(role=user, type=answer)
-
-    逻辑与 orchestrator._record_user_answer 一致,迁移到 API 端点同步执行。
-    """
-    answer_map: dict[str, dict] = {}
-    for a in answers:
-        qid = a.get("question_id")
-        if qid:
-            answer_map[qid] = a
-
-    parts = []
-    for i, q in enumerate(questions, 1):
-        qid = q.get("id", f"q_{i}")
-        q_text = q.get("question", f"问题 {i}")
-        a = answer_map.get(qid)
-        if a is None:
-            continue
-        value = a.get("value")
-        if value is None or value == "":
-            continue
-        if isinstance(value, list):
-            value_text = ", ".join(str(v) for v in value)
-        else:
-            value_text = str(value)
-        if qid == "_supplement" and not value_text.strip():
-            continue
-        parts.append(f"Q: {q_text}\nA: {value_text}")
-
-    content = "\n\n".join(parts) if parts else "(用户未填写有效答案)"
-
-    conv = Conversation(
-        task_id=task.id,
-        round_idx=0,
-        role="user",
-        type="answer",
-        content=content,
-        reasoning=json.dumps(
-            {"ask_round": ask_round, "answers": answers},
-            ensure_ascii=False,
-        ),
-    )
-    db.add(conv)
-    db.commit()
-    db.refresh(conv)
-    publish(task.id, "conversation", {
-        "id": str(conv.id),
-        "round_idx": conv.round_idx,
-        "role": conv.role,
-        "type": conv.type,
-        "content": conv.content,
-        "reasoning": conv.reasoning,
-        "created_at": conv.created_at.isoformat() if conv.created_at else None,
-    })
-
-
 # ============================================================
 # 用户补充消息(对话界面下方输入框)
 # ============================================================
@@ -943,7 +668,7 @@ def submit_task_message(
         # 同步将状态改为 RUNNING 落库后再启动后台线程:
         # 消除 SSE 端点快照读到 COMPLETED 的竞态窗口 —— 否则前端重连 SSE 时,
         # stream_task_events 会按旧快照直接推 done 关闭连接,后续
-        # checklist_review 等事件虽进历史缓存却无人接收(需刷新页面才恢复)。
+        # conversation/status 等事件虽进历史缓存却无人接收(需刷新页面才恢复)。
         # resume_audit_with_message 开头会再设置一次,幂等无冲突。
         task.status = TaskStatus.RUNNING
         task.current_stage = "用户追加消息,重启执行"
@@ -1379,79 +1104,6 @@ def delete_task(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.get("/tasks/{task_id}/coverage")
-def get_task_coverage(
-    task_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    current_user: User | None = Depends(get_optional_user),
-) -> dict[str, Any]:
-    """覆盖度看板:从 agent2 最新一轮 evaluation 解析各维度覆盖状态
-
-    仅当 task.checklist 已生成(第 0 轮 agent2 动态生成 + 用户确认)时可用。
-    维度定义来自 task.checklist,覆盖状态来自最新一条 agent2 evaluation。
-    """
-    task = db.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if task.user_id is not None:
-        if current_user is None or current_user.id != task.user_id:
-            raise HTTPException(status_code=403, detail="无权访问此任务")
-
-    result = _compute_task_coverage(task, db)
-    if result is None:
-        raise HTTPException(status_code=404, detail="该任务无覆盖度清单(尚未生成)")
-    return result
-
-
-def _compute_task_coverage(task: Task, db: Session) -> dict[str, Any] | None:
-    """计算任务覆盖度(供 coverage 端点和报告导出共用)
-
-    场景降级后:维度从 task.checklist 读取(动态生成 + 用户编辑确认的清单),
-    不再从 scenario.coverage 读取。task.checklist 为空时返回 None(无看板)。
-    """
-    # 场景降级后:从 task.checklist 取维度(动态生成的覆盖度清单)
-    checklist = task.checklist
-    if not checklist:
-        return None
-    # checklist 结构:[{"id":..., "name":..., "description":..., "checklist":[...]}]
-    dimensions_decl = checklist
-
-    # 取最新一条 agent2 evaluation
-    latest_eval = (
-        db.query(Conversation)
-        .filter(
-            Conversation.task_id == task.id,
-            Conversation.role == "agent2",
-            Conversation.type == "evaluation",
-        )
-        .order_by(Conversation.round_idx.desc(), Conversation.created_at.desc())
-        .first()
-    )
-
-    covered_set, _missing_set = set(), set()
-    last_round = None
-    if latest_eval and latest_eval.reasoning:
-        covered_set, _missing_set = _parse_evaluation_reasoning(latest_eval.reasoning)
-        last_round = latest_eval.round_idx
-
-    dims = [
-        {
-            "id": d.get("id", ""),
-            "name": d.get("name", ""),
-            "description": d.get("description", ""),
-            "covered": d.get("id", "") in covered_set,
-        }
-        for d in dimensions_decl
-    ]
-    covered_count = sum(1 for d in dims if d["covered"])
-    return {
-        "dimensions": dims,
-        "covered_count": covered_count,
-        "total_count": len(dims),
-        "last_round": last_round,
-    }
-
-
 def _get_result_display_config(
     task: Task, results: list,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
@@ -1484,44 +1136,6 @@ def _get_result_display_config(
     return grouping, meta_fields
 
 
-def _parse_evaluation_reasoning(reasoning: str) -> tuple[set[str], set[str]]:
-    """从 agent2 evaluation 的 reasoning 文本解析 covered/missing id 集合
-
-    reasoning 由 orchestrator._record_agent2 拼接,格式:
-        [agent2 第 X 轮评估]
-        已覆盖: ['injection', 'auth']
-        未覆盖: ['crypto', 'deps']
-        ...
-    元素可能是 str 或 dict{'id': ...}
-    """
-    covered: set[str] = set()
-    missing: set[str] = set()
-    for line in reasoning.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("已覆盖:"):
-            covered = _extract_ids(stripped[len("已覆盖:"):].strip())
-        elif stripped.startswith("未覆盖:"):
-            missing = _extract_ids(stripped[len("未覆盖:"):].strip())
-    return covered, missing
-
-
-def _extract_ids(s: str) -> set[str]:
-    """从 Python list repr 提取 id 集合,元素可能是 str 或 dict{'id':...}"""
-    try:
-        val = ast.literal_eval(s)
-    except (ValueError, SyntaxError):
-        return set()
-    if not isinstance(val, list):
-        return set()
-    ids: set[str] = set()
-    for item in val:
-        if isinstance(item, str):
-            ids.add(item)
-        elif isinstance(item, dict) and "id" in item:
-            ids.add(str(item["id"]))
-    return ids
-
-
 # ============================================================
 # 报告导出(Markdown / HTML)
 # ============================================================
@@ -1549,10 +1163,8 @@ def export_task_report(
         if current_user is None or current_user.id != task.user_id:
             raise HTTPException(status_code=403, detail="无权访问此任务")
 
-    coverage = _compute_task_coverage(task, db)
-
     if format == "markdown":
-        body = _build_markdown_report(task, db, coverage)
+        body = _build_markdown_report(task, db)
         return Response(
             content=body.encode("utf-8"),
             media_type="text/markdown; charset=utf-8",
@@ -1561,14 +1173,14 @@ def export_task_report(
             },
         )
     # html
-    body = _build_html_report(task, db, coverage)
+    body = _build_html_report(task, db)
     return Response(content=body.encode("utf-8"), media_type="text/html; charset=utf-8")
 
 
 def _build_markdown_report(
-    task: Task, db: Session, coverage: dict[str, Any] | None
+    task: Task, db: Session,
 ) -> str:
-    """生成 Markdown 报告:任务信息 + 覆盖度 + 结果清单(按场景分组)"""
+    """生成 Markdown 报告:任务信息 + 结果清单(按场景分组)"""
     lines: list[str] = []
     lines.append("# 任务报告")
     lines.append("")
@@ -1588,23 +1200,6 @@ def _build_markdown_report(
     lines.append("")
     lines.append(task.user_input)
     lines.append("")
-
-    # 覆盖度
-    if coverage:
-        lines.append("## 覆盖度")
-        lines.append("")
-        round_hint = (
-            f"(第 {coverage['last_round']} 轮评估)" if coverage.get("last_round") is not None else ""
-        )
-        lines.append(
-            f"已覆盖 {coverage['covered_count']}/{coverage['total_count']} {round_hint}"
-        )
-        lines.append("")
-        for d in coverage["dimensions"]:
-            mark = "x" if d["covered"] else " "
-            desc = f": {d['description']}" if d.get("description") else ""
-            lines.append(f"- [{mark}] {d['name']}{desc}")
-        lines.append("")
 
     # 结果清单(场景降级后:grouping 从 task.params._grouping 读取,
     # meta_fields 从 results 的 metadata keys 动态推断)
@@ -1692,7 +1287,7 @@ def _append_result_md(
 
 
 def _build_html_report(
-    task: Task, db: Session, coverage: dict[str, Any] | None
+    task: Task, db: Session,
 ) -> str:
     """生成打印友好的 HTML 报告(前端新窗口打印为 PDF)"""
     status_val = task.status.value if hasattr(task.status, "value") else str(task.status)
@@ -1712,12 +1307,6 @@ def _build_html_report(
         ".meta div{margin:2px 0;}"
         ".intent{background:#f9fafb;padding:12px 16px;border-radius:6px;"
         "white-space:pre-wrap;font-size:14px;}"
-        ".coverage-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin-top:12px;}"
-        ".cov{padding:8px 12px;border:1px solid #e5e7eb;border-radius:6px;font-size:13px;}"
-        ".cov.yes{border-color:#16a34a;background:#f0fdf4;}"
-        ".cov.no{border-color:#e5e7eb;background:#f9fafb;}"
-        ".dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;}"
-        ".dot.yes{background:#16a34a;}.dot.no{background:#9ca3af;}"
         ".result{margin:12px 0;padding:12px 16px;background:#fafafa;border-radius:6px;break-inside:avoid;}"
         ".result h4{margin:0 0 6px;}"
         ".result .rmeta{font-size:12px;color:#6b7280;margin:6px 0;}"
@@ -1758,27 +1347,6 @@ def _build_html_report(
 
     parts.append("<h2>用户意图</h2>")
     parts.append(f'<div class="intent">{html.escape(task.user_input)}</div>')
-
-    # 覆盖度
-    if coverage:
-        parts.append("<h2>覆盖度</h2>")
-        round_hint = (
-            f"(第 {coverage['last_round']} 轮评估)"
-            if coverage.get("last_round") is not None
-            else ""
-        )
-        parts.append(
-            f'<p>已覆盖 {coverage["covered_count"]}/{coverage["total_count"]} '
-            f"{html.escape(round_hint)}</p>"
-        )
-        parts.append('<div class="coverage-grid">')
-        for d in coverage["dimensions"]:
-            cls = "yes" if d["covered"] else "no"
-            parts.append(f'<div class="cov {cls}">')
-            parts.append(f'<span class="dot {cls}"></span>')
-            parts.append(html.escape(d["name"]))
-            parts.append("</div>")
-        parts.append("</div>")
 
     # 结果清单
     results = list(task.results)
@@ -1880,7 +1448,7 @@ def _append_result_html(
 #    "[之前轮次的对话记忆]" 块(新数据已在 react_agent 落库侧拆分),
 #    报告侧裁剪兼容历史任务
 # 4. agent2 启用时,驱动第 r+1 轮的问题是第 r 轮 agent2 评估生成的
-#    追问(非 done/ask_user 时评估 content 就是 followup_query),协作轨迹
+#    追问(非 done 时评估 content 就是 followup_query),协作轨迹
 #    把这类评估归位到下一轮展示为提问/追问,避免与落库的样板 question 重复
 
 _CONVERSATION_TRACE_TYPES = {
@@ -1907,14 +1475,15 @@ _FOLLOWUP_SECTION_LABELS = (
 
 # agent2 评估中的非追问内容标记(_record_agent2 落库约定):
 # 这类评估是结论/动作记录而非驱动下一轮的问题,协作轨迹中保留在原轮
+# ("请求用户澄清"为旧版澄清提问机制的落库文案,保留以兼容存量数据)
 _UA_EVAL_NON_FOLLOWUP_MARKERS = ("评估完成,无需追问", "(未给出追问)", "请求用户澄清")
 
 
 def _is_ua_followup_evaluation(c) -> bool:
     """判断 agent2 评估是否为追问类(其 content 即驱动下一轮的问题)
 
-    _record_agent2 落库约定:非 done/ask_user 时 content 就是
-    followup_query 本身;done/ask_user/无追问时为固定标记文案。
+    _record_agent2 落库约定:非 done 时 content 就是
+    followup_query 本身;done/无追问时为固定标记文案。
     """
     if c.role != "agent2" or c.type != "evaluation":
         return False
@@ -2012,8 +1581,8 @@ def _collect_conversation_trace(task: Task) -> list[dict[str, Any]]:
 
     agent2 启用时的提问归位:
     - 驱动第 r+1 轮的问题是第 r 轮 agent2 评估的追问 → 归位到
-      r+1 轮展示为提问/追问(role=agent2);包括 round_idx=0 的
-      初始评估(提问阶段结束时落库,其追问即第 1 轮有效意图)
+      r+1 轮展示为提问/追问(role=agent2);含存量数据里 round_idx=0
+      的初始评估(旧版在任务开始时有第 0 轮评估,其追问即第 1 轮有效意图)
     - 落库的样板 question(原始意图/编排样板)相应跳过:第 1 轮原始意图
       已在报告「用户意图」节展示,后续轮 question 主体就是已归位的追问
     - 单 agent 模式(无 agent2 评估)保持原样展示落库 question
@@ -2125,7 +1694,7 @@ def _should_force_close_stream(
     快照为 COMPLETED/FAILED 但总线未标记结束 → resume/retry 已启动
     (API 端点 reset_task_bus 清除了标记),只是后台线程尚未更新 DB 状态,
     属时序竞态:若按快照关闭,前端刚重连的 SSE 会被误杀,后续
-    checklist_review 等事件虽进历史缓存却无人接收(需刷新页面才恢复)。
+    conversation/status 等事件虽进历史缓存却无人接收(需刷新页面才恢复)。
     """
     if initial_status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
         return False

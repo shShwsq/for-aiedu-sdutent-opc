@@ -1,7 +1,7 @@
 """安全审计场景模板(降级后:仅提供预设提示词 + 推荐 skill)
 
 不再定义 checklist/prompt/工具白名单/结果 schema。
-checklist 由 agent2 动态生成 + 用户编辑;
+审查维度由 agent2 根据用户意图自行确定;
 prompt 用通用 prompt;工具全部开放;结果结构通用化。
 """
 from app.scenarios.base import register_scenario

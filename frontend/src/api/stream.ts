@@ -16,7 +16,6 @@
 import { getAccessToken } from './client'
 import { clientLog } from '@/utils/clientLog'
 import type {
-  ChecklistReviewEventData,
   CloneProgressEventData,
   CommandConfirmEventData,
   ConnectedData,
@@ -24,7 +23,6 @@ import type {
   ConversationUpdateEventData,
   DoneEventData,
   PlanEventData,
-  QuestionEventData,
   SSEEvent,
   SSEEventType,
   StatusEventData,
@@ -45,10 +43,6 @@ export interface StreamCallbacks {
   onCloneProgress?: (data: CloneProgressEventData) => void
   /** 计划清单更新(复杂任务时 agent1 输出 <plan>,后端提取推送) */
   onPlan?: (data: PlanEventData) => void
-  /** 用户澄清提问(阶段 8:agent2 输出 ask_user=true 时触发) */
-  onQuestion?: (data: QuestionEventData) => void
-  /** 覆盖度清单确认(agent2 第 0 轮动态生成 checklist 后触发) */
-  onChecklistReview?: (data: ChecklistReviewEventData) => void
   /** 动态验证动作授权(verifier_agent per_action 模式,每个 HTTP/PoC 动作需用户确认) */
   onVerifyAction?: (data: VerifyActionEventData) => void
   /** 危险命令确认(local 模式安全策略,LLM 执行危险命令时需用户确认) */
@@ -82,8 +76,6 @@ export function subscribeTaskStream(
     'thinking_delta',
     'clone_progress',
     'plan',
-    'question',
-    'checklist_review',
     'verify_action',
     'command_confirm',
     'done',
@@ -127,12 +119,6 @@ export function subscribeTaskStream(
             break
           case 'plan':
             callbacks.onPlan?.(data as unknown as PlanEventData)
-            break
-          case 'question':
-            callbacks.onQuestion?.(data as unknown as QuestionEventData)
-            break
-          case 'checklist_review':
-            callbacks.onChecklistReview?.(data as unknown as ChecklistReviewEventData)
             break
           case 'verify_action':
             callbacks.onVerifyAction?.(data as unknown as VerifyActionEventData)

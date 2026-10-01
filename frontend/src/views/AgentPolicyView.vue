@@ -238,7 +238,7 @@ function formatTime(iso: string | null | undefined): string {
 /** 各字段帮助说明(点击问号按钮展示) */
 const FIELD_HELP: Record<string, string> = {
   agent2_enabled:
-    '开启后,检查助手参与协作(初始评估、轮次评估、验证)。关闭后退化为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做覆盖度评估、不验证。适合简单任务或用户完全信任 AI助手的场景。',
+    '开启后,检查助手参与协作(每轮执行后的质检评估、验证)。关闭后退化为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做质检评估、不验证。适合简单任务或用户完全信任 AI助手的场景。',
   max_rounds:
     '检查助手与 AI助手之间的协作总轮次。每轮含 AI助手执行 + 检查助手评估。轮次越多覆盖越全面但耗时越长。仅检查助手启用时生效。上限为 10。',
   allow_verify:

@@ -46,8 +46,6 @@ def _eval_json(**overrides):
         "reasoning": "需要先查后端",
         "followup_query": "请检查 backend 目录",
         "done": False,
-        "ask_user": False,
-        "questions": [],
     }
     result.update(overrides)
     return json.dumps(result, ensure_ascii=False)
@@ -64,7 +62,7 @@ def test_thinking_persisted_as_conversation():
     result = run_agent2(
         "审查这个仓库", [],
         task_id="task-1", db=db, round_idx=1,
-        client=_mk_client(chunks), ask_round=2, task=_mk_task(),
+        client=_mk_client(chunks), task=_mk_task(),
     )
     assert result["followup_query"] == "请检查 backend 目录"
 
@@ -90,7 +88,7 @@ def test_empty_reasoning_not_persisted():
     run_agent2(
         "审查这个仓库", [],
         task_id="task-1", db=db, round_idx=1,
-        client=_mk_client(chunks), ask_round=2, task=_mk_task(),
+        client=_mk_client(chunks), task=_mk_task(),
     )
     added = [c.args[0] for c in db.add.call_args_list]
     assert not [
@@ -107,8 +105,8 @@ def test_no_db_no_task_still_returns_result():
     ]
     result = run_agent2(
         "审查这个仓库", [],
-        task_id="task-1", db=None, round_idx=0,
-        client=_mk_client(chunks), ask_round=0, task=None,
+        task_id="task-1", db=None, round_idx=1,
+        client=_mk_client(chunks), task=None,
     )
     assert result["followup_query"] == "请检查 backend 目录"
 
@@ -122,10 +120,9 @@ def test_parse_failure_fallback_shows_raw_output():
     result = run_agent2(
         "审查这个仓库", [{"round": 1, "summary": "第一轮总结"}],
         task_id="task-1", db=None, round_idx=1,
-        client=_mk_client(chunks), ask_round=2, task=None,
+        client=_mk_client(chunks), task=None,
     )
     assert result["done"] is True
-    assert result["ask_user"] is False
     assert "agent2 输出解析失败" in result["reasoning"]
     assert "[agent2 输出原文]" in result["reasoning"]
     assert raw in result["reasoning"]
@@ -142,7 +139,7 @@ def test_parse_failure_raw_output_truncated():
     result = run_agent2(
         "审查这个仓库", [],
         task_id="task-1", db=None, round_idx=1,
-        client=_mk_client(chunks), ask_round=2, task=None,
+        client=_mk_client(chunks), task=None,
     )
     reasoning = result["reasoning"]
     assert "原文过长已截断" in reasoning

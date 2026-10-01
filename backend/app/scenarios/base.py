@@ -1,11 +1,11 @@
-"""场景模板(降级后:仅作快捷模板,不再硬编码 prompt/checklist/工具白名单)
+"""场景模板(降级后:仅作快捷模板,不再硬编码 prompt/工具白名单)
 
 场景降级后的职责:
 - 提供预设提示词(preset_prompt):用户选场景后预填到输入框
 - 推荐技能列表(recommended_skills):创建任务时默认勾选的 skill
 
 不再承担:
-- checklist(改为 agent2 动态生成 + 用户编辑)
+- checklist(已随覆盖度清单功能移除,agent2 自行确定审查维度)
 - agent2_prompt / react_agent_prompt(改为通用 prompt)
 - enabled_tools(改为全部开放)
 - extract_results / format_result(改为通用提取)

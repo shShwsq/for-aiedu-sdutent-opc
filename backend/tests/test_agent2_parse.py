@@ -20,8 +20,6 @@ def _eval_dict(**overrides):
         "reasoning": "评估理由",
         "followup_query": "",
         "done": True,
-        "ask_user": False,
-        "questions": [],
     }
     result.update(overrides)
     return result

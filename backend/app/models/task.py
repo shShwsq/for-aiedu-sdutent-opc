@@ -45,10 +45,6 @@ class Task(Base):
     # 可选的补充参数(如 repo_url、branch、scope 等),放 metadata
     params: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
-    # 动态覆盖度清单:agent2 第 0 轮根据用户意图生成,用户可编辑。
-    # 结构:[{"id": "cat_injection", "name": "注入类", "description": "...", "checklist": ["SQL 注入", ...]}]
-    # 取代原场景预定义的 checklist;为空表示尚未生成(第 0 轮前)
-    checklist: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     # 用户在创建任务时选择的允许调用的 skill 名称列表。
     # None 或空列表表示全部 skill 可用(默认);非空时 react_agent 的 skill 工具按此过滤
     allowed_skills: Mapped[list | None] = mapped_column(JSONB, nullable=True)
@@ -147,7 +143,7 @@ class Conversation(Base):
     task_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    # 协作轮次(第几轮,从 0 开始;0 = 初始评估)
+    # 协作轮次(第几轮,从 1 开始;存量数据可能含 round 0 的旧版初始评估)
     round_idx: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     # 角色:user / agent2 / react_agent
@@ -207,6 +203,33 @@ def migrate_conversation_tool_call_id() -> None:
         )
         conn.commit()
     log.info("conversations.tool_call_id 列迁移完成")
+
+
+def migrate_task_drop_checklist_column() -> None:
+    """幂等删除 tasks.checklist 旧列(覆盖度清单功能移除)
+
+    背景:任务开始时的 agent2 初始评估(生成覆盖度清单 + 用户确认弹窗)
+    已整体移除,task.checklist 不再有写入方与读取方。模型不再映射该列,
+    create_all 不会删已存在的列,老库需显式 DROP。列已删(全新库)时直接返回。
+    """
+    import logging
+
+    from sqlalchemy import inspect, text
+
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    with engine.connect() as conn:
+        insp = inspect(conn)
+        if not insp.has_table("tasks"):
+            return
+        cols = {c["name"] for c in insp.get_columns("tasks")}
+        if "checklist" not in cols:
+            return  # 全新库或已迁过
+        conn.execute(text("ALTER TABLE tasks DROP COLUMN checklist"))
+        conn.commit()
+    log.info("tasks.checklist 旧列已删除(覆盖度清单功能移除)")
 
 
 class Result(Base):

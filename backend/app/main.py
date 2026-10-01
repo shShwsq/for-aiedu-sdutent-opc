@@ -130,9 +130,14 @@ async def lifespan(app: FastAPI):
     migrate_agent_policy_drop_checkpoint_columns()
     migrate_conversations_drop_checkpoint_records()
     # 加 conversations.tool_call_id 列(tool_result 关联对应 tool_call,并行调用时前端精确配对)
-    from app.models.task import migrate_conversation_tool_call_id
+    from app.models.task import (
+        migrate_conversation_tool_call_id,
+        migrate_task_drop_checklist_column,
+    )
 
     migrate_conversation_tool_call_id()
+    # 覆盖度清单功能移除:删 tasks.checklist 旧列(幂等)
+    migrate_task_drop_checklist_column()
 
     # 领域事件:注册审计订阅者(所有事件 append-only 落库 domain_event_logs;
     # 建表已完成,后续扩展按同样方式 subscribe,见 app/domain_events.py)

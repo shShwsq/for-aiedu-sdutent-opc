@@ -3,21 +3,14 @@
 ## 1. 概述
 
 ### 1.1 产品定位
-双智能体协作的代码分析平台,核心是 **agent1(执行智能体,前端「AI助手」)执行 + agent2(质检智能体,前端「检查助手」)质检与追问** 的协作模式,在单 ReAct 架构之上叠加意图对齐与结果审视能力。
+双智能体协作的代码分析平台,核心是 **agent1(执行智能体,前端「AI助手」)执行 + agent2(质检智能体,前端「检查助手」)质检与追问** 的协作模式,在单 ReAct 架构之上叠加结果审视能力。
 
-**场景降级后的定位变更**:系统不再绑定安全审计场景。checklist 由 agent2 动态生成 + 用户编辑确认,prompt 通用化,工具全部开放,结果结构通用化。安全审计仅作为预设场景模板(快捷提示词 + 推荐 skill)之一,另含代码审查等场景。
+**场景降级后的定位变更**:系统不再绑定安全审计场景。agent2 按任务意图自行确定审查维度,prompt 通用化,工具全部开放,结果结构通用化。安全审计仅作为预设场景模板(快捷提示词 + 推荐 skill)之一,另含代码审查等场景。
 
 ### 1.2 核心架构
 ```
 用户输入(目的/仓库URL)
       ↓
-┌─────────────┐    提问澄清     ┌──────────────┐
-│   agent2    │ ←----------→ │   用户(人)    │
-│ (检查助手:   │               └──────────────┘
-│  质检+追问)  │
-└──────┬──────┘
-       │ 定向追问请求
-       ↓
 ┌──────────────────────────────┐
 │ ExecutorAgent(agent1/AI助手) │
 │  ┌─────────┐  ┌─────────────┐ │
@@ -28,9 +21,10 @@
 └──────┬───────────────────────┘
        │ 执行结果
        ↓
-┌─────────────┐
-│   agent2    │ 对照 checklist 评估覆盖度与深度
-│ (检查助手)   │ → 满足则输出给用户 / 不满足则继续追问 agent1
+┌─────────────┐    定向追问
+│   agent2    │ ----------→ 回到 agent1 补全
+│ (检查助手:   │
+│  质检+追问)  │ → 满足则输出给用户
 └─────────────┘
 ```
 
@@ -55,7 +49,7 @@
 - `preset_prompt`:预设提示词(用户选场景后预填到输入框)
 - `recommended_skills`:推荐技能列表(创建任务时默认勾选)
 
-不再承担:checklist(改为动态生成)、prompt(改为通用)、工具白名单(改为全部开放)、结果 schema(改为通用化)。
+不再承担:checklist(已随覆盖度清单功能移除,agent2 自行确定审查维度)、prompt(改为通用)、工具白名单(改为全部开放)、结果 schema(改为通用化)。
 
 ### 2.2 当前支持场景
 **场景一:代码安全审计**(`code_security_audit`)
@@ -70,51 +64,36 @@
 - 无预设提示词,用户自行描述任务
 
 ### 2.3 场景扩展预留
-用户在前端选择场景,后端加载对应预设提示词与推荐 skill。checklist 由 agent2 动态生成,不依赖场景定义。
+用户在前端选择场景,后端加载对应预设提示词与推荐 skill。审查维度由 agent2 按用户意图自行确定,不依赖场景定义。
 
 ---
 
 ## 3. 核心流程:双智能体协作
 
-### 3.1 agent2(检查助手)阶段一:意图对齐(可选)
-触发条件:用户输入模糊或缺少关键信息(如未指定分支、任务范围不清)。
-- 第 0 轮初始评估时,agent2 可输出 `ask_user=true` + questions 列表向用户提问
-- **预算上限 2 轮**(避免无限澄清),超过后强制关闭提问
-- questions 支持选择题(choice)和填空题(text),系统自动追加"是否有其他补充"问题
-- 前端弹窗交互,用户提交后后台线程唤醒继续评估
-- 典型问题:
-  - "请确认范围:全仓库还是特定目录?"
-  - "有特定关注的类别吗?"
-  - "是否需要检查依赖项漏洞(CVE)?"
-
-如果用户输入已明确,跳过此阶段直接进入 3.2。
-
-### 3.2 agent1(执行智能体)阶段:首轮执行
-agent2 将用户意图转化为任务(初始 followup_query),交给执行器(ExecutorAgent,即 agent1)。
+### 3.1 agent1(执行智能体)阶段:首轮执行
+任务启动后 agent1 直接按用户意图执行(任务开始时不再有 agent2 初始评估/澄清提问/覆盖度清单确认)。
 - 执行器可以是内置 react_agent(ReAct 模式)或外部 CLI agent(Qoder / DeepSeek / Codex via ACP)
 - 内置 react_agent 拥有工具:clone_repo / list_files / find_files / read_file / search_code / run_semgrep / query_cve / write_file / run_python_code / list_skills / skill
-- orchestrator 预处理:若用户选了仓库,主动 clone + list_files,仓库结构注入第 0 轮 agent2 和第 1 轮 agent1
+- orchestrator 预处理:若用户选了仓库,主动 clone + list_files,仓库结构注入第 1 轮 agent1(跳过自主 clone)
 - 输出首轮自然语言总结(summary)
 
-### 3.3 agent2 阶段二:对照 checklist 评估
-agent2 对照**动态生成的 checklist**评估每轮:
-- **第 0 轮**:agent2 根据用户意图动态生成 checklist(3-8 个维度,每个含子项),推送给用户编辑确认后落库
-- **协作轮**(第 1 轮起):从 task.checklist 读取已确认的清单,评估:
-  - 维度覆盖度:哪些维度已查、哪些未触及
-  - 维度深度:已查维度是否触及必查子项
-  - 已知发现的交叉验证:是否存在矛盾或需要补强的结论
+### 3.2 agent2(检查助手)阶段:每轮质检评估
+agent1 每完成一轮后,agent2 质检评估:
+- **审查维度**:agent2 根据用户意图自行确定本任务应覆盖的维度(3-8 个为宜,在 reasoning 中说明),跨轮保持维度 id 稳定
+- **每轮评估**:
+  - 维度覆盖度:哪些维度已查、哪些未触及(covered/missing)
+  - 维度深度:已查维度是否足够深入
+  - 已知发现的交叉验证:是否存在矛盾或需要补强的结论(可读源码核实)
 - 跨轮记忆:agent2 注入自己之前各轮的评估记录,避免 covered/missing 反复摇摆
 
-### 3.4 漏洞类别 checklist(场景降级后:动态生成)
-**场景降级变更**:checklist 不再从场景固定读取,改为 agent2 第 0 轮根据用户意图动态生成。
+### 3.3 审查维度确定原则
+**变更说明**:覆盖度清单(第 0 轮生成 + 用户编辑确认)机制已移除,agent2 在评估时自行确定维度。
 
-**动态生成原则**:
-- 根据用户意图自适应:安全审计任务生成安全维度(注入/认证/反序列化等),代码审查任务生成质量维度(可读性/正确性/性能等),其他任务按语义生成
-- 3-8 个维度为宜,每个维度含 3-6 个子项(checklist)
+- 根据用户意图自适应:安全审计任务覆盖安全维度(注入/认证/反序列化等),代码审查任务覆盖质量维度(可读性/正确性/性能等),其他任务按语义生成
+- 维度应覆盖该任务类型的主要风险点,不遗漏重要类别
 - 维度 id 用英文下划线命名(如 injection / readability),name 用中文
-- 用户可编辑确认后落库到 task.checklist,后续协作轮按此评估
 
-以下为安全审计场景的**参考维度**(agent2 生成时可能调整):
+以下为安全审计场景的**参考维度**(agent2 实际按任务语义调整):
 
 | 维度 | 必查子项(示例) | 高风险语言 |
 |------|------------------|------------|
@@ -128,10 +107,10 @@ agent2 对照**动态生成的 checklist**评估每轮:
 | XSS | 模板转义、DOM 操作、CSP | Web 应用 |
 | 配置安全 | 调试模式、CORS、默认凭据 | 全部 |
 
-> 注:此为参考 checklist,实际由 agent2 动态生成 + 用户编辑确认。
+> 注:此为参考维度,实际由 agent2 按任务意图自行确定。
 
-### 3.5 agent2 阶段三:定向追问
-当 checklist 未覆盖或深度不足时,agent2 向 agent1 发送**定向追问**:
+### 3.4 agent2 阶段:定向追问
+当覆盖不足或深度不够时,agent2 向 agent1 发送**定向追问**:
 - **追问要具体到类别和检查点**,禁止 "你再查查有没有别的" 这类无方向指令
 - 追问要带上**已有发现作为上下文**,避免 agent1 重复扫描
 - 示例:"已发现 SQL 注入 2 处(位置见上文)。请继续检查认证与授权模块,重点关注:1) 权限校验是否在每个受保护路由上;2) JWT 验证是否校验签名与过期;3) 是否存在 IDOR(通过用户可控 ID 访问他人资源)。"
@@ -185,8 +164,8 @@ agent2 对照**动态生成的 checklist**评估每轮:
 
 ### 3.6 终止条件(硬性,避免死循环)
 满足以下**全部**条件后输出最终报告:
-1. checklist 所有适用维度均有明确结论(有 / 无 / 无法确定)
-2. 每个维度至少触及一个必查子项
+1. agent2 确定的审查维度均有明确结论(有 / 无 / 无法确定)
+2. 每个维度至少触及一个关键检查点
 3. agent2 追问轮次 ≤ 总轮次上限(协作策略可配 1-10,默认 4)
 4. 最近一轮 agent1 未产生新发现,且 agent2 无新增追问点
 
@@ -211,7 +190,7 @@ agent2 对照**动态生成的 checklist**评估每轮:
 
 ### 4.1 共用后端(推荐)
 - 后端服务暴露统一 REST API + SSE(Server-Sent Events)实时流
-- 核心双智能体逻辑、checklist、工具集均在后端
+- 核心双智能体逻辑、工具集均在后端
 - 双端只负责 UI 与交互
 
 ### 4.2 前端框架选择(已决策)
@@ -224,8 +203,6 @@ agent2 对照**动态生成的 checklist**评估每轮:
   - `conversation`:对话消息(agent2 / agent1 的每一步)
   - `status`:任务状态变更(进入新阶段)
   - `thinking_delta`:LLM 流式 token 增量(打字机效果)
-  - `question`:用户澄清提问(前端弹窗)
-  - `checklist_review`:覆盖度清单确认
   - `plan`:计划清单状态更新
   - `done` / `error`:终止事件
 - **小程序端**:异步处理,**不主动通知**,用户自行进入小程序查看进度与结果
@@ -248,7 +225,6 @@ Task(任务)
   - user_input: 用户原始输入(意图,通用化:不再固定 repo_url)
   - params: JSONB,可选补充参数(repo_url / branch / scope / _verifier 等)
     - params._verifier: 验证智能体配置(auth_mode / auth_tokens / test_env_url,实验性)
-  - checklist: JSONB,动态覆盖度清单(agent2 第 0 轮生成 + 用户编辑确认)
   - allowed_skills: JSONB,用户选择的允许调用的 skill 名称列表(空=全部可用)
   - status: pending / running / paused / completed / failed
   - current_stage: 当前阶段描述(展示给前端)
@@ -261,9 +237,9 @@ Task(任务)
 Conversation(对话)
   - id (UUID)
   - task_id
-  - round_idx: 协作轮次(0=初始评估,1+=协作轮)
+  - round_idx: 协作轮次(从 1 起;存量数据可能含 round 0 的旧版初始评估)
   - role: user / agent1 / agent2 / system
-  - type: question / answer / evaluation / followup / thinking / tool_call / tool_result / summary / error / message / question(澄清提问)
+  - type: question / evaluation / followup / thinking / tool_call / tool_result / summary / error / message / answer(存量数据:旧版澄清提问的回答)
   - content: 消息内容
   - reasoning: 思考链(仅 type=thinking 有,模型 reasoning_content)
   - created_at
@@ -281,7 +257,7 @@ Result(任务结果项,通用)
 **场景降级变更**:
 - Task 从固定 `repo_url/branch/scope` 字段改为 `user_input`(通用意图)+ `params`(JSONB 补充参数)
 - Finding 表改为通用的 Result 表,metadata 放场景专用字段
-- Task 新增 `checklist`(动态覆盖度清单)、`allowed_skills`(技能过滤)、`executor`(执行器选择)、`react_llm_config_id`(react_agent 独立模型配置)
+- Task 新增 `allowed_skills`(技能过滤)、`executor`(执行器选择)、`react_llm_config_id`(react_agent 独立模型配置);曾有的 `checklist` 列(动态覆盖度清单)已随该功能移除而删除
 - Task 新增 `paused` 状态
 - Conversation 新增 `round_idx`(协作轮次)、`reasoning`(思考链)、`message`(用户补充消息)、`history_compress`(LLM 压缩缓存)等类型
 
@@ -640,8 +616,6 @@ react_agent 维护跨轮 plan 状态:
 | `conversation_update` | 更新已有 conversation 的 content(节流推送,如部分 CLI 的工具调用参数增量) |
 | `status` | 任务状态变更(进入新阶段) |
 | `thinking_delta` | LLM 流式 token 增量(打字机效果;phase: start / reasoning / content / error / end) |
-| `question` | 用户澄清提问(前端 QuestionDialog 弹窗) |
-| `checklist_review` | 覆盖度清单确认(前端 ChecklistReviewDialog,用户编辑后落库) |
 | `plan` | 计划清单状态更新(跨轮续接) |
 | `verify_action` | 验证动作授权请求(verifier_agent 的 `per_action` 模式,前端 VerifyActionDialog) |
 | `command_confirm` | 危险命令确认(local 模式,前端 CommandConfirmDialog) |

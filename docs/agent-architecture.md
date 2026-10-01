@@ -16,13 +16,6 @@
 用户意图
    │
    ▼
-┌───────────────┐  round 0  ┌──────────────────┐
-│    agent2     │ ◄──────►  │  用户(澄清/清单确认)
-│ (检查助手/    │           └──────────────────┘
-│  质检智能体)  │
-└───────┬───────┘
-        │ followup_query
-        ▼
 ┌──────────────────────────────────────────────┐
 │ ExecutorAgent (按 task.executor 派发,即      │
 │ agent1/AI助手)                               │
@@ -32,7 +25,7 @@
 └───────┬──────────────────────────────────────┘
                 │ summary + plan
                 ▼
-       agent2 对照 checklist 质检评估
+       agent2 质检评估(自行确定审查维度)
                 │
         ┌───────┴───────┐
    done=true        missing≠∅
@@ -56,20 +49,16 @@
 
 | 角色 | 职责 | 是否调工具 | 模型来源 |
 |------|------|-----------|---------|
-| **agent2(检查助手)** | ①质检审查 agent1 的结果(覆盖度评估、生成 checklist、追问、整理结构化结果);②必要时追问补全(中断任务向用户提问,ask_user);③任务完成后生成题目和知识点(practice 服务,由 orchestrator 调用) | 是,只读核查工具(`read_file` / `list_files` / `find_files` / `search_code`,单轮上限 `MAX_READ_TOOL_CALLS=12`);可选经 verifier_agent 生成 PoC 验证(单轮上限 `MAX_VERIFY_CALLS=3`) | `task.llm_config_id` |
+| **agent2(检查助手)** | ①每轮执行后质检审查 agent1 的结果(按任务意图自行确定审查维度、核实发现、追问、整理结构化结果);②任务完成后生成题目和知识点(practice 服务,由 orchestrator 调用) | 是,只读核查工具(`read_file` / `list_files` / `find_files` / `search_code`,单轮上限 `MAX_READ_TOOL_CALLS=12`);可选经 verifier_agent 生成 PoC 验证(单轮上限 `MAX_VERIFY_CALLS=3`) | `task.llm_config_id` |
 | **内置 react_agent(agent1)** | ReAct 循环执行代码分析(clone / search / read / semgrep 等) | 是,调用沙箱工具 | `task.react_llm_config_id`(空时回退 `llm_config_id`) |
 | **ExternalCLIAgent(agent1)** | 沙箱内启动外部 CLI,通过 ACP 协议通信 | 是,由 CLI 自主调工具 | CLI 自管(凭证经环境变量注入) |
 | **verifier_agent**(实验性) | 在沙箱里跑 PoC / HTTP 请求动态验证 agent1 的发现 | 是,独立工具集(`http_request` + `run_python_code`) | `task.llm_config_id`(复用 agent2 的 LLMClient) |
 
 ### 1.2 协作轮次
 
-- **round 0**：agent2 初始评估
-  - 生成动态 checklist（覆盖度维度）+ 初始 `followup_query`
-  - 可输出 `ask_user=true` 触发用户澄清弹窗（最多 `MAX_ASKS=2` 轮）
-  - 输出 checklist 推送给用户编辑确认，落库到 `task.checklist`
-- **round 1..N**：协作循环（N = 生效的总轮次上限）
+- **round 1..N**：协作循环（N = 生效的总轮次上限;任务开始时无 agent2 初始评估,agent1 第 1 轮直接按用户意图执行）
   - agent1 执行一轮 → 返回 `summary`
-  - agent2 对照 `task.checklist` 质检评估 → 输出 `covered/missing/followup_query/done`
+  - agent2 质检评估（自行确定审查维度）→ 输出 `covered/missing/followup_query/done`
   - `done=true` 时输出 `results + grouping`，orchestrator 落库
 - **轮次可配置**:总轮次不再是硬编码 4,经协作策略页配置(`AgentPolicy.max_rounds`,范围 1-10,默认 4,由 `MAX_MAX_ROUNDS=10` 钳制;任务级经 `task.params._agent_policy` 覆盖)
 - **单 agent 退化**:协作策略页关闭 Agent 2(`agent2_enabled=false`)后退化为单 agent 模式——agent1 跑 1 轮直接产出结果,无质检评估与追问
@@ -96,7 +85,7 @@
 
 - **不直接执行审查**，只做质检与追问；但可用**只读核查工具**(`read_file` / `list_files` / `find_files` / `search_code`,单轮上限 `MAX_READ_TOOL_CALLS=12`)核对 agent1 声称的发现是否有真实源码依据，以及可选的 verify 工具生成 PoC 动态验证安全问题(经 verifier_agent,单轮上限 `MAX_VERIFY_CALLS=3`)
 - **题目与知识点生成是 agent2 的职责**:任务完成后由 orchestrator 调用 practice 服务(实现位于 `app/services/practice/`)生成练习题与知识点
-- **场景降级后通用化**：不再从场景读 checklist，第 0 轮动态生成，后续轮从 `task.checklist` 注入
+- **审查维度自定**：无预定义覆盖度清单，agent2 每次评估时根据用户意图自行确定应覆盖的审查维度（3-8 个为宜），跨轮保持维度 id 稳定
 - **流式输出**：`_stream_agent2_llm` 通过 `client.chat_stream` 收 token，实时推送 `thinking_delta` 事件给前端
 - **跨轮记忆**：第 2 轮起注入自己之前各轮的评估记录，避免 covered/missing 反复摇摆
 
@@ -108,9 +97,6 @@ def run_agent2(
     react_agent_summaries: list[dict],   # 之前各轮 react_agent 的 summary
     task_id, db, round_idx, scenario_id,
     client: LLMClient | None,            # None 时回退 env 默认
-    ask_round=0,                         # 第 0 轮提问循环的轮次
-    repo_context: str | None,            # 仅 round 0,主动 clone 后的仓库结构
-    task_checklist: list[dict] | None,   # 协作轮从 task.checklist 读
     user_id, repo_url,
 ) -> dict
 ```
@@ -124,9 +110,6 @@ def run_agent2(
   "reasoning": "评估理由",
   "followup_query": "针对 missing 的追问指令",
   "done": false,
-  "ask_user": false,                 // round 0 可 true
-  "questions": [...],                // ask_user=true 时必填
-  "checklist": [...],                // 仅 round 0 输出
   "results": [...],                  // 仅 done=true 时输出
   "grouping": {"field":..., "values":[...]} | null
 }
@@ -136,10 +119,7 @@ def run_agent2(
 
 #### System Prompt（`AGENT2_SYSTEM_PROMPT`）
 
-固定模板 + `{checklist_section}` 占位符替换：
-
-- **round 0**：`task_checklist=None` → 提示 LLM "本轮尚未有 checklist，请动态生成"
-- **round ≥1**：`task_checklist=task.checklist` → 格式化为 "已确认的覆盖度清单" 注入
+固定模板，包含「质检基准维度」一节（提示 agent2 根据用户意图自行确定审查维度并在 reasoning 中说明）。
 
 末尾追加 **长期记忆段**（`build_agent2_memory_section`）：
 - User Profile（用户偏好，自由文本，≤2000 字符）
@@ -148,16 +128,7 @@ def run_agent2(
 
 #### User Message
 
-**round 0（无 react_agent_summaries）**：
-```
-用户原始意图：{user_intent}
-这是任务开始，react_agent 还没执行。请输出初始评估...
-[当前可向用户提问] 这是第 N 次评估，最多可提问 2 次...
-[已预克隆仓库结构,供你参考给出初始指令]
-{repo_context}
-```
-
-**round ≥1（有 react_agent_summaries）**：
+**协作轮（有 react_agent_summaries）**：
 ```
 用户原始意图：{user_intent}
 
@@ -171,7 +142,6 @@ def run_agent2(
 ...
 
 请评估覆盖情况，决定是否追问或结束。
-[当前不允许提问] react_agent 已开始执行，ask_user 必须为 false。
 [记忆提示] 上面已附上你之前各轮的评估记录，请保持覆盖度判断的连续性...
 ```
 
@@ -185,26 +155,16 @@ def run_agent2(
 - 优先级 0：其他
 - 同优先级 FIFO 丢最早轮次
 
-### 2.6 ask_user 流程（仅 round 0）
+### 2.6 后置约束
 
-1. agent2 输出 `ask_user=true + questions`
-2. 后端校验 questions 结构，规范化 id/type/options，过滤掉 LLM 误加的"补充"问题
-3. **后端追加固定 `SUPPLEMENT_QUESTION`**（id=`_supplement`，"是否有其他补充?"）作为最后一题
-4. orchestrator 推送 `question` 事件 + 落库 `Conversation(role=agent2, type=question)`
-5. `set_pending_question` + 阻塞 `wait_for_answers`
-6. 用户提交答案 → `_format_user_answers` 格式化为 `[用户澄清] Q1/A1/Q2/A2...` 拼回 `effective_intent`
-7. 重新调 `run_agent2`（`ask_round+1`）
-8. 达到 `MAX_ASKS=2` 时强制 `ask_user=false`
-
-### 2.7 后置约束
-
-- 非 round 0 或已达 `MAX_ASKS` → 强制 `ask_user=false`
-- `ask_user=true` 但 `questions` 空 → 关闭提问
 - JSON 解析失败 → 兜底 `done=true, results=[]`，避免无意义重跑
 
-### 2.8 落库（`_record_agent2`）
+> 历史说明:任务开始时的「初始评估 + 澄清提问(ask_user)+ 覆盖度清单确认」机制已整体移除,
+> agent1 第 1 轮直接按用户意图执行,agent2 从第 1 轮执行完成后开始质检。
 
-- `content`：精简显示（追问内容 / "评估完成" / "请求用户澄清(N 个问题)"）
+### 2.7 落库（`_record_agent2`）
+
+- `content`：精简显示（追问内容 / "评估完成"）
 - `reasoning`：完整评估（已覆盖/未覆盖/判断/追问/done 标记），供刷新页面回看 + 跨轮记忆加载
 
 ---
@@ -659,9 +619,8 @@ list of `{label, header_name, header_value}`：
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                     orchestrator                            │
-│  effective_intent(用户澄清后) / task.checklist /           │
-│  react_summaries / current_plan(跨轮) / git_tokens /       │
-│  allowed_skills / repo_path / repo_context                  │
+│  user_intent / react_summaries / current_plan(跨轮) /      │
+│  git_tokens / allowed_skills / repo_path / repo_context     │
 └──────┬──────────────────────────────────────┬──────────────┘
        │                                      │
        ▼                                      ▼
@@ -671,16 +630,14 @@ list of `{label, header_name, header_value}`：
 │  输入:        │                     │  输入:            │
 │  - user_intent                      │  - task.user_input
 │  - react_summaries (跨轮)          │  - followup_query │
-│  - task_checklist                   │  - repo_context (仅 round 1)
-│  - repo_context (仅 round 0)       │  - previous_plan (跨轮) │
-│  - history (自己之前各轮评估)      │  - client (仅 builtin) │
-│  - User Profile + 全局记忆 + 项目记忆精简版           │
-│              │                     │  - 分项目记忆 + 全局记忆 │
-│  输出:        │                     │                  │
-│  - covered/missing                  │  输出:            │
-│  - followup_query                   │  - summary        │
-│  - done + results + grouping        │  - final_plan     │
-│  - ask_user + questions (round 0)   │                  │
+│  - history (自己之前各轮评估)      │  - repo_context (仅 round 1)
+│  - User Profile + 全局记忆 + 项目记忆精简版           │  - previous_plan (跨轮) │
+│              │                     │  - client (仅 builtin) │
+│  输出:        │                     │  - 分项目记忆 + 全局记忆 │
+│  - covered/missing                  │                  │
+│  - followup_query                   │  输出:            │
+│  - done + results + grouping        │  - summary        │
+│              │                     │  - final_plan     │
 └──────────────┘                     └──────────────────┘
 ```
 
@@ -703,8 +660,6 @@ list of `{label, header_name, header_value}`：
 
 | 交互类型 | 触发条件 | 传递方式 |
 |---------|---------|---------|
-| **澄清提问**（round 0） | agent2 输出 `ask_user=true` | orchestrator 推 `question` 事件 + 阻塞 `wait_for_answers` → 答案格式化拼回 `effective_intent` |
-| **checklist 确认**（round 0） | agent2 输出 `checklist` | orchestrator 推 `checklist_review` 事件 + 阻塞 `wait_for_checklist_confirmation` → 确认后落库 `task.checklist` |
 | **运行中追加消息** | 用户在对话界面输入框发消息 | API 端点落库 `Conversation(role=user, type=message)` + 推 SSE；react_agent 每个迭代开头 `drain_user_messages` 注入 `messages` |
 | **完成后重启** | 任务 COMPLETED 后用户追加消息 | `resume_audit_with_message`：用户消息拼到 `task.user_input` 后面作为 `effective_intent`，从 Conversation 表加载 `react_summaries`，重启协作循环 |
 
@@ -719,8 +674,6 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 | `conversation_update` | CLI agent | 更新已有 conversation 的 content（节流推送，如工具调用参数增量） |
 | `thinking_delta` | agent2 / react_agent / CLI agent / verifier_agent | 流式思考增量（phase: start / reasoning / content / error / end；verifier 带 `role=agent2, verify=true`） |
 | `plan` | react_agent / CLI agent | plan 状态更新（round_idx + steps） |
-| `question` | orchestrator | 用户澄清提问（ask_round + questions + reasoning） |
-| `checklist_review` | orchestrator | checklist 确认请求（checklist + reasoning） |
 | `verify_action` | verifier_agent | 验证动作授权请求(`per_action` 模式,前端 VerifyActionDialog) |
 | `command_confirm` | sandbox_tools (local 模式) | 危险命令确认(前端 CommandConfirmDialog) |
 | `done` / `error` | orchestrator | 任务终止事件 |
@@ -748,7 +701,6 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 - **agent1（内置 react_agent）循环检测**：连续相同调用 + 滑动窗口低多样性检测，强制转入总结
 - **协作轮次可配**：总轮次经 `AgentPolicy.max_rounds` 配置（范围 1-10，默认 4，由 `MAX_MAX_ROUNDS=10` 钳制；任务级 `task.params._agent_policy` 覆盖）
 - **MAX_ITERATIONS=30**：单轮 ReAct 迭代上限
-- **MAX_ASKS=2**：用户澄清提问上限
 - **MAX_READ_TOOL_CALLS=12**：agent2 单次评估只读核查工具调用上限
 - **MAX_VERIFY_CALLS=3**：agent2 单次评估 verifier_agent 调用上限
 - **verifier MAX_ITERATIONS=10**：验证 ReAct 迭代上限
@@ -761,7 +713,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 ### 8.5 资源清理（finally 块）
 
 `run_dual_agent_audit` 和 `resume_audit_with_message` 的 finally 块清理：
-- `clear_pending_question` / `clear_pending_checklist` / `clear_pause_state` / `clear_user_messages` / `clear_pending_verify_authorization` / `clear_pending_command_confirm`
+- `clear_pause_state` / `clear_user_messages` / `clear_pending_verify_authorization` / `clear_pending_command_confirm`
 - `sandbox_tools.mark_task_completed`（延迟关闭沙箱，TTL 1 小时惰性清理）
 - 推送 `done` / `error` 终止事件
 - `finish_task`（通知事件总线任务结束）
@@ -772,8 +724,8 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 
 | 文件 | 职责 |
 |------|------|
-| [orchestrator.py](../backend/app/agents/orchestrator.py) | 双智能体协作编排（round 0 评估 + 协作循环 + resume） |
-| [agent2.py](../backend/app/agents/agent2.py) | agent2 实现（评估 / checklist 生成 / ask_user / 跨轮自记忆） |
+| [orchestrator.py](../backend/app/agents/orchestrator.py) | 双智能体协作编排（协作循环 + resume） |
+| [agent2.py](../backend/app/agents/agent2.py) | agent2 实现（质检评估 / 审查维度自定 / 跨轮自记忆） |
 | [react_agent.py](../backend/app/agents/react_agent.py) | 内置 react_agent（流式 LLM / 工具调用 / plan 状态机 / 三级压缩跨轮记忆 / 循环检测） |
 | [verifier_agent.py](../backend/app/agents/verifier_agent.py) | 验证智能体（独立 ReAct 循环 + http_request / run_python_code 工具 + per_action 授权） |
 | [executor_agent.py](../backend/app/agents/executor_agent.py) | 执行器抽象层（BuiltinReactAgent + ExternalCLIAgent + 工厂） |
@@ -788,7 +740,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 | [tools/sandbox_tools.py](../backend/app/tools/sandbox_tools.py) | 沙箱工具实现（clone_repo / search_code / run_command 等 + local 模式 _classify_command + 危险命令确认） |
 | [tools/verifier_tools.py](../backend/app/tools/verifier_tools.py) | verifier_agent 工具（http_request 沙箱内 urllib + run_python_code + auth_profile 注入） |
 | [memory_injection.py](../backend/app/services/memory_injection.py) | 记忆注入服务（User Profile / 全局记忆 / 项目记忆） |
-| [user_interaction.py](../backend/app/user_interaction.py) | 用户交互状态管理（pending question / checklist / verify_authorization / command_confirm 阻塞等待） |
+| [user_interaction.py](../backend/app/user_interaction.py) | 用户交互状态管理（verify_authorization / command_confirm 阻塞等待） |
 | [user_messages.py](../backend/app/user_messages.py) | 用户补充消息队列（运行中/暂停中追加） |
 | [pause_controller.py](../backend/app/pause_controller.py) | 暂停/恢复控制器 |
 | [event_bus.py](../backend/app/event_bus.py) | 事件总线(publish / SSE 订阅) |

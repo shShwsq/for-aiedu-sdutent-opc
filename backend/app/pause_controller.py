@@ -14,9 +14,8 @@
 适用单机部署;多实例部署需换 Redis 等共享存储。
 
 注意:
-- 与 user_interaction.py 的 _PendingQuestion 不同,这里 Event 是"运行门控"
-  (set=放行,clear=阻塞),而 _PendingQuestion 的 Event 是"一次性唤醒"
-  (wait 等待 set,被 set 后唤醒一次)。
+- 与 user_interaction.py 的待授权动作 Event 不同,这里 Event 是"运行门控"
+  (set=放行,clear=阻塞),而后者是"一次性唤醒"(wait 等待 set,被 set 后唤醒一次)。
 - 服务重启会丢失 in-memory 状态,任务会卡在 PAUSED 状态(后台线程已死)。
   这是单机部署的已知限制,生产环境应配合任务恢复机制。
 """

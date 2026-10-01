@@ -17,8 +17,6 @@ from pydantic import ValidationError
 
 from app.agents.registry import get_registered_types
 from app.schemas.task import (
-    AnswerItem,
-    AnswerRequest,
     SendMessageRequest,
     SendMessageResponse,
     TaskCreateRequest,
@@ -244,7 +242,7 @@ def test_send_message_request_accepts_max_length():
 
 
 # ============================================================
-# VerifyActionRequest / AnswerRequest
+# VerifyActionRequest
 # ============================================================
 
 def test_verify_action_request_fields():
@@ -252,24 +250,3 @@ def test_verify_action_request_fields():
     req = VerifyActionRequest(action_id="act-123", approved=True)
     assert req.action_id == "act-123"
     assert req.approved is True
-
-
-def test_answer_request_accepts_string_value():
-    """AnswerItem value 为字符串(填空题)。"""
-    req = AnswerRequest(answers=[AnswerItem(question_id="q1", value="自由文本回答")])
-    assert req.answers[0].value == "自由文本回答"
-
-
-def test_answer_request_accepts_list_value():
-    """AnswerItem value 为字符串列表(多选题)。"""
-    req = AnswerRequest(answers=[AnswerItem(question_id="q1", value=["选项A", "选项B"])])
-    assert req.answers[0].value == ["选项A", "选项B"]
-
-
-def test_answer_request_empty_list_rejected():
-    """answers 空列表:Pydantic 默认允许(后端可能校验)。
-
-    schema 层不强约束非空,留给 router 判断。这里验证 schema 接受空 list。
-    """
-    req = AnswerRequest(answers=[])
-    assert req.answers == []

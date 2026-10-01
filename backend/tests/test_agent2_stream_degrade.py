@@ -3,8 +3,8 @@
 背景:用户发追问时,agent2 评估阶段的流式 LLM 调用失败会直接 raise,
 导致整个任务 FAILED,前端只显示"未知错误"。修复:
 1. agent2.py:流式调用失败重试一次,仍失败返回 degraded=true 降级结果
-   (不抛异常杀死任务);orchestrator 检测到降级后首次分析跳过清单确认、
-   直接把用户输入内容交给 react_agent,协作轮评估降级则收尾结束;
+   (不抛异常杀死任务);orchestrator 检测到降级后 resume 首次分析直接把
+   用户输入内容交给 react_agent,协作轮评估降级则收尾结束;
 2. orchestrator.py / tasks.py:error_message 兜底增强——异常消息为空时
    补异常类型名(_err_detail),杜绝 UI 显示"未知错误"字面。
 """
@@ -37,14 +37,14 @@ def test_stream_fail_once_retry_success(monkeypatch):
             raise RuntimeError("网络抖动")
         return (
             '{"covered": [], "missing": [], "reasoning": "重试成功", '
-            '"followup_query": "继续检查", "done": false, "ask_user": false}',
+            '"followup_query": "继续检查", "done": false}',
             [], "思考链",
         )
 
     monkeypatch.setattr(agent2, "_stream_agent2_llm", _fake_stream)
 
     result = agent2.run_agent2(
-        "审计这个仓库", [], task_id="task-1", round_idx=0, client=MagicMock(),
+        "审计这个仓库", [], task_id="task-1", round_idx=1, client=MagicMock(),
     )
 
     assert len(calls) == 2  # 失败后重试了一次
@@ -60,12 +60,11 @@ def test_stream_fail_twice_returns_degraded(monkeypatch):
     monkeypatch.setattr(agent2, "_stream_agent2_llm", _fake_stream)
 
     result = agent2.run_agent2(
-        "审计这个仓库", [], task_id="task-1", round_idx=0, client=MagicMock(),
+        "审计这个仓库", [], task_id="task-1", round_idx=1, client=MagicMock(),
     )
 
     assert result["degraded"] is True
     assert result["done"] is False
-    assert result["ask_user"] is False
     assert result["followup_query"] == "审计这个仓库"  # 原始用户输入透传
     assert result["degrade_reason"] == "boom"
     assert "降级" in result["reasoning"]
@@ -90,12 +89,10 @@ def _mk_resume_task():
     task.allowed_skills = None
     task.verifier_enabled = False
     task.test_env_url = ""
-    task.checklist = None
     return task
 
 
-def _patch_resume_env(monkeypatch, executor, ua_side_effect,
-                      set_pending=None, publish_events=None):
+def _patch_resume_env(monkeypatch, executor, ua_side_effect):
     """屏蔽 resume 链路的副作用,只测降级分流。"""
     monkeypatch.setattr(orchestrator, "_build_llm_client", lambda *a, **k: MagicMock())
     monkeypatch.setattr(
@@ -132,29 +129,20 @@ def _patch_resume_env(monkeypatch, executor, ua_side_effect,
     monkeypatch.setattr(workspace_diff, "save_repo_tree_artifact",
                         lambda *a, **k: None)
 
-    # publish 全量接管:仅捕获 checklist_review,其余丢弃(避免碰真实事件总线)
-    def _pub(tid, event, data):
-        if event == "checklist_review" and publish_events is not None:
-            publish_events.append(data)
-    monkeypatch.setattr(orchestrator, "publish", _pub)
-
-    if set_pending is not None:
-        monkeypatch.setattr(
-            orchestrator, "set_pending_checklist",
-            lambda tid, cl: set_pending.append(cl),
-        )
+    # publish 全量接管:丢弃所有事件(避免碰真实事件总线)
+    monkeypatch.setattr(orchestrator, "publish", lambda *a, **k: None)
 
 
 def test_resume_analyze_degraded_passes_user_message(monkeypatch):
-    """resume 首次分析降级 → 跳过清单确认,直接把用户消息交给 react_agent。"""
+    """resume 首次分析降级 → 直接把用户消息交给 react_agent。"""
     task = _mk_resume_task()
     degraded = {
         "covered": [], "missing": [], "reasoning": "流式失败已降级",
-        "followup_query": "被降级覆盖", "done": False, "ask_user": False,
+        "followup_query": "被降级覆盖", "done": False,
         "degraded": True, "degrade_reason": "boom",
     }
     done = {"covered": [], "missing": [], "reasoning": "完成",
-            "followup_query": "", "done": True, "ask_user": False,
+            "followup_query": "", "done": True,
             "results": [], "grouping": None}
     ua_calls = []
 
@@ -166,18 +154,12 @@ def test_resume_analyze_degraded_passes_user_message(monkeypatch):
     executor.name = "builtin"
     executor.run = MagicMock(return_value=([], "总结", []))
 
-    set_pending, publish_events = [], []
-    _patch_resume_env(monkeypatch, executor, _ua,
-                      set_pending=set_pending, publish_events=publish_events)
+    _patch_resume_env(monkeypatch, executor, _ua)
 
     orchestrator.resume_audit_with_message(
         task, MagicMock(), "再帮我查下依赖漏洞",
     )
 
-    # 降级时仍按分析模式调用(内部跳过清单更新确认)
-    assert ua_calls[0]["checklist_update_mode"] is True
-    assert set_pending == []     # 未推送清单确认
-    assert publish_events == []  # 未推送 checklist_review
     # 直接把用户输入内容交给 react_agent
     executor.run.assert_called_once()
     assert executor.run.call_args.kwargs["followup_query"] == "再帮我查下依赖漏洞"
@@ -188,9 +170,9 @@ def test_resume_collab_degraded_ends_round(monkeypatch):
     """resume 协作轮评估降级 → 不再追问,以当前进度收尾结束。"""
     task = _mk_resume_task()
     analyze = {"covered": [], "missing": [], "reasoning": "分析",
-               "followup_query": "查依赖", "done": False, "ask_user": False}
+               "followup_query": "查依赖", "done": False}
     degraded = {"covered": [], "missing": [], "reasoning": "评估失败降级",
-                "followup_query": "", "done": False, "ask_user": False,
+                "followup_query": "", "done": False,
                 "degraded": True, "degrade_reason": "boom"}
     ua_calls = []
 
@@ -230,7 +212,7 @@ def test_resume_except_typed_error_message(monkeypatch):
 
 
 # ============================================================
-# run_dual_agent_audit:降级分流
+# run_dual_agent_audit:直接执行 + 降级分流
 # ============================================================
 
 
@@ -248,12 +230,11 @@ def _mk_dual_task():
     task.params = {}
     task.allowed_skills = None
     task.executor = "builtin"
-    task.checklist = None
     return task
 
 
-def _patch_dual_env(monkeypatch, executor, ua_side_effect, publish_events=None):
-    """屏蔽 dual 链路的副作用,只测降级分流。"""
+def _patch_dual_env(monkeypatch, executor, ua_side_effect):
+    """屏蔽 dual 链路的副作用,只测执行与降级分流。"""
     monkeypatch.setattr(orchestrator, "resolve_agent_policy",
                         lambda *a, **k: {"agent2_enabled": True})
     monkeypatch.setattr(orchestrator, "perf_log", lambda *a, **k: None)
@@ -284,50 +265,46 @@ def _patch_dual_env(monkeypatch, executor, ua_side_effect, publish_events=None):
     monkeypatch.setattr(workspace_diff, "save_repo_tree_artifact",
                         lambda *a, **k: None)
 
-    def _pub(tid, event, data):
-        if event == "checklist_review" and publish_events is not None:
-            publish_events.append(data)
-    monkeypatch.setattr(orchestrator, "publish", _pub)
+    monkeypatch.setattr(orchestrator, "publish", lambda *a, **k: None)
 
 
-def test_dual_round0_degraded_runs_react_agent(monkeypatch):
-    """dual 第 0 轮评估降级 → 无清单确认,直接跑 react_agent,任务完成。"""
+def test_dual_starts_with_react_agent_no_initial_eval(monkeypatch):
+    """任务开始时无 agent2 初始评估:agent1 第 1 轮直接按用户意图执行。"""
     task = _mk_dual_task()
-    degraded = {
-        "covered": [], "missing": [], "reasoning": "初始评估失败已降级",
-        "followup_query": "审计这个仓库", "done": False, "ask_user": False,
-        "degraded": True, "degrade_reason": "boom",
-    }
     done = {"covered": [], "missing": [], "reasoning": "完成",
-            "followup_query": "", "done": True, "ask_user": False,
-            "results": [], "grouping": None}
+            "followup_query": "", "done": True,
+            "results": [{"title": "发现", "content": "内容"}], "grouping": None}
     ua_calls = []
 
     def _ua(*args, **kwargs):
         ua_calls.append(kwargs)
-        return degraded if len(ua_calls) == 1 else done
+        return done
 
     executor = MagicMock()
     executor.name = "builtin"
     executor.run = MagicMock(return_value=([], "总结", []))
 
-    publish_events = []
-    _patch_dual_env(monkeypatch, executor, _ua, publish_events=publish_events)
+    _patch_dual_env(monkeypatch, executor, _ua)
 
     orchestrator.run_dual_agent_audit(task, MagicMock())
 
-    assert publish_events == []        # 降级 dict 无 checklist,不推确认
-    executor.run.assert_called_once()  # react_agent 正常执行一轮
+    # agent1 先执行:第 1 轮、followup_query=None(直接用用户意图)
+    executor.run.assert_called_once()
+    assert executor.run.call_args.kwargs["round_idx"] == 1
+    assert executor.run.call_args.kwargs["followup_query"] is None
+    # agent2 首次评估发生在 agent1 执行之后(第 1 轮评估)
+    assert len(ua_calls) == 1
+    assert ua_calls[0]["round_idx"] == 1
     assert task.status == TaskStatus.COMPLETED
 
 
 def test_dual_collab_degraded_ends_round(monkeypatch):
     """dual 协作轮评估降级 → 结束协作循环,以当前进度收尾。"""
     task = _mk_dual_task()
-    normal = {"covered": [], "missing": [], "reasoning": "r0",
-              "followup_query": "查依赖", "done": False, "ask_user": False}
+    normal = {"covered": [], "missing": [], "reasoning": "第 1 轮评估",
+              "followup_query": "查依赖", "done": False}
     degraded = {"covered": [], "missing": [], "reasoning": "评估失败降级",
-                "followup_query": "", "done": False, "ask_user": False,
+                "followup_query": "", "done": False,
                 "degraded": True, "degrade_reason": "boom"}
     ua_calls = []
 
@@ -343,7 +320,10 @@ def test_dual_collab_degraded_ends_round(monkeypatch):
 
     orchestrator.run_dual_agent_audit(task, MagicMock())
 
-    executor.run.assert_called_once()  # 降级后不再继续追问执行
+    # 第 1 轮按用户意图执行 + 第 2 轮按追问执行;降级后不再继续
+    assert executor.run.call_count == 2
+    assert executor.run.call_args_list[0].kwargs["followup_query"] is None
+    assert executor.run.call_args_list[1].kwargs["followup_query"] == "查依赖"
     assert task.status == TaskStatus.COMPLETED
 
 

@@ -7,58 +7,6 @@
 /** 任务状态(后端 TaskStatus 枚举的字符串值) */
 export type TaskStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed'
 
-// ============================================================
-// 阶段 8:agent2 向用户提问澄清意图
-// ============================================================
-
-/** 选择题选项 */
-export interface ClarificationQuestionOption {
-  value: string
-  label: string
-}
-
-/**
- * agent2 向用户提出的问题
- *
- * 两种类型:
- * - choice: 选择题(用户从 options 中选,可单选或多选)
- * - text: 填空题(用户自由文本回答)
- */
-export interface ClarificationQuestion {
-  id: string
-  type: 'choice' | 'text'
-  question: string
-  placeholder?: string
-  required?: boolean
-  options?: ClarificationQuestionOption[]
-  multi?: boolean
-}
-
-/** 任务当前待回答的问题(GET /tasks/{id}/pending_question) */
-export interface PendingQuestion {
-  ask_round: number
-  questions: ClarificationQuestion[]
-  reasoning?: string
-  conversation_id?: string | null
-}
-
-/** 单个问题的答案 */
-export interface AnswerItem {
-  question_id: string
-  value: string | string[]
-}
-
-/** 提交答案请求 */
-export interface AnswerRequest {
-  answers: AnswerItem[]
-}
-
-/** 提交答案响应 */
-export interface AnswerResponse {
-  accepted: boolean
-  message?: string
-}
-
 /**
  * 场景信息(后端 ScenarioInfo,精简模板)
  *
@@ -73,40 +21,6 @@ export interface Scenario {
   preset_prompt?: string
   /** 推荐使用的 skill 列表(展示给用户参考,不强制) */
   recommended_skills?: string[]
-}
-
-/**
- * 覆盖度清单维度(agent2 第 0 轮动态生成,用户可编辑确认)
- *
- * 维度对应一类检查目标,checklist 是该维度下的具体检查项。
- */
-export interface ChecklistDimension {
-  id: string
-  name: string
-  description: string
-  /** 该维度下的检查项列表 */
-  checklist: string[]
-}
-
-/** 任务覆盖度看板数据(GET /tasks/{id}/coverage) */
-export interface TaskCoverage {
-  /** 各维度覆盖状态 */
-  dimensions: TaskCoverageDimension[]
-  /** 已覆盖维度数 */
-  covered_count: number
-  /** 维度总数 */
-  total_count: number
-  /** 最新评估所在轮次(null 表示尚无评估) */
-  last_round: number | null
-}
-
-/** 任务覆盖度维度(含运行时覆盖状态) */
-export interface TaskCoverageDimension {
-  /** 是否已覆盖 */
-  covered: boolean
-  id: string
-  name: string
-  description: string
 }
 
 /** 提交任务请求(后端 TaskCreateRequest) */
@@ -240,13 +154,6 @@ export interface TaskDetail {
   completed_at: string | null
   results: TaskResult[]
   conversations: Conversation[]
-  /**
-   * 覆盖度清单(agent2 第 0 轮动态生成,用户确认后落库)
-   *
-   * null/未定义 = 未生成清单(任务尚未进入清单生成阶段,或场景不使用清单)。
-   * 覆盖度看板据此判断是否展示。
-   */
-  checklist?: ChecklistDimension[] | null
   /** 用户选择的 skill 列表(null/未定义 = 全部可用) */
   allowed_skills?: string[] | null
   /** 测试环境 URL(启用验证时,agent2 在此环境动态验证安全发现) */
@@ -286,8 +193,6 @@ export type SSEEventType =
   | 'thinking_delta'
   | 'clone_progress'
   | 'plan'
-  | 'question'
-  | 'checklist_review'
   | 'verify_action'
   | 'command_confirm'
   | 'done'
@@ -407,37 +312,6 @@ export interface PlanStep {
   text: string
   /** 状态:pending / in_progress / done */
   status: 'pending' | 'in_progress' | 'done'
-}
-
-/**
- * question 事件 data(阶段 8:用户澄清)
- *
- * agent2 在第 0 轮初始评估时,若认为用户意图不清晰,输出 ask_user=true
- * + questions 列表。后端推送此事件,前端弹出 QuestionDialog 让用户填答。
- * 用户提交后通过 POST /tasks/{id}/answer 唤醒后台线程继续评估。
- */
-export interface QuestionEventData {
-  /** 提问轮次(0=首次,1=用户回答后再问) */
-  ask_round: number
-  /** 问题列表(最后一题固定为"是否有其他补充") */
-  questions: ClarificationQuestion[]
-  /** agent2 的判断依据(展示给用户参考) */
-  reasoning?: string
-  /** 对应的 Conversation 记录 id(落库的提问记录) */
-  conversation_id?: string | null
-}
-
-/**
- * checklist_review 事件 data(覆盖度清单动态生成)
- *
- * agent2 在第 0 轮动态生成覆盖度清单后推送此事件,前端弹出 ChecklistReviewDialog
- * 让用户编辑确认。用户提交后通过 POST /tasks/{id}/checklist 唤醒后台线程继续评估。
- */
-export interface ChecklistReviewEventData {
-  /** agent2 生成的覆盖度维度列表 */
-  checklist: ChecklistDimension[]
-  /** agent2 生成清单的依据(展示给用户参考,可选) */
-  reasoning?: string
 }
 
 /**

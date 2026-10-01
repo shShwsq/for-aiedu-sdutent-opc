@@ -4,7 +4,7 @@
 无状态函数,每次调用现查 DB。token 受控(各段上限 2000 字符,超出尾部截断)。
 
 注入策略:
-- agent2:User Profile + 全局长期记忆(影响评判标准与 checklist 生成)
+- agent2:User Profile + 全局长期记忆(影响评判标准与审查维度)
 - react_agent:分项目记忆(影响审计方向,优先检查已知问题)
 
 user_id 为 None(匿名任务)或无配置 → 返回空串(不注入),保证匿名任务不受影响。
@@ -35,8 +35,8 @@ def build_agent2_memory_section(
     """构造 agent2 的"User Profile + 全局长期记忆 + 项目记忆精简版"段。
 
     user_id 为 None(匿名任务)或无任何配置 → 返回空串(不注入)。
-    repo_url 非空时追加当前项目的记忆精简版(影响 checklist 生成与评估覆盖度)。
-    注入到 agent2 system prompt 末尾,影响评判标准与 checklist 生成。
+    repo_url 非空时追加当前项目的记忆精简版(影响审查维度与评估覆盖度)。
+    注入到 agent2 system prompt 末尾,影响评判标准与审查维度。
 
     agent2 不在沙箱,无法 read_file 查阅完整记忆,故只注入精简版
     (memory_summary;为空回退 memory_content 截断)。
@@ -54,7 +54,7 @@ def build_agent2_memory_section(
     )
     if pref and pref.user_profile and pref.user_profile.strip():
         parts.append(
-            "## User Profile (follow when generating checklist and evaluation)\n"
+            "## User Profile (follow when evaluating and defining review dimensions)\n"
             + _truncate(pref.user_profile.strip(), MAX_PREF_CHARS)
         )
 
@@ -63,11 +63,11 @@ def build_agent2_memory_section(
     if mem and mem.content and mem.content.strip():
         parts.append(
             "The following is long-term memory accumulated across tasks, "
-            "organized by category (follow when generating checklist and evaluation):\n"
+            "organized by category (follow when evaluating and defining review dimensions):\n"
             + _truncate(mem.content.strip(), MAX_GLOBAL_MEM_CHARS)
         )
 
-    # 项目记忆精简版(影响 checklist 生成与评估覆盖度;agent2 不在沙箱,只注入精简版)
+    # 项目记忆精简版(影响审查维度与评估覆盖度;agent2 不在沙箱,只注入精简版)
     if repo_url:
         norm = normalize_repo_url(repo_url)
         if norm:
@@ -89,7 +89,7 @@ def build_agent2_memory_section(
                     parts.append(
                         "The following is a summary of known issues and historical "
                         "memory for this project, organized by category "
-                        "(reference when generating checklist and evaluation coverage):\n"
+                        "(reference when evaluating and defining review dimensions):\n"
                         + summary
                     )
 

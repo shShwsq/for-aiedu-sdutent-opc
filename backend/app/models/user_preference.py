@@ -1,7 +1,7 @@
 """User Profile (per-user, 1:1)
 
 用户级的稳定倾向(自由文本 Markdown),注入 agent2 的 system prompt,
-影响评判标准与 checklist 生成。
+影响评判标准与审查维度。
 
 设计:
 - 1:1 表(user_id unique),用户首次保存时 get_or_create

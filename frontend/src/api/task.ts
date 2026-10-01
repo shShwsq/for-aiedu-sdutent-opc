@@ -6,14 +6,9 @@
  */
 import client from './client'
 import type {
-  AnswerRequest,
-  AnswerResponse,
-  ChecklistDimension,
-  PendingQuestion,
   Scenario,
   SendMessageRequest,
   SendMessageResponse,
-  TaskCoverage,
   TaskCreateRequest,
   CommandConfirmEventData,
   CommandConfirmRequest,
@@ -65,16 +60,6 @@ export function getTask(taskId: string): Promise<TaskDetail> {
 }
 
 /**
- * 查询任务覆盖度看板数据
- *
- * 仅当任务有 checklist(agent2 第 0 轮动态生成)时可用(404 表示无看板)。
- * 返回各维度覆盖状态,基于最新一条 agent2 evaluation。
- */
-export function getTaskCoverage(taskId: string): Promise<TaskCoverage> {
-  return client.get(`/tasks/${taskId}/coverage`).then((r) => r.data)
-}
-
-/**
  * 下载任务报告(Markdown 格式,触发浏览器下载)
  *
  * 后端返回 text/markdown 附件。
@@ -100,65 +85,6 @@ export function getTaskReportHtml(taskId: string): Promise<string> {
       responseType: 'text',
       transformResponse: [(x) => x],
     })
-    .then((r) => r.data)
-}
-
-// ============================================================
-// 阶段 8:用户澄清(agent2 向用户提问)
-// ============================================================
-
-/**
- * 查询任务当前待回答的问题
- *
- * 用于刷新页面后恢复提问弹窗。无待回答问题时返回 null。
- */
-export function getPendingQuestion(taskId: string): Promise<PendingQuestion | null> {
-  return client.get(`/tasks/${taskId}/pending_question`).then((r) => r.data)
-}
-
-/**
- * 提交用户对澄清问题的答案
- *
- * 后端唤醒阻塞的后台线程,把答案拼回 user_intent 重新评估。
- * 返回 accepted=false 表示任务已结束 / 重复提交 / 状态异常。
- */
-export function submitTaskAnswer(
-  taskId: string,
-  req: AnswerRequest,
-): Promise<AnswerResponse> {
-  return client.post(`/tasks/${taskId}/answer`, req).then((r) => r.data)
-}
-
-// ============================================================
-// 覆盖度清单:agent2 动态生成 → 用户编辑确认
-// ============================================================
-
-/**
- * 查询任务当前待确认的覆盖度清单
- *
- * 用于刷新页面后恢复清单确认弹窗。无待确认清单时返回 null。
- * 后端 agent2 第 0 轮动态生成 checklist 后会推送 checklist_review SSE 事件,
- * 若 SSE 事件在连接前已错过,通过此接口拉取当前待确认清单。
- */
-export function getPendingChecklist(taskId: string): Promise<ChecklistDimension[] | null> {
-  return client.get(`/tasks/${taskId}/pending_checklist`).then((r) => r.data)
-}
-
-/**
- * 提交用户编辑后的覆盖度清单
- *
- * - 传 null:直接采用 agent2 生成的清单(用户不编辑)
- * - 传数组:用户编辑后的清单(增删改维度或检查项)
- *
- * 后端唤醒阻塞的后台线程,把确认后的清单落库并继续评估。
- * 返回 accepted=false 表示任务已结束 / 重复提交 / 状态异常。
- */
-export function submitTaskChecklist(
-  taskId: string,
-  checklist: ChecklistDimension[] | null,
-): Promise<{ accepted: boolean; message: string }> {
-  return client
-    .post(`/tasks/${taskId}/checklist`, { checklist })
     .then((r) => r.data)
 }
 

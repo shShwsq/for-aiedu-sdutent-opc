@@ -1,26 +1,20 @@
 """双智能体协作编排器(阶段 4)
 
-驱动 agent2 + react_agent 多轮协作:
-1. agent2 初始评估,动态生成覆盖度清单(checklist)+ 给出第一轮指令
-2. 用户编辑确认 checklist(orchestrator 阻塞等待)
-3. react_agent 执行第一轮(含 clone),输出自然语言总结
-4. agent2 对照 checklist 评估 react_agent 结果
-5. 若未覆盖完整,agent2 构造追问
-6. react_agent 执行追问(不重新 clone)
-7. 循环 4-6 直到 done 或达到 MAX_ROUNDS
-8. agent2 done=true 时,输出结构化结果(results + grouping),orchestrator 落库
+驱动 react_agent + agent2 多轮协作:
+1. react_agent 直接按用户意图执行第一轮(含 clone),输出自然语言总结
+   (任务开始时不再有 agent2 初始评估/覆盖度清单确认/澄清提问)
+2. agent2 质检 react_agent 结果(自行确定审查维度,标注 covered/missing)
+3. 若未覆盖完整,agent2 构造追问
+4. react_agent 执行追问(不重新 clone)
+5. 循环 2-4 直到 done 或达到 MAX_ROUNDS
+6. agent2 done=true 时,输出结构化结果(results + grouping),orchestrator 落库
 
 场景降级后的变更:
-- checklist 不再从场景读取,由 agent2 第 0 轮动态生成 + 用户编辑确认
+- 覆盖度清单(第 0 轮生成 + 用户确认)机制已移除,agent2 每轮自行确定维度
 - 结果提取不再调 scenario.extract_results,改为直接取 ua_result["results"]
 - 结果分组不再从场景声明,改为从 ua_result["grouping"] 读取
 - allowed_skills 传给 react_agent(set_current_task),按用户选择过滤 skill
-
-阶段 8(用户澄清):第 0 轮初始评估时,agent2 可输出 ask_user=true
-触发用户澄清弹窗。orchestrator 推送 question 事件,后台线程阻塞等待
-用户提交答案;答案拼回 user_intent 重新调 agent2。最多 MAX_ASKS 轮提问。
 """
-import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -29,17 +23,13 @@ from sqlalchemy.orm import Session
 
 from app.agents.executor_agent import get_executor
 from app.agents.agent2 import (
-    MAX_ASKS,
     MAX_ROUNDS,
-    SUPPLEMENT_QUESTION,
     run_agent2,
 )
 from app.clone_skip import clear_skip_state
 from app.config import settings
 from app.domain_events import (
     AGENT1_ROUND_COMPLETED,
-    CHECKLIST_CONFIRMED,
-    QUESTION_RAISED,
     TASK_COMPLETED,
     TASK_FAILED,
     TASK_STARTED,
@@ -55,14 +45,6 @@ from app.perf import perf_log
 from app.security import decrypt_secret
 from app.tools import sandbox_tools
 from app.tools.schema import set_current_git_tokens, set_current_task
-from app.user_interaction import (
-    clear_pending_checklist,
-    clear_pending_question,
-    set_pending_checklist,
-    set_pending_question,
-    wait_for_answers,
-    wait_for_checklist_confirmation,
-)
 from app.agent_policy import resolve_agent_policy
 from app.user_messages import clear_user_messages
 from app.user_interaction import clear_pending_command_confirm, clear_pending_verify_action
@@ -150,9 +132,6 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
     if params.get("upload_id"):
         user_intent += "\n交付物来源:用户上传的文件(已就绪在任务工作区,无需 clone)"
 
-    # 阶段 8:用户澄清后的意图会拼到这个变量,作为 agent2 后续评估的输入
-    effective_intent = user_intent
-
     # react_agent 历轮结果摘要(给 agent2 评估用)
     react_summaries: list[dict] = []
     all_results_count = 0
@@ -167,10 +146,7 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
     try:
         # ---------- 预处理:若用户选了仓库,主动 clone + list_files ----------
         # 把仓库结构和 repo_path 提前准备好:
-        #   - 注入 agent2 第 0 轮:看到结构后能给更精准的初始指令/提问
         #   - 注入 react_agent 第 1 轮:跳过自主 clone,直接开始审计
-        # 修复 9:repo_context 不再拼到 effective_intent(避免膨胀所有轮次的
-        #   agent2 输入),改为单独传参给 round 0 的 agent2 调用
         # clone 失败不再让整个任务 failed:降级返回 (None, ""),回到
         #   react_agent 自主 clone 路径(有 LLM 重试/自适应,成功率更高)
         _t0 = time.perf_counter()
@@ -243,7 +219,7 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
             # 立即标记总线结束(不等 finally):任务已完成,后续 publish 静默丢弃。
             # 提前标记可消除竞态 —— 若等 finally 再标记,用户在此期间发追问会触发
             # reset_task_bus(清 _finished),随后 finally 的 finish_task 又把它重新置 True,
-            # resume 线程后续 publish 全被丢弃(checklist_review 弹窗丢失、任务卡死)。
+            # resume 线程后续 publish 全被丢弃(对话/状态事件丢失、任务卡死)。
             finish_task(task.id)
             normal_completed = True
 
@@ -276,122 +252,10 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
 
             return  # 单 agent 模式结束,finally 块仍会执行清理
 
-        # ---------- 第 0 轮:agent2 初始评估(含用户澄清循环) ----------
-        task.current_stage = "agent2 初始评估"
-        db.commit()
-        _publish_status(task)
-
-        ua_result_0: dict | None = None
-        ask_round = 0
-        while True:
-            _t0 = time.perf_counter()
-            ua_result_0 = run_agent2(
-                effective_intent, [],
-                task_id=task.id, db=db, round_idx=0,
-                scenario_id=scenario_id,
-                client=llm_client,
-                ask_round=ask_round,
-                repo_context=repo_context,  # 修复 9:仅 round 0 注入,不膨胀 effective_intent
-                user_id=task.user_id,
-                repo_url=(task.params or {}).get("repo_url"),
-                task=task,
-                agent_policy=agent_policy,
-                repo_path=repo_path,  # round 0 用预克隆结果;agent2 据此启用只读核查工具
-            )
-            perf_log(task.id, "ua_eval", time.perf_counter() - _t0, round_idx=0)
-
-            # agent2 没请求提问 → 提问循环结束,进入协作阶段
-            if not ua_result_0.get("ask_user"):
-                _record_agent2(db, task, 0, ua_result_0, ask_round=ask_round)
-                break
-
-            # ask_user=true:若已达提问上限(agent2.py 已强制 ask_user=false,
-            # 这里是兜底),强制关闭并记录
-            if ask_round >= MAX_ASKS:
-                logger.warning(
-                    f"[task={task.id}] agent2 在 ask_round={ask_round} 仍试图提问,"
-                    f"已达上限,强制关闭"
-                )
-                ua_result_0["ask_user"] = False
-                if not ua_result_0.get("followup_query"):
-                    ua_result_0["followup_query"] = effective_intent
-                _record_agent2(db, task, 0, ua_result_0, ask_round=ask_round)
-                break
-
-            # 推送提问并阻塞等待用户答案
-            questions = list(ua_result_0.get("questions") or [])
-            # 追加固定的"是否有其他补充"问题(最后一题)
-            questions.append(dict(SUPPLEMENT_QUESTION))
-
-            _handle_ask_user(db, task, ask_round, questions, ua_result_0)
-
-            # 阻塞后台线程,直到用户提交答案(无限等待)
-            answers = wait_for_answers(task.id)
-            if not answers:
-                # 答案为空(任务被取消或清理),结束提问循环,用最后一次结果兜底
-                logger.warning(f"[task={task.id}] 用户答案为空,结束提问循环")
-                if not ua_result_0.get("followup_query"):
-                    ua_result_0["followup_query"] = effective_intent
-                # 不记录 ask_user=true 的评估,直接退出
-                break
-
-            # 把答案格式化为文本,拼到 effective_intent,让 agent2 重新评估
-            answer_text = _format_user_answers(questions, answers)
-            if answer_text:
-                effective_intent = user_intent + answer_text
-            # 注意:answer 落库已移到 API 端点(submit_task_answer → _record_answer)
-            # 同步执行,确保刷新时数据库已有记录。此处不再重复落库。
-            ask_round += 1
-            # 继续循环:再调 agent2 评估,可能再次 ask_user 或给出 followup_query
-
-        # 兜底:若因异常路径 ua_result_0 为 None,用用户意图作 followup
-        if ua_result_0 is None:
-            ua_result_0 = {
-                "covered": [],
-                "missing": [],
-                "reasoning": "agent2 未返回有效结果,兜底使用用户原始意图",
-                "followup_query": effective_intent,
-                "done": False,
-                "ask_user": False,
-            }
-
-        # ---------- 场景降级后:agent2 第 0 轮动态生成 checklist,用户编辑确认 ----------
-        # agent2 在 round 0 输出 checklist 字段(动态生成的覆盖度维度)。
-        # orchestrator 推送给前端,阻塞等待用户编辑或"直接采用"。
-        # 确认后的 checklist 落库到 task.checklist,后续协作轮 agent2 按此评估。
-        generated_checklist = ua_result_0.get("checklist")
-        task_checklist: list[dict] | None = None
-        if generated_checklist and isinstance(generated_checklist, list):
-            task.current_stage = "等待用户确认覆盖度清单"
-            db.commit()
-            _publish_status(task)
-
-            # 推送 checklist 给前端,并阻塞等待用户确认
-            set_pending_checklist(task.id, generated_checklist)
-            publish(task.id, "checklist_review", {
-                "checklist": generated_checklist,
-                "reasoning": ua_result_0.get("reasoning", ""),
-            })
-
-            # 阻塞后台线程,直到用户提交编辑/直接采用(无限等待)
-            task_checklist = wait_for_checklist_confirmation(task.id)
-
-            # 落库到 task.checklist
-            task.checklist = task_checklist
-            db.commit()
-            logger.info(
-                f"[task={task.id}] 覆盖度清单已确认,{len(task_checklist)} 个维度"
-            )
-            # 领域事件:意图对齐完成(用户确认 checklist 并落库)
-            emit(
-                CHECKLIST_CONFIRMED, task.id,
-                dimensions=len(task_checklist),
-                edited=(task_checklist != generated_checklist),
-            )
-
-        followup = ua_result_0.get("followup_query", effective_intent)
-
-        # ---------- 协作循环 ----------
+        # ---------- 协作循环(任务开始时无 agent2 初始评估,agent1 直接执行) ----------
+        # 第 1 轮 react_agent 直接按用户意图执行(followup_query=None),
+        # agent2 从第 1 轮执行完成后才开始质检。
+        followup = user_intent
         for round_idx in range(1, max_rounds + 1):
             # 暂停检查点:每轮开始前(粗粒度,react_agent 内部还有细粒度检查点)
             wait_if_paused(task.id)
@@ -445,12 +309,10 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
 
             _t0 = time.perf_counter()
             ua_result = run_agent2(
-                effective_intent, react_summaries,
+                user_intent, react_summaries,
                 task_id=task.id, db=db, round_idx=round_idx,
                 scenario_id=scenario_id,
                 client=llm_client,
-                ask_round=MAX_ASKS,  # 协作循环阶段不允许再提问
-                task_checklist=task_checklist,  # 场景降级后:传已确认的 checklist
                 user_id=task.user_id,
                 repo_url=(task.params or {}).get("repo_url"),
                 task=task,
@@ -589,16 +451,6 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         except Exception as diff_err:
             logger.warning(f"[task={task.id}] 失败时捕获工作区产物失败(忽略): {diff_err}")
     finally:
-        # 阶段 8:清理可能残留的待回答问题状态
-        try:
-            clear_pending_question(task.id)
-        except Exception as cleanup_err:
-            logger.warning(f"[task={task.id}] 清理待回答问题失败: {cleanup_err}")
-        # 场景降级后:清理可能残留的待确认 checklist 状态
-        try:
-            clear_pending_checklist(task.id)
-        except Exception as cleanup_err:
-            logger.warning(f"[task={task.id}] 清理待确认清单失败: {cleanup_err}")
         # 清理暂停状态(防止任务结束时仍有 in-memory 残留)
         try:
             clear_pause_state(task.id)
@@ -652,160 +504,18 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
 
 
 # ============================================================
-# 阶段 8:用户澄清处理
-# ============================================================
-
-
-def _handle_ask_user(
-    db: Session,
-    task: Task,
-    ask_round: int,
-    questions: list[dict],
-    ua_result: dict,
-) -> bool:
-    """处理 agent2 的 ask_user 请求
-
-    1. 落库 agent2 的提问(Conversation: role=agent2, type=question)
-    2. 设置 pending question(供 API 端点 / 前端恢复查询)
-    3. 推送 question 事件给前端 SSE
-    4. 更新任务状态为"等待用户回答"
-    5. 阻塞等待用户答案(本函数不阻塞,只是设置 pending;实际阻塞在调用方的
-       wait_for_answers)
-
-    返回 True 表示已设置 pending,调用方应继续 wait_for_answers;
-    返回 False 表示不应等待(异常情况)。
-    """
-    reasoning = ua_result.get("reasoning", "")
-
-    # 1. 落库提问(agent2 → 用户)
-    question_payload = {
-        "ask_round": ask_round,
-        "questions": questions,
-        "reasoning": reasoning,
-    }
-    # content 用简短文本(便于对话流显示),完整 questions 放 reasoning 字段(JSON)
-    short_content = (
-        f"[第 {ask_round + 1} 次澄清提问] "
-        f"问了 {len(questions) - 1} 个问题 + 1 个补充问题"
-    )
-    conv = Conversation(
-        task_id=task.id,
-        round_idx=0,
-        role="agent2",
-        type="question",
-        content=short_content,
-        reasoning=json.dumps(question_payload, ensure_ascii=False),
-    )
-    db.add(conv)
-    db.commit()
-    db.refresh(conv)
-    # 推送 conversation 事件(让前端在对话流里看到提问记录)
-    publish(task.id, "conversation", {
-        "id": str(conv.id),
-        "round_idx": conv.round_idx,
-        "role": conv.role,
-        "type": conv.type,
-        "content": conv.content,
-        "reasoning": conv.reasoning,
-        "created_at": conv.created_at.isoformat() if conv.created_at else None,
-    })
-
-    # 2. 设置 pending question(API 端点和前端恢复弹窗都从这里读)
-    set_pending_question(task.id, question_payload)
-
-    # 3. 推送 question 事件(前端收到后弹出 QuestionDialog)
-    publish(task.id, "question", {
-        "ask_round": ask_round,
-        "questions": questions,
-        "reasoning": reasoning,
-        "conversation_id": str(conv.id),
-    })
-    # 领域事件:agent2 发起澄清提问
-    emit(
-        QUESTION_RAISED, task.id,
-        ask_round=ask_round, question_count=len(questions),
-        conversation_id=str(conv.id),
-    )
-
-    # 4. 更新任务状态
-    task.current_stage = f"等待用户回答澄清问题(第 {ask_round + 1} 次)"
-    db.commit()
-    _publish_status(task)
-
-    return True
-
-
-def _format_user_answers(
-    questions: list[dict],
-    answers: list[dict],
-) -> str:
-    """把用户答案格式化为文本,拼到 user_intent 后面
-
-    格式:
-        [用户澄清]
-        Q1: <问题文本>
-        A1: <答案文本>
-
-        Q2: <问题文本>
-        A2: <答案文本>
-        ...
-    """
-    # 按 question_id 索引答案
-    answer_map: dict[str, dict] = {}
-    for a in answers:
-        qid = a.get("question_id")
-        if qid:
-            answer_map[qid] = a
-
-    lines = ["\n\n[用户澄清]"]
-    for i, q in enumerate(questions, 1):
-        qid = q.get("id", f"q_{i}")
-        q_text = q.get("question", f"问题 {i}")
-        a = answer_map.get(qid)
-        if a is None:
-            continue
-        value = a.get("value")
-        if value is None or value == "":
-            continue
-        # 多选答案(value 是 list)拼接为逗号分隔
-        if isinstance(value, list):
-            value_text = ", ".join(str(v) for v in value)
-        else:
-            value_text = str(value)
-        # 跳过空补充
-        if qid == "_supplement" and not value_text.strip():
-            continue
-        lines.append(f"Q{i}: {q_text}")
-        lines.append(f"A{i}: {value_text}")
-        lines.append("")
-
-    # 若没有任何有效答案,返回空字符串(不拼)
-    if len(lines) <= 2:
-        return ""
-
-    return "\n".join(lines)
-
-
-# 注意:用户答案落库(_record_user_answer)已迁移到 API 端点
-# submit_task_answer → _record_answer,同步执行,确保刷新时数据库已有记录。
-
-
-# ============================================================
 # 辅助:记录 agent2 的对话
 # ============================================================
 
 
 def _record_agent2(
     db: Session, task: Task, round_idx: int, ua_result: dict,
-    ask_round: int | None = None,
 ) -> None:
     """把 agent2 的输出记录到 Conversation 表
 
     - content:精简显示,只放追问内容(前端默认展示)
     - reasoning:完整评估(覆盖情况/判断/追问/done),用于刷新页面后回看
     react_agent 接收追问是通过函数参数传递的,不依赖 Conversation 表。
-
-    ask_round:第 0 轮提问循环的轮次(阶段 8)。None 表示非提问循环。
     """
     # 标记已记录(供 orchestrator 兜底逻辑判断)
     ua_result["_recorded"] = True
@@ -815,14 +525,10 @@ def _record_agent2(
     reasoning_text = ua_result.get("reasoning", "")
     followup = ua_result.get("followup_query", "")
     done = ua_result.get("done", False)
-    ask_user = ua_result.get("ask_user", False)
 
     # 精简 content:只显示追问
     if done:
         content = "评估完成,无需追问"
-    elif ask_user:
-        questions = ua_result.get("questions") or []
-        content = f"请求用户澄清({len(questions)} 个问题)"
     elif followup:
         content = followup
     else:
@@ -830,21 +536,13 @@ def _record_agent2(
 
     # 完整评估 reasoning(可折叠回看)
     full_eval = (
-        f"[agent2 第 {round_idx} 轮评估"
-        + (f", ask_round={ask_round}" if ask_round is not None else "")
-        + "]\n"
+        f"[agent2 第 {round_idx} 轮评估]\n"
         f"已覆盖: {covered}\n"
         f"未覆盖: {missing}\n"
         f"判断: {reasoning_text}\n"
     )
-    if ask_user:
-        full_eval += f"→ 请求用户澄清({len(ua_result.get('questions') or [])} 个问题)\n"
     if followup:
         full_eval += f"追问: {followup}\n"
-    # 追问清单更新(round_idx>0 时 agent2 附带更新后 checklist):落库标记便于追溯
-    # (第 0 轮 checklist 是首次生成,另有确认机制,不在此标记)
-    if round_idx > 0 and isinstance(ua_result.get("checklist"), list) and ua_result["checklist"]:
-        full_eval += f"→ 更新覆盖度清单({len(ua_result['checklist'])} 个维度)\n"
     if done:
         full_eval += "→ 宣布完成\n"
 
@@ -1014,7 +712,6 @@ def _prepare_repo_context(
     无匹配则只试 SSH + 匿名 HTTPS)。
 
     repo_context 会注入:
-      - agent2 第 0 轮(拼到 effective_intent):看到结构给更准初始指令
       - react_agent 第 1 轮(传 repo_context 参数):跳过自主 clone 直接审计
 
     主动 clone 复用 sandbox_tools 的 session 管理,完成后 react_agent / workspace
@@ -1325,29 +1022,6 @@ def _restore_workspace_if_needed(
 # ============================================================
 
 
-def _checklist_changed(
-    old: list[dict] | None, new: list[dict],
-) -> bool:
-    """判断 agent2 输出的 checklist 与现有清单是否有实质差异
-
-    逐维度比较 id + name + description + 子项,任一不同即视为变更。
-    用于追问清单更新时避免 agent2 输出与原清单相同的 checklist
-    触发无意义的确认弹窗。
-    """
-    def _norm(cl: list[dict] | None) -> list[tuple]:
-        return [
-            (
-                str(d.get("id", "")),
-                str(d.get("name", "")),
-                str(d.get("description", "")),
-                [str(x) for x in (d.get("checklist") or [])],
-            )
-            for d in (cl or [])
-            if isinstance(d, dict)
-        ]
-    return _norm(old) != _norm(new)
-
-
 def resume_audit_with_message(
     task: Task, db: Session, user_message: str, retry: bool = False,
 ) -> None:
@@ -1358,10 +1032,10 @@ def resume_audit_with_message(
 
     流程:
     1. task.status: COMPLETED/FAILED → RUNNING
-    2. 加载历史上下文(react_summaries / task_checklist / LLM 配置)
+    2. 加载历史上下文(react_summaries / LLM 配置)
     3. 起始 round_idx:用户追加消息时复用消息所在轮(消息与首轮 react 执行
        同轮,不隔轮);失败重试时从 max+1 续接新轮
-    4. 先调 agent2 分析用户消息(对照已有 checklist,输出 followup_query)
+    4. 先调 agent2 分析用户消息(输出 followup_query)
     5. 启动协作循环(react_agent + agent2 评估),最多 MAX_RESUME_ROUNDS 轮;
        分析评估与首轮 react 执行共享起始 round_idx,不单独占轮
     6. done 或达到上限时结束,task.status → COMPLETED
@@ -1406,7 +1080,6 @@ def resume_audit_with_message(
         f"[task={task.id}] resume agent2_enabled={ua_enabled}"
     )
 
-    task_checklist = task.checklist
     react_summaries = _load_react_summaries(db, task.id)
     # 重启时不复用旧 plan(让 LLM 根据新消息重新规划)
     current_plan: list[dict] = []
@@ -1501,60 +1174,17 @@ def resume_audit_with_message(
             effective_intent, react_summaries,
             task_id=task.id, db=db, round_idx=start_round_idx,
             scenario_id=task.scenario, client=llm_client,
-            ask_round=MAX_ASKS,  # 重启不允许提问
-            task_checklist=task_checklist,
             user_id=task.user_id,
             repo_url=(task.params or {}).get("repo_url"),
             task=task,
             agent_policy=agent_policy,
-            # 追问清单更新模式:仅用户追问启用(重试续跑不是新需求,不更新清单)
-            checklist_update_mode=not retry,
             repo_path=cur_repo_path,
         )
         perf_log(task.id, "ua_eval", time.perf_counter() - _t0, round_idx=start_round_idx, phase="analyze_message")
 
         # 流式调用降级标记(agent2 重试仍失败时返回 degraded=true):
-        # 跳过清单确认环节,直接把用户输入内容交给 react_agent 执行
+        # 直接把用户输入内容交给 react_agent 执行
         degraded = bool(ua_result.get("degraded"))
-
-        # ---------- 追问清单更新:agent2 输出更新后 checklist,再次向用户确认 ----------
-        # 复用第 0 轮的确认机制(set_pending_checklist → checklist_review 事件 →
-        # 阻塞等待)。确认后的清单覆写 task.checklist,后续 resume 循环评估按新清单。
-        # 在 _record_agent2 之前处理,确保落库的评估反映最终 done 状态。
-        if not degraded and not retry:
-            updated_checklist = ua_result.get("checklist")
-            if isinstance(updated_checklist, list):
-                # 过滤畸形条目(至少需有 id)
-                updated_checklist = [
-                    d for d in updated_checklist
-                    if isinstance(d, dict) and d.get("id")
-                ]
-            else:
-                updated_checklist = []
-            if updated_checklist and _checklist_changed(task.checklist, updated_checklist):
-                task.current_stage = "等待用户确认覆盖度清单更新"
-                db.commit()
-                _publish_status(task)
-
-                set_pending_checklist(task.id, updated_checklist)
-                publish(task.id, "checklist_review", {
-                    "checklist": updated_checklist,
-                    "reasoning": ua_result.get("reasoning", ""),
-                })
-
-                # 阻塞后台线程,直到用户提交编辑/直接采用(无限等待)
-                confirmed = wait_for_checklist_confirmation(task.id)
-                if confirmed:
-                    # 落库到 task.checklist,后续循环评估用新清单
-                    task.checklist = confirmed
-                    task_checklist = confirmed
-                    db.commit()
-                    logger.info(
-                        f"[task={task.id}] 追问清单更新已确认,{len(confirmed)} 个维度"
-                    )
-                    # 用户确认了新清单,react_agent 必须跑一轮执行追问需求,
-                    # 不允许直接结束(兜底:LLM 可能同时输出 done=true)
-                    ua_result["done"] = False
 
         _record_agent2(db, task, start_round_idx, ua_result)
 
@@ -1610,8 +1240,6 @@ def resume_audit_with_message(
                 effective_intent, react_summaries,
                 task_id=task.id, db=db, round_idx=round_idx,
                 scenario_id=task.scenario, client=llm_client,
-                ask_round=MAX_ASKS,
-                task_checklist=task_checklist,
                 user_id=task.user_id,
                 repo_url=(task.params or {}).get("repo_url"),
                 task=task,
@@ -1673,8 +1301,6 @@ def resume_audit_with_message(
     finally:
         # 清理资源(与 run_dual_agent_audit 对齐)
         for cleanup_fn, name in [
-            (clear_pending_question, "待回答问题"),
-            (clear_pending_checklist, "待确认清单"),
             (clear_pause_state, "暂停状态"),
             (clear_skip_state, "跳过预克隆标志"),
             (clear_user_messages, "用户消息队列"),
@@ -1815,7 +1441,7 @@ def _finish_resume(
     publish(task.id, "done", {"status": "completed"})
     # 立即标记总线结束(不等 resume 线程 finally):与 run_dual_agent_audit 同理,
     # 消除"用户再发新追问触发的 reset_task_bus 被旧线程 finally 的 finish_task 重新覆盖"
-    # 竞态 —— 否则新 resume 线程 publish 全被丢弃(checklist_review 弹窗丢失、任务卡死)。
+    # 竞态 —— 否则新 resume 线程 publish 全被丢弃(对话/状态事件丢失、任务卡死)。
     finish_task(task.id)
     
     # 重启完成:自动归纳写入长期记忆(失败兑底,不影响;client 用默认,归纳是简单任务)

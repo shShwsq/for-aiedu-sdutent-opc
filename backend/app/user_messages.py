@@ -8,8 +8,9 @@
   (resume_audit_with_message),先调 agent2 分析这条消息
 
 设计要点:
-- 与 user_interaction.py 的 _PendingQuestion 不同,这里是"队列"(可累积多条),
-  而非"一次性 Event"(单问单答)。drain 时一次性取出全部并清空。
+- 与 user_interaction.py 的阻塞-唤醒机制(如验证动作授权)不同,这里是
+  "队列"(可累积多条),而非"一次性 Event"(单动作单确认)。
+  drain 时一次性取出全部并清空。
 - 不需要 Event 阻塞:react_agent 在迭代边界主动 drain,有就处理,无就跳过。
   不阻塞 agent 线程,避免影响正常 ReAct 循环。
 - 落库与 SSE 推送由 API 端点同步完成(确保刷新时数据库已有记录),

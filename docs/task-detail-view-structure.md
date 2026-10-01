@@ -161,19 +161,18 @@ RoundGroup { roundIdx, label, segments, planSteps }
 
 ### 5.2 内容区(detail-sidebar-body)自上而下
 
-1. **覆盖度**(task.checklist 存在时置顶):covered/total + 最近评估轮次,维度卡片网格(已覆盖/缺失着色)。
-2. **任务概览**:场景/创建时间/完成时间、当前阶段、错误信息。
+1. **任务概览**:场景/创建时间/完成时间、当前阶段、错误信息。
    不再包含:状态徽标与下载/打印按钮(已移至标题行,见 §5.1)、
    用户意图卡片(不再显示;用户指令仍保留在对话流顶部 userDirective 气泡)。
-3. **动态验证**(配置了测试环境 URL 时):开关、授权模式切换、登录凭证(脱敏);不出现 verifier_agent 字样。
-4. **结果清单**(最底部):按 `task.params._grouping` 动态分组(如按严重度);卡片默认折叠,展开显示 Markdown 正文;文件类 meta 标签可点击打开左侧工作区文件。
+2. **动态验证**(配置了测试环境 URL 时):开关、授权模式切换、登录凭证(脱敏);不出现 verifier_agent 字样。
+3. **结果清单**(最底部):按 `task.params._grouping` 动态分组(如按严重度);卡片默认折叠,展开显示 Markdown 正文;文件类 meta 标签可点击打开左侧工作区文件。
+
+> 历史说明:覆盖度看板(task.checklist 驱动的维度卡片网格)已随覆盖度清单功能移除。
 
 ## 6. 全局弹窗
 
 | 弹窗 | 触发 |
 |---|---|
-| QuestionDialog | agent2 ask_user=true 的澄清提问 |
-| ChecklistReviewDialog | agent2 动态生成覆盖度清单后确认 |
 | VerifyActionDialog | 动态验证 per_action 模式,逐动作授权 |
 | CommandConfirmDialog | local 模式危险命令确认 |
 

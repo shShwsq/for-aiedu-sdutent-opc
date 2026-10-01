@@ -3,7 +3,7 @@
 角色:扮演严谨的质量审查官,质检 agent1(执行智能体,"AI助手")的审查结果。
 按决策文档,agent2 承担三项职责:
 1. 质检审查结果:核实 agent1 的发现是否有真实源码依据、严重度是否合理、
-   有无误报/遗漏关键维度(必要时用只读工具读源码核对)
+   有无误报或遗漏关键维度(必要时用只读工具读源码核对)
 2. 必要时追问补全:针对不足构造 followup_query 让 agent1 再跑一轮
 3. 整理审查报告与结论:覆盖完整、质量合格后输出结构化结果(results +
    grouping)与「敢不敢上线」结论;任务完成后还负责生成练习题与知识点
@@ -14,26 +14,20 @@
   (read_file / list_files / find_files / search_code)核对真实源码,
   以及可选的 verify 工具生成 PoC 动态验证安全问题(经 verifier_agent)
 - 输出结构化 JSON:covered / missing / followup_query / done
-  + round 0 额外输出 checklist(质检基准清单,用户可编辑确认)
   + done=true 时输出 grouping(结果分组声明)与 results(结构化结果)
 - done=true 表示质检通过,agent2 认为任务可以结束
+- 覆盖度清单(初始评估/用户确认)机制已移除:agent2 在每次评估时
+  根据用户意图自行确定应覆盖的审查维度,在 covered/missing 中
+  按维度 id 标注覆盖情况,跨轮记忆保证判断连续性
 
-流程:
-1. 第 0 轮:agent2 根据用户意图生成质检基准 checklist + 初始审查指令
-   → orchestrator 推送 checklist 给用户编辑,阻塞等待
-   → 用户确认后,checklist 落库 task.checklist
-2. agent1 跑一轮,返回 summary
-3. agent2 对照 checklist 质检 agent1 的总结(可读源码核对):
+流程(任务开始时不再有 agent2 初始评估,agent1 直接按用户意图执行):
+1. agent1 跑一轮,返回 summary
+2. agent2 质检 agent1 的总结(可读源码核对):
    - 哪些维度质检通过(covered)/ 哪些维度不合格或缺失(missing)
    - 针对 missing 维度构造 followup_query 追问补全
-4. 若 missing 为空或 done=true,任务结束(done 时输出 results + grouping)
-5. 否则把 followup_query 发给 agent1 再跑一轮
-6. 循环 3-5,最多 MAX_ROUNDS 轮
-
-用户澄清(继承阶段 8 机制):第 0 轮初始评估时,agent2 若认为用户意图
-不清晰,可输出 ask_user=true + questions 列表,orchestrator 推送给前端
-弹窗(选择题 + 填空题),用户填答后拼回 user_intent 重新评估。
-最多 MAX_ASKS 轮提问。
+3. 若 missing 为空或 done=true,任务结束(done 时输出 results + grouping)
+4. 否则把 followup_query 发给 agent1 再跑一轮
+5. 循环 1-4,最多 MAX_ROUNDS 轮
 """
 import json
 import logging
@@ -56,9 +50,6 @@ logger = logging.getLogger(__name__)
 # 最大追问轮次(防止死循环)
 MAX_ROUNDS = 4
 
-# 第 0 轮初始评估时,最多向用户提问的次数(含首次)
-MAX_ASKS = 2
-
 # 跨轮记忆传递:agent2 之前各轮评估的单条最大字符数与总字符数上限
 # 与 agent1 的对应常量保持一致,避免两边不一致
 MAX_HISTORY_MSG_CHARS = 3000
@@ -77,31 +68,6 @@ MAX_READ_TOOL_CALLS = 12
 
 # 单次评估中最多调用 verifier_agent 的次数(防止无限验证)
 MAX_VERIFY_CALLS = 3
-
-# 固定追加的"是否有其他补充"问题(由后端追加,LLM 不负责生成)
-SUPPLEMENT_QUESTION_ID = "_supplement"
-SUPPLEMENT_QUESTION = {
-    "id": SUPPLEMENT_QUESTION_ID,
-    "type": "text",
-    "question": "是否有其他补充?(可选)",
-    "placeholder": "如有其他需求或上下文,请在此填写",
-    "required": False,
-}
-
-# 追问清单更新模式(仅 resume 首次分析用户追加消息时启用):
-# agent2 判断追问是否引入新覆盖维度,需要时在输出中附带更新后的完整 checklist,
-# orchestrator 据此推送给用户再次编辑确认。详见 CHECKLIST_UPDATE_SECTION。
-CHECKLIST_UPDATE_SECTION = """## 本轮附加规则(追问清单更新模式)
-本轮是分析用户的追问消息:任务本已完成,用户又追加了新消息
-(见用户意图中的「[用户追加消息]」段)。除对照 checklist 质检外,你还需:
-1. 判断追问消息是否引入了现有 checklist 中没有的覆盖维度。
-2. 若需要新增维度或调整现有维度:在输出中附带 `checklist` 字段,
-   给出**更新后的完整清单**(保留原有维度,追加新维度;
-   格式与第 0 轮相同: id/name/description/checklist 子项)。
-   此时 done 必须为 false,followup_query 需指导 agent1 执行追问需求。
-3. 若追问消息没有引入任何新需求(仅确认/致谢等):不输出 checklist 字段,
-   可按常规质检,允许 done=true 宣布结束。
-注意:新维度 id 用英文下划线命名;已有维度的 id 保持不变(覆盖度看板按 id 匹配)。"""
 
 # ============================================================
 # agent2 的只读核查工具定义(工作区可用时启用,repo_path 由后端注入)
@@ -255,41 +221,25 @@ AGENT2_SYSTEM_PROMPT = """你是 agent2(质检智能体),扮演一位严谨的�
 你负责质检 agent1(执行智能体)的审查结果,面向"敢不敢用 AI 产出物"的验收目标:
 1. **核实**:agent1 的发现是否有真实源码依据、严重度是否合理、有无误报或夸大;
    有只读工具时必须抽查关键发现对应的真实代码,不要凭 agent1 的说法臆断。
-2. **查漏**:对照质检基准清单,判断是否遗漏了任务应有的关键审查维度。
+2. **查漏**:判断是否遗漏了任务应有的关键审查维度。
 3. **补全**:发现不足时,构造 followup_query 让 agent1 再跑一轮补全。
 4. **结论**:覆盖完整、质量合格后宣布结束,整理结构化审查报告(results),
    并给出「敢不敢上线/敢不敢用」的明确结论(放进 reasoning)。
 
-## 质检基准清单(checklist)
-{checklist_section}
+## 质检基准维度
+本任务没有预定义的覆盖度清单。你需要根据用户意图自行确定本任务
+**应覆盖哪些审查维度**(3-8 个为宜,维度 id 用英文下划线命名,如
+injection / readability / contract_terms),并在 reasoning 中简要说明
+你采用的维度。后续各轮保持维度 id 稳定,保证覆盖判断可跨轮延续。
 
 ## 工作流程
-1. **第 0 轮(初始评估)**:根据用户意图,生成质检基准清单(checklist),
-   定义本任务应覆盖哪些审查维度及合格标准。同时输出初始 followup_query
-   指导 agent1 第一轮执行。
-2. **协作轮(第 1 轮起)**:对照 checklist 质检 agent1 的总结,
+1. **协作轮(每轮)**:对照你确定的审查维度质检 agent1 的总结,
    标记质检通过(covered)和不合格/缺失(missing)的维度,
    针对未通过维度构造 followup_query 追问补全。
-3. **结束**:所有维度质检通过(done=true)或已达最大轮次时,
+2. **结束**:所有维度质检通过(done=true)或已达最大轮次时,
    整理结构化结果(results)并声明结果分组方式(grouping)。
 
 ## 输出格式(严格 JSON)
-
-### 第 0 轮(初始评估)输出:
-```json
-{
-  "checklist": [
-    {"id": "dim_id", "name": "维度名称", "description": "维度说明", "checklist": ["子项1", "子项2"]}
-  ],
-  "covered": [],
-  "missing": [],
-  "reasoning": "生成 checklist 的理由 + 初始指令说明",
-  "followup_query": "给 agent1 的初始执行指令",
-  "done": false,
-  "ask_user": false,
-  "questions": []
-}
-```
 
 ### 协作轮输出:
 ```json
@@ -298,9 +248,7 @@ AGENT2_SYSTEM_PROMPT = """你是 agent2(质检智能体),扮演一位严谨的�
   "missing": ["dim_id2"],
   "reasoning": "质检结论:为什么这些维度通过,那些未通过(含核实依据/误报判断)",
   "followup_query": "针对 missing 维度的追问补全指令(空字符串若 done)",
-  "done": false,
-  "ask_user": false,
-  "questions": []
+  "done": false
 }
 ```
 
@@ -312,8 +260,6 @@ AGENT2_SYSTEM_PROMPT = """你是 agent2(质检智能体),扮演一位严谨的�
   "reasoning": "最终质检结论(含「敢不敢上线/敢不敢用」的明确判断)",
   "followup_query": "",
   "done": true,
-  "ask_user": false,
-  "questions": [],
   "results": [
     {"title": "结果标题", "content": "结果详细内容", "metadata": {"自定义字段": "值"}}
   ],
@@ -347,21 +293,10 @@ grouping 可为 null(不分组,平铺展示)。非 null 时各字段说明:
 - 文件名/模块名/标签等开放集合 → 用 `dynamic`
 - 不确定是否固定 → 用 `dynamic`(更安全)
 
-### questions 问题对象格式(ask_user=true 时):
-```json
-"questions": [
-  {"type": "text", "question": "问题文本(必填,放 question 字段)", "placeholder": "输入提示(可选)", "required": false},
-  {"type": "choice", "question": "问题文本", "options": [{"value": "val1", "label": "选项显示名"}], "multi": false}
-]
-```
-注意:不需要输出 id(系统自动生成);问题文本必须放在 question 字段。
-
-## checklist 生成原则(第 0 轮)
+## 审查维度确定原则
 - 根据用户意图自适应:代码审查任务覆盖安全漏洞/隐性成本(失控 API 调用、
   死循环烧钱逻辑)/可维护性/能否交付上线等维度,合同任务覆盖权责对等/
   付款违约/知识产权/霸王条款等维度,其他任务按语义生成。
-- 3-8 个维度为宜,每个维度含 3-6 个子项(checklist)。
-- 维度 id 用英文下划线命名(如 injection / readability),name 用中文。
 - 维度应覆盖该任务类型的主要风险点,不遗漏重要类别。
 
 ## 质检原则(协作轮)
@@ -409,29 +344,6 @@ grouping 可为 null(不分组,平铺展示)。非 null 时各字段说明:
 - 不要对每个发现都验证,只验证关键的、不确定的;已明确的问题不需要验证
 - 验证结果应反映在 results 的 metadata 中(如加 verified: true/false 字段)
 """
-
-
-def _format_checklist_for_prompt(checklist: list[dict[str, Any]] | None) -> str:
-    """把已确认的 checklist 格式化成 prompt 友好的文本
-
-    协作轮(round_idx>=1)使用:从 task.checklist 读取已确认的清单注入 prompt。
-    第 0 轮时 checklist 为 None,prompt 提示 LLM 自行生成。
-    """
-    if not checklist:
-        return (
-            "本轮尚未有 checklist。请你根据用户意图**动态生成**质检基准清单,\n"
-            "定义本任务应覆盖哪些维度(3-8 个),每个维度含子项。"
-        )
-    lines = ["以下是已确认的质检基准清单(用户可能已编辑),你需对照它质检覆盖情况:"]
-    for cat in checklist:
-        lines.append(f"- id: {cat.get('id', '?')}, 名称: {cat.get('name', '?')}")
-        lines.append(f"  描述: {cat.get('description', '')}")
-        items = cat.get("checklist", [])
-        if items:
-            lines.append("  子项:")
-            for item in items:
-                lines.append(f"    * {item}")
-    return "\n".join(lines)
 
 
 # ============================================================
@@ -511,17 +423,13 @@ def run_agent2(
     agent1_summaries: list[dict[str, Any]],
     task_id: UUID | str,
     db: Session | None = None,
-    round_idx: int = 0,
+    round_idx: int = 1,
     scenario_id: str = "general",
     client: LLMClient | None = None,
-    ask_round: int = 0,
-    repo_context: str | None = None,
-    task_checklist: list[dict[str, Any]] | None = None,
     user_id: UUID | None = None,
     repo_url: str | None = None,
     task: Task | None = None,
     agent_policy: dict[str, Any] | None = None,
-    checklist_update_mode: bool = False,
     repo_path: str | None = None,
 ) -> dict[str, Any]:
     """执行一次 agent2 质检评估
@@ -534,17 +442,10 @@ def run_agent2(
         task_id: 任务 ID(必填,用于推送 thinking_delta 事件)
         db: 数据库会话(可选)。传入时用于加载 agent2 自己之前各轮的评估记录,
             让 agent2 跨轮记住 covered/missing 判断,避免反复摇摆。
-        round_idx: 当前协作轮次(0=初始评估,1+=协作轮)
-        scenario_id: 场景标识(仅作模板标识,不再驱动 prompt/checklist)
-        ask_round: 第 0 轮初始评估时的提问轮次(0=首次评估,1=用户回答后重新评估)
-        repo_context: 第 0 轮专用,orchestrator 主动准备的工作区结构上下文。
-        task_checklist: 已确认的质检基准清单(从 task.checklist 读取)。
-            round_idx=0 时传 None(LLM 动态生成);round_idx>=1 时传已确认清单。
+        round_idx: 当前协作轮次(从 1 起,agent1 执行后的评估轮)
+        scenario_id: 场景标识(仅作模板标识,不再驱动 prompt)
         task: 任务对象(可选)。传入时用于读取 verifier 配置(test_env_url / verifier_enabled)。
         agent_policy: agent 策略(可选)。含 allow_verify 开关,控制是否启用 verify 工具。
-        checklist_update_mode: 追问清单更新模式(可选)。仅 resume 首次分析用户追加
-            消息时启用:agent2 判断追问是否引入新覆盖维度,需要时在输出中附带
-            更新后的完整 checklist,orchestrator 据此推送给用户再次编辑确认。
         repo_path: 任务工作区路径(可选)。传入时启用只读核查工具,
             agent2 可读真实源码核对 agent1 的发现。
 
@@ -555,20 +456,11 @@ def run_agent2(
             "reasoning": str,
             "followup_query": str,
             "done": bool,
-            "ask_user": bool,
-            "questions": [...],
-            "checklist": [...],         # 仅 round 0 输出(动态生成)
             "results": [...],           # 仅 done=true 时输出
             "grouping": {...} | null,    # 仅 done=true 时输出
         }
     """
-    # 用通用 prompt,checklist 从 task_checklist 注入
-    checklist_text = _format_checklist_for_prompt(task_checklist)
-    system_prompt = AGENT2_SYSTEM_PROMPT.replace("{checklist_section}", checklist_text)
-
-    # 追问清单更新模式:附加额外规则(判断追问是否引入新维度,需要时输出更新后 checklist)
-    if checklist_update_mode:
-        system_prompt += "\n\n" + CHECKLIST_UPDATE_SECTION
+    system_prompt = AGENT2_SYSTEM_PROMPT
 
     # 长期记忆注入:User Profile + 全局记忆 + 项目记忆精简版
     # (仅当有内容时,追加到 system prompt 末尾)
@@ -581,39 +473,15 @@ def run_agent2(
 
     # 构造 user 消息:包含用户意图 + agent1 之前的所有摘要
     if not agent1_summaries:
-        # 第一轮:agent2 还没看到 agent1 结果,直接给初始指令
-        # 第 0 轮初始评估时,允许 agent2 提问澄清用户意图
-        can_ask = ask_round < MAX_ASKS
-        ask_hint = ""
-        if can_ask:
-            ask_hint = (
-                f"\n\n[当前可向用户提问] 这是第 {ask_round + 1} 次评估,"
-                f"最多可提问 {MAX_ASKS} 次。如果用户意图不清晰(如缺少仓库地址、"
-                f"审查范围模糊、目标不明确),你可以输出 ask_user=true + questions "
-                f"列表向用户提问。问题应聚焦于让你能给出有效的 followup_query。"
-                f"\n注意:questions 中**不要**包含\"是否有其他补充\"问题,系统会自动追加。"
-                f"\n若意图已清晰,直接输出 followup_query,ask_user=false。"
-            )
-        else:
-            ask_hint = (
-                "\n\n[已达提问上限] 用户意图已澄清或已达最大提问次数,"
-                "请基于现有意图输出 followup_query,ask_user=false。"
-            )
+        # 兜底:agent1 尚无总结(异常/降级路径)。任务开始时不再有初始评估,
+        # agent1 直接按用户意图执行;正常协作轮不会走到这里。
         user_msg = (
             f"用户原始意图:{user_intent}\n\n"
-            f"这是任务开始,agent1 还没执行。"
-            f"请输出你的初始评估:应该覆盖哪些审查类别?"
-            f"输出 followup_query 给 agent1 的第一轮指令。done=false。"
-            + ask_hint
+            f"这是任务开始,agent1 尚未执行。"
+            f"请输出 followup_query 给 agent1 的执行指令。done=false。"
         )
-        # repo_context 仅注入到 round 0 的 user_msg(不拼到 user_intent,
-        # 避免被协作轮 agent2 反复带入)。供 agent2 参考工作区结构给更精准指令/提问
-        if repo_context:
-            user_msg += (
-                "\n\n[已准备好的工作区结构,供你参考给出初始指令]\n" + repo_context
-            )
     else:
-        # 后续轮次:把 agent1 的自然语言总结给 agent2 质检(不允许再提问)
+        # 协作轮:把 agent1 的自然语言总结给 agent2 质检
         # 注意:agent1 只输出自然语言 summary,不再有结构化 results 字段
         rounds_text = []
         for i, r in enumerate(agent1_summaries, 1):
@@ -655,14 +523,7 @@ def run_agent2(
 
         user_msg_parts.append(
             "\n\n请质检覆盖情况与结论质量,决定是否追问补全或结束。"
-            + "\n\n[当前不允许提问] agent1 已开始执行,ask_user 必须为 false。"
         )
-        if checklist_update_mode:
-            user_msg_parts.append(
-                "\n[追问清单更新] 本轮是分析用户的追问消息。若追问引入了新的覆盖维度,"
-                "请在输出中附带更新后的完整 checklist(done=false,followup_query "
-                "指向追问需求);若无新维度,不要输出 checklist。"
-            )
         if history_prefix:
             user_msg_parts.append(
                 "\n[记忆提示] 上面已附上你之前各轮的评估记录,请保持质检判断的连续性:"
@@ -833,8 +694,8 @@ def run_agent2(
         # 循环回去:LLM 看到工具结果后,要么再调工具,要么输出 JSON 评估
 
     # 流式调用降级:重试仍失败时返回降级结果(不抛异常杀死任务)。
-    # orchestrator 检测到 degraded=true 后,首次分析跳过清单确认、直接把用户
-    # 输入内容交给 agent1 执行;协作轮评估降级则直接以当前进度收尾结束。
+    # orchestrator 检测到 degraded=true 后,resume 首次分析直接把用户输入
+    # 内容交给 agent1 执行;协作轮评估降级则直接以当前进度收尾结束。
     if degraded_error is not None:
         degrade_reason = str(degraded_error) or type(degraded_error).__name__
         logger.info(
@@ -851,7 +712,6 @@ def run_agent2(
             ),
             "followup_query": user_intent,
             "done": False,
-            "ask_user": False,
             "degraded": True,
             "degrade_reason": degrade_reason,
         }
@@ -880,71 +740,7 @@ def run_agent2(
             ),
             "followup_query": "",
             "done": True,
-            "ask_user": False,
         }
-
-    # 后置约束:非第 0 轮或已达提问上限,强制关闭 ask_user
-    if result.get("ask_user") and (round_idx > 0 or ask_round >= MAX_ASKS):
-        logger.warning(
-            f"[task={task_id}] agent2 试图提问但已被禁止"
-            f"(round_idx={round_idx}, ask_round={ask_round}),强制关闭"
-        )
-        result["ask_user"] = False
-        if not result.get("followup_query"):
-            result["followup_query"] = user_intent
-
-    # 校验 questions 结构(ask_user=true 时必须有)
-    if result.get("ask_user"):
-        questions = result.get("questions") or []
-        if not isinstance(questions, list) or not questions:
-            logger.warning(
-                f"[task={task_id}] agent2 ask_user=true 但 questions 为空,关闭提问"
-            )
-            result["ask_user"] = False
-        else:
-            # 规范化:确保每个问题有 id/type/question;过滤掉 LLM 误加的"补充"问题
-            normalized = []
-            for q in questions:
-                if not isinstance(q, dict):
-                    continue
-                if q.get("id") == SUPPLEMENT_QUESTION_ID:
-                    continue  # 系统固定追加,LLM 不应生成
-                q.setdefault("id", f"q_{len(normalized) + 1}")
-                q_type = q.get("type", "text")
-                if q_type not in ("choice", "text"):
-                    q_type = "text"
-                q["type"] = q_type
-                # 问题文本:LLM 可能把文本写到 text/content 等替代字段,兼容提取
-                # (曾因 prompt 未定义问题结构,LLM 用 text 字段导致前端显示"(未提供问题)")
-                q_text = (
-                    q.get("question") or q.get("text")
-                    or q.get("content") or q.get("title")
-                )
-                q["question"] = str(q_text).strip() if q_text else "(未提供问题)"
-                if q_type == "choice":
-                    if not isinstance(q.get("options"), list) or not q["options"]:
-                        # 选择题无选项,降级为填空题
-                        q["type"] = "text"
-                    else:
-                        # 规范化 options
-                        norm_opts = []
-                        for opt in q["options"]:
-                            if isinstance(opt, str):
-                                norm_opts.append({"value": opt, "label": opt})
-                            elif isinstance(opt, dict):
-                                opt.setdefault("value", opt.get("label", ""))
-                                opt.setdefault("label", opt["value"])
-                                norm_opts.append(opt)
-                        q["options"] = norm_opts
-                    q.setdefault("multi", False)
-                if q_type == "text":
-                    q.setdefault("placeholder", "")
-                    q.setdefault("required", False)
-                normalized.append(q)
-            if not normalized:
-                result["ask_user"] = False
-            else:
-                result["questions"] = normalized
 
     # 落库真实思考链(供前端刷新后还原思考卡片,与 agent1 thinking 同机制)。
     # 不推 SSE:流式期间已通过 thinking_delta 在流式卡片展示,推送会重复。
@@ -1208,8 +1004,8 @@ def _build_agent2_history(
       - 其次保留 done=false 的轮次
       - 同优先级内 FIFO 丢最早轮次
 
-    返回字符串(可能为空)。current_round_idx < 2 时返回空(第 1 轮之前
-    只有初始评估,刚输出过,注入意义不大)。
+    返回字符串(可能为空)。current_round_idx < 2 时返回空(第 1 轮
+    之前没有历史评估记录可注入)。
     """
     if current_round_idx < 2:
         return ""

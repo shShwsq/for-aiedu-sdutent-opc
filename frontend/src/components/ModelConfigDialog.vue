@@ -2,7 +2,7 @@
 /**
  * 模型配置 新增/编辑 弹窗
  *
- * 复用 QuestionDialog 的视觉语言(mask + card + header/body/footer + Teleport)。
+ * 项目统一弹窗视觉语言(mask + card + header/body/footer + Teleport)。
  * 通过 kind 区分 LLM / Embedding,条件渲染对应字段:
  * - LLM:        enable_thinking(仅当厂商 supportsThinking)
  * - Embedding:  维度提示(只读,由模型元信息推导)

@@ -2,7 +2,7 @@
 /**
  * Git 平台账号管理 弹窗(统一 GitHub / Gitee)
  *
- * 复用 QuestionDialog / ModelConfigDialog 的视觉语言(mask + card + header/body/footer)。
+ * 复用 ModelConfigDialog 的视觉语言(mask + card + header/body/footer)。
  * - 已绑定:展示头像 + 用户名,footer 提供「解绑」按钮
  * - 未绑定:展示说明 + 授权范围,footer 提供「绑定 {平台}」按钮
  * - 加载中:展示 spinner

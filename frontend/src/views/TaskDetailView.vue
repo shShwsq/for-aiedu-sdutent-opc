@@ -4,14 +4,11 @@
  *
  * 布局区域:
  * 1. 主区协作对话流:按 round_idx 分组,展示 agent2 与 agent1 的来回
- * 2. 右侧栏:覆盖度看板 / 结果清单(默认折叠,分组由 task.params._grouping 驱动)/
+ * 2. 右侧栏:结果清单(默认折叠,分组由 task.params._grouping 驱动)/
  *    任务概览 / 动态验证配置
  *
  * 实时更新:SSE 接收每条对话/状态变更 + thinking_delta(流式 token 增量)。
  * 初始加载 GET /tasks/{id} 拿快照(补历史),然后 SSE 接收增量。
- *
- * 覆盖度看板:从 task.checklist 读取维度(agent2 第 0 轮动态生成,
- * 用户可通过 ChecklistReviewDialog 编辑确认),不再从场景声明。
  *
  * 流式思考显示(thinking_delta):
  * - 一次 LLM 调用对应一个 conv_id,前端按 conv_id 累积 reasoning + content
@@ -24,10 +21,8 @@ import { useRoute, useRouter } from 'vue-router'
 import { jsonrepair } from 'jsonrepair'
 
 import AppHeader from '@/components/AppHeader.vue'
-import ChecklistReviewDialog from '@/components/ChecklistReviewDialog.vue'
 import ConversationMessage from '@/components/ConversationMessage.vue'
 import PracticeGenerateDialog from '@/components/PracticeGenerateDialog.vue'
-import QuestionDialog from '@/components/QuestionDialog.vue'
 import UserMessageInput from '@/components/UserMessageInput.vue'
 import TaskRuntimeSettings from '@/components/TaskRuntimeSettings.vue'
 import CommandConfirmDialog from '@/components/CommandConfirmDialog.vue'
@@ -36,19 +31,14 @@ import WorkspaceSidebar from '@/components/WorkspaceSidebar.vue'
 import WorkspaceToggleButton from '@/components/WorkspaceToggleButton.vue'
 import {
   downloadTaskReportMarkdown,
-  getPendingChecklist,
-  getPendingQuestion,
   getPendingVerifyAction,
   getPendingCommandConfirm,
   getTask,
-  getTaskCoverage,
   getTaskReportHtml,
   pauseTask,
   resumeTask,
   retryTask,
   skipPreClone,
-  submitTaskAnswer,
-  submitTaskChecklist,
   submitVerifyAction,
   submitCommandConfirm,
   updateTaskVerifierConfig,
@@ -63,16 +53,10 @@ import { parseDiffFileSegments } from '@/utils/diffFiles'
 import { renderMarkdown } from '@/utils/markdown'
 import { buildToolSegments, buildToolSummary, parseAgentTrace, toolFileTargetOf } from '@/utils/toolSummary'
 import type {
-  AnswerItem,
-  ChecklistDimension,
-  ClarificationQuestion,
   CloneProgressEventData,
   Conversation,
   PlanStep,
-  QuestionEventData,
-  ChecklistReviewEventData,
   SendMessageResponse,
-  TaskCoverage,
   TaskDetail,
   TaskResult,
   TaskStatus,
@@ -244,133 +228,6 @@ const convCountPerRound = reactive<Map<number, number>>(new Map())
 // ---- 计划清单(plan 事件 + 历史回放)----
 // key: round_idx,value: 该 round 最新一次的 plan 步骤列表(覆盖式更新)
 const planPerRound = reactive<Map<number, PlanStep[]>>(new Map())
-
-// ---- 用户澄清提问弹窗(阶段 8)----
-// agent2 在第 0 轮评估时若 ask_user=true,后端推送 question 事件,
-// 前端弹出 QuestionDialog 让用户填答。刷新页面后通过 getPendingQuestion 恢复。
-const questionOpen = ref(false)
-const questionData = reactive<{
-  questions: ClarificationQuestion[]
-  reasoning: string
-  askRound: number
-}>({
-  questions: [],
-  reasoning: '',
-  askRound: 0,
-})
-const submittingAnswer = ref(false)
-
-/** 从 PendingQuestion / QuestionEventData 填充弹窗数据并打开 */
-function openQuestionDialog(payload: {
-  questions: ClarificationQuestion[]
-  reasoning?: string
-  ask_round?: number
-}): void {
-  questionData.questions = payload.questions ?? []
-  questionData.reasoning = payload.reasoning ?? ''
-  questionData.askRound = payload.ask_round ?? 0
-  questionOpen.value = true
-}
-
-/** 用户提交答案:调 API,成功后关闭弹窗 */
-async function handleSubmitAnswer(answers: AnswerItem[]): Promise<void> {
-  if (!task.value?.id || submittingAnswer.value) return
-  submittingAnswer.value = true
-  try {
-    const resp = await submitTaskAnswer(String(task.value.id), { answers })
-    if (resp.accepted) {
-      questionOpen.value = false
-    } else {
-      error.value = resp.message || '答案提交失败,任务可能已结束'
-    }
-  } catch (err) {
-    error.value = extractErrorMessage(err)
-  } finally {
-    submittingAnswer.value = false
-  }
-}
-
-/** 用户取消提问弹窗(直接关闭,不提交) */
-function handleCancelQuestion(): void {
-  questionOpen.value = false
-}
-
-/** 刷新页面后恢复待回答问题弹窗(若后端有 pending question) */
-async function restorePendingQuestion(taskId: string): Promise<void> {
-  try {
-    const pending = await getPendingQuestion(taskId)
-    if (pending && pending.questions?.length) {
-      openQuestionDialog({
-        questions: pending.questions,
-        reasoning: pending.reasoning,
-        ask_round: pending.ask_round,
-      })
-    }
-  } catch {
-    // 无 pending question 或任务已结束,静默忽略
-  }
-}
-
-// ---- 覆盖度清单确认弹窗(checklist_review 事件)----
-// agent2 在第 0 轮动态生成覆盖度清单后推送 checklist_review 事件,
-// 前端弹出 ChecklistReviewDialog 让用户编辑确认。刷新页面后通过
-// getPendingChecklist 恢复弹窗。
-const checklistOpen = ref(false)
-const checklistData = reactive<{
-  checklist: ChecklistDimension[]
-  reasoning: string
-}>({
-  checklist: [],
-  reasoning: '',
-})
-const submittingChecklist = ref(false)
-
-/** 从 ChecklistReviewEventData / 待确认清单 填充弹窗数据并打开 */
-function openChecklistDialog(payload: {
-  checklist: ChecklistDimension[]
-  reasoning?: string
-}): void {
-  checklistData.checklist = payload.checklist ?? []
-  checklistData.reasoning = payload.reasoning ?? ''
-  checklistOpen.value = true
-}
-
-/** 用户提交清单:null=直接采用,数组=用户编辑后的清单 */
-async function handleSubmitChecklist(
-  checklist: ChecklistDimension[] | null,
-): Promise<void> {
-  if (!task.value?.id || submittingChecklist.value) return
-  submittingChecklist.value = true
-  try {
-    const resp = await submitTaskChecklist(String(task.value.id), checklist)
-    if (resp.accepted) {
-      checklistOpen.value = false
-    } else {
-      error.value = resp.message || '清单提交失败,任务可能已结束'
-    }
-  } catch (err) {
-    error.value = extractErrorMessage(err)
-  } finally {
-    submittingChecklist.value = false
-  }
-}
-
-/** 用户取消清单弹窗(直接关闭,不提交) */
-function handleCancelChecklist(): void {
-  checklistOpen.value = false
-}
-
-/** 刷新页面后恢复待确认清单弹窗(若后端有 pending checklist) */
-async function restorePendingChecklist(taskId: string): Promise<void> {
-  try {
-    const pending = await getPendingChecklist(taskId)
-    if (pending && pending.length > 0) {
-      openChecklistDialog({ checklist: pending })
-    }
-  } catch {
-    // 无 pending checklist 或任务已结束,静默忽略
-  }
-}
 
 // ---- 验证动作授权弹窗(verify_action 事件)----
 // verifier_agent 在 per_action 模式下,每次执行 http_request / run_python_code 前
@@ -604,44 +461,17 @@ async function initTask(): Promise<void> {
     // 2. 若任务仍在进行(含暂停态),连接 SSE 接收实时事件
     if (task.value && (task.value.status === 'pending' || task.value.status === 'running' || task.value.status === 'paused')) {
       connectSSE(taskId)
-      // 恢复可能存在的待回答问题弹窗(刷新页面 / 迟到订阅者场景)
-      // 后端 agent2 可能已发出 ask_user,但 SSE 事件在连接前已错过,
-      // 通过 GET /pending_question 拉取当前待回答问题
-      void restorePendingQuestion(taskId)
-      // 恢复可能存在的待确认清单弹窗(同理,SSE 事件可能已错过)
-      void restorePendingChecklist(taskId)
       // 恢复可能存在的待授权验证动作弹窗(per_action 模式刷新页面后)
       void restorePendingVerifyAction(taskId)
       // 恢复可能存在的待确认危险命令弹窗(local 模式刷新页面后)
       void restorePendingCommandConfirm(taskId)
     }
 
-    // 3. 加载覆盖度看板(task.checklist 存在才拉取)
-    void loadCoverage()
-    // 4. 加载工作区变更(任务完成时捕获的 diff;进行中任务此时为空,完成时由 SSE done 触发重拉)
+    // 3. 加载工作区变更(任务完成时捕获的 diff;进行中任务此时为空,完成时由 SSE done 触发重拉)
     void loadArtifact(taskId)
   } catch (err) {
     error.value = extractErrorMessage(err)
     loading.value = false
-  }
-}
-
-// ---- 覆盖度看板(仅当 task.checklist 存在时启用) ----
-
-const coverageData = ref<TaskCoverage | null>(null)
-
-/**
- * 拉取覆盖度数据;task.checklist 不存在或任务无 evaluation 时静默置空。
- *
- * 场景降级后,覆盖度维度从 task.checklist 读取(由 agent2 第 0 轮动态生成),
- * 不再从场景声明 coverage 读取。
- */
-async function loadCoverage(): Promise<void> {
-  if (!task.value?.id || !task.value.checklist?.length) return
-  try {
-    coverageData.value = await getTaskCoverage(String(task.value.id))
-  } catch {
-    coverageData.value = null
   }
 }
 
@@ -734,11 +564,6 @@ function connectSSE(taskId: string): void {
       }
       // 自动滚动到底部
       nextTick(scrollToBottom)
-
-      // agent2 评估产出 → 刷新覆盖度看板
-      if (data.role === 'agent2' && data.type === 'evaluation') {
-        void loadCoverage()
-      }
     },
     onConversationUpdate: (data) => {
       if (!task.value) return
@@ -769,21 +594,6 @@ function connectSSE(taskId: string): void {
       // 覆盖式更新:每个 round 只保留最新一次 plan
       planPerRound.set(data.round_idx, data.steps)
       nextTick(scrollToBottom)
-    },
-    onQuestion: (data: QuestionEventData) => {
-      // agent2 请求用户澄清:弹出 QuestionDialog
-      openQuestionDialog({
-        questions: data.questions,
-        reasoning: data.reasoning,
-        ask_round: data.ask_round,
-      })
-    },
-    onChecklistReview: (data: ChecklistReviewEventData) => {
-      // agent2 动态生成覆盖度清单:弹出 ChecklistReviewDialog 让用户编辑确认
-      openChecklistDialog({
-        checklist: data.checklist,
-        reasoning: data.reasoning,
-      })
     },
     onVerifyAction: (data: VerifyActionEventData) => {
       // 动态验证动作需要授权(per_action 模式):弹出 VerifyActionDialog
@@ -1129,15 +939,10 @@ function resetTaskState(): void {
   planPerRound.clear()
   convCountPerRound.clear()
   historyReasoningExpanded.clear()
-  // 关闭提问弹窗
-  questionOpen.value = false
-  // 关闭清单确认弹窗
-  checklistOpen.value = false
   // 重置 resume 窗口标志(防止跨任务误触发 onDone 校验)
   resumingRef.value = false
   // 重置任务视图态
   task.value = null
-  coverageData.value = null
   loading.value = true
   error.value = ''
 }
@@ -2727,28 +2532,6 @@ function toggleResult(id: string): void {
         />
       </div>
       <div class="detail-sidebar-body">
-        <!-- 覆盖度(task.checklist 存在时显示,置顶以便无需滚动即可查看) -->
-        <section v-if="task.checklist?.length && coverageData" class="coverage-section">
-          <h2>
-            覆盖度
-            <span class="count">{{ coverageData.covered_count }}/{{ coverageData.total_count }}</span>
-            <span v-if="coverageData.last_round !== null" class="coverage-round">
-              第 {{ coverageData.last_round }} 轮评估
-            </span>
-          </h2>
-          <div class="coverage-grid">
-            <div
-              v-for="d in coverageData.dimensions"
-              :key="d.id"
-              :class="['coverage-card', d.covered ? 'coverage-covered' : 'coverage-missing']"
-              :title="d.description"
-            >
-              <span class="coverage-dot" />
-              <span class="coverage-name">{{ d.name }}</span>
-            </div>
-          </div>
-        </section>
-
         <!-- 任务详情(扁平化,无卡片外框):状态徽标与下载/打印按钮已移至标题行,用户意图卡片已移除 -->
         <section class="overview-section">
           <dl class="overview-meta">
@@ -2907,27 +2690,6 @@ function toggleResult(id: string): void {
       </span>
     </div>
     </div>
-
-    <!-- 用户澄清提问弹窗(agent2 ask_user=true 时触发) -->
-    <QuestionDialog
-      :open="questionOpen"
-      :questions="questionData.questions"
-      :reasoning="questionData.reasoning"
-      :ask-round="questionData.askRound"
-      :submitting="submittingAnswer"
-      @submit="handleSubmitAnswer"
-      @cancel="handleCancelQuestion"
-    />
-
-    <!-- 覆盖度清单确认弹窗(agent2 动态生成 checklist 后触发) -->
-    <ChecklistReviewDialog
-      :open="checklistOpen"
-      :checklist="checklistData.checklist"
-      :reasoning="checklistData.reasoning"
-      :submitting="submittingChecklist"
-      @submit="handleSubmitChecklist"
-      @cancel="handleCancelChecklist"
-    />
 
     <!-- 验证动作授权弹窗(per_action 模式,每个 HTTP/PoC 动作需用户确认) -->
     <VerifyActionDialog
@@ -3409,75 +3171,6 @@ function toggleResult(id: string): void {
   color: var(--color-text-muted);
   font-weight: var(--fw-normal);
   font-size: var(--fs-sm);
-}
-
-/* ---- 覆盖度 ---- */
-.coverage-section {
-  margin-bottom: 0;
-}
-
-.coverage-section h2 {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  margin-bottom: var(--space-3);
-  font-size: var(--fs-base);
-  font-weight: var(--fw-semibold);
-}
-
-.coverage-round {
-  margin-left: auto;
-  font-size: var(--fs-xs);
-  color: var(--color-text-muted);
-  font-weight: var(--fw-normal);
-}
-
-.coverage-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-  gap: var(--space-2);
-}
-
-.coverage-card {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  font-size: var(--fs-sm);
-  transition: all var(--transition-fast);
-}
-
-.coverage-covered {
-  border-color: var(--color-success);
-  background: var(--color-success-light);
-}
-
-.coverage-covered .coverage-dot {
-  background: var(--color-success);
-}
-
-.coverage-missing {
-  border-color: var(--color-border);
-  background: var(--color-surface-alt);
-}
-
-.coverage-missing .coverage-dot {
-  background: var(--color-text-muted);
-}
-
-.coverage-dot {
-  flex-shrink: 0;
-  width: 8px;
-  height: 8px;
-  border-radius: var(--radius-full);
-}
-
-.coverage-name {
-  color: var(--color-text);
-  font-weight: var(--fw-medium);
-  word-break: break-word;
 }
 
 /* ---- 动态验证配置(右侧栏,仅 test_env_url 存在时显示)---- */

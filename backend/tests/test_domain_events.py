@@ -186,7 +186,6 @@ def test_subscribe_rejects_unknown_event_type():
 def test_all_event_types_covers_documented_types():
     for t in [
         "task.started", "task.completed", "task.failed",
-        "checklist.confirmed", "question.raised",
         "agent1.round_completed",
         "verifier.completed",
     ]:

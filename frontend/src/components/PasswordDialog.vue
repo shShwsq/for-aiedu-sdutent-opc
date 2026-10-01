@@ -2,7 +2,7 @@
 /**
  * 密码修改/设置 弹窗
  *
- * 复用 QuestionDialog / ModelConfigDialog 的视觉语言(mask + card + header/body/footer)。
+ * 复用 ModelConfigDialog 的视觉语言(mask + card + header/body/footer)。
  * - hasPassword=true:修改密码,需先验证当前密码
  * - hasPassword=false:设置密码(OAuth 用户首次设密码),跳过当前密码字段
  *
