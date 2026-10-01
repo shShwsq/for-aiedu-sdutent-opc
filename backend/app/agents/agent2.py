@@ -1003,6 +1003,26 @@ def run_agent2(
 # ============================================================
 
 
+def _publish_conversation(task: Task, conv: Conversation) -> None:
+    """把 agent2 落库的对话记录实时推给前端 SSE
+
+    与 orchestrator._add_conversation 的推送格式一致(额外带 tool_call_id,
+    供侧栏把 tool_result 与 tool_call 配对)。此前 agent2 的只读/引用核查工具
+    仅落库不推事件,导致运行中侧栏只见思考、工具步骤要等审查结束 refetch 才出现;
+    实时推送后"过程中"与"结束后"展示一致。
+    """
+    publish(task.id, "conversation", {
+        "id": str(conv.id),
+        "round_idx": conv.round_idx,
+        "role": conv.role,
+        "type": conv.type,
+        "content": conv.content,
+        "reasoning": conv.reasoning,
+        "tool_call_id": conv.tool_call_id,
+        "created_at": conv.created_at.isoformat() if conv.created_at else None,
+    })
+
+
 def _execute_read_tool(
     fn_name: str,
     args: dict[str, Any],
@@ -1041,6 +1061,7 @@ def _execute_read_tool(
             db.add(call_conv)
             db.commit()
             db.refresh(call_conv)
+            _publish_conversation(task, call_conv)
         except Exception as e:
             logger.warning(f"[task={task_id}] 落库 agent2 工具调用失败(忽略): {e}")
 
@@ -1088,15 +1109,18 @@ def _execute_read_tool(
 
     if db is not None and task is not None and call_conv is not None:
         try:
-            db.add(Conversation(
+            result_conv = Conversation(
                 task_id=task.id,
                 round_idx=round_idx,
                 role="agent2",
                 type="tool_result",
                 content=result_str,
                 tool_call_id=str(call_conv.id),
-            ))
+            )
+            db.add(result_conv)
             db.commit()
+            db.refresh(result_conv)
+            _publish_conversation(task, result_conv)
         except Exception as e:
             logger.warning(f"[task={task_id}] 落库 agent2 工具结果失败(忽略): {e}")
 
@@ -1153,6 +1177,7 @@ def _execute_reference_tool(
             db.add(call_conv)
             db.commit()
             db.refresh(call_conv)
+            _publish_conversation(task, call_conv)
         except Exception as e:
             logger.warning(f"[task={task_id}] 落库 agent2 引用复核调用失败(忽略): {e}")
 
@@ -1172,15 +1197,18 @@ def _execute_reference_tool(
 
     if db is not None and task is not None and call_conv is not None:
         try:
-            db.add(Conversation(
+            result_conv = Conversation(
                 task_id=task.id,
                 round_idx=round_idx,
                 role="agent2",
                 type="tool_result",
                 content=result_str,
                 tool_call_id=str(call_conv.id),
-            ))
+            )
+            db.add(result_conv)
             db.commit()
+            db.refresh(result_conv)
+            _publish_conversation(task, result_conv)
         except Exception as e:
             logger.warning(f"[task={task_id}] 落库 agent2 引用复核结果失败(忽略): {e}")
 

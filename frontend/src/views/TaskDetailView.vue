@@ -667,6 +667,11 @@ function connectSSE(taskId: string): void {
         const fresh = await getTask(taskId)
         if (fresh && !unmountedFlag) {
           applyTaskSnapshot(fresh, false)
+          // 审查已结束:agent2 的思考/工具步骤已落库并随快照返回,
+          // 清掉 agent2 流式项,避免与历史 thinking 记录在侧栏重复显示
+          for (const [key, s] of streamingItems) {
+            if (s.role === 'agent2') streamingItems.delete(key)
+          }
         }
       } catch {
         // 快照拉取失败:onDone 兜底再拉一次

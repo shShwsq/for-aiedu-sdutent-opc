@@ -249,28 +249,32 @@ function charCount(text: string | null | undefined): number {
       </button>
 
       <div v-if="expanded.has(g.round_idx)" class="panel-round-body">
-        <!-- 实时流式思考(SSE thinking_delta;verify 标记为动态验证) -->
-        <div v-for="s in g.streaming" :key="s.conv_id" class="panel-stream">
-          <span :class="['panel-stream-label', { 'is-verify': s.verify }]">
-            {{ s.verify ? '动态验证' : '思考中' }}{{ s.status === 'streaming' ? '…' : '' }}
-          </span>
+        <!-- 工具核查(读码核对 / PoC / 引用复核):执行步骤,提到思考之前、与思考同级 -->
+        <details v-for="tool in g.tools" :key="tool.call.id" class="panel-item panel-tool">
+          <summary>{{ toolIntent(tool.call) }}</summary>
+          <div v-if="tool.result" class="panel-tool-result">{{ truncate(tool.result.content, 1500) }}</div>
+          <div v-else class="panel-tool-pending">执行中…</div>
+        </details>
+
+        <!-- 实时流式思考(SSE thinking_delta;verify 标记为动态验证):默认折叠,与工具核查同级 -->
+        <details v-for="s in g.streaming" :key="s.conv_id" class="panel-item panel-stream-item">
+          <summary>
+            <span :class="['panel-stream-label', { 'is-verify': s.verify }]">
+              {{ s.verify ? '动态验证' : '思考中' }}{{ s.status === 'streaming' ? '…' : '' }}
+            </span>
+            <span class="panel-row-count">· {{ charCount(s.reasoning || s.content) }} 字</span>
+          </summary>
           <div
             class="panel-stream-text"
             :ref="(el) => setStreamRef(g.round_idx, el)"
             v-text="streamText(s)"
           />
-        </div>
+        </details>
 
         <!-- 历史思考链(刷新页面后由落库记录接管) -->
         <details v-for="t in g.thinking" :key="t.id" class="panel-item">
           <summary>思考链 · {{ charCount(t.reasoning || t.content) }} 字</summary>
           <div class="markdown-body panel-md" v-html="renderMarkdown(t.reasoning || t.content)" />
-        </details>
-
-        <!-- 工具核查(读码核对 / PoC / 引用复核):单行意图 + 展开看结果 -->
-        <details v-for="tool in g.tools" :key="tool.call.id" class="panel-item panel-tool">
-          <summary>{{ toolIntent(tool.call) }}</summary>
-          <div v-if="tool.result" class="panel-tool-result">{{ truncate(tool.result.content, 1500) }}</div>
         </details>
 
         <!-- 审查结论(后台审查模式):结论行 + 展开完整审查 -->
@@ -485,13 +489,7 @@ function charCount(text: string | null | undefined): number {
   gap: var(--space-2);
 }
 
-/* 流式思考 */
-.panel-stream {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-}
-
+/* 流式思考(折叠行,与工具核查同级) */
 .panel-stream-label {
   font-size: var(--fs-xs);
   font-weight: var(--fw-medium);
@@ -500,6 +498,18 @@ function charCount(text: string | null | undefined): number {
 
 .panel-stream-label.is-verify {
   color: var(--color-info);
+}
+
+/* 折叠行尾部的字数提示(思考中… · N 字) */
+.panel-row-count {
+  color: var(--color-text-tertiary);
+}
+
+/* 工具执行中(只收到 tool_call、结果未回)的占位 */
+.panel-tool-pending {
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--fs-xs);
+  color: var(--color-text-tertiary);
 }
 
 .panel-stream-text {
