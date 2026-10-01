@@ -110,6 +110,7 @@ const qoderModelOptions: { value: string; label: string }[] = [
   { value: '', label: '默认(智能路由 Auto)' },
   { value: 'Auto', label: '智能路由 (Auto)' },
   { value: 'Qwen3.8-Max', label: 'Qwen3.8-Max' },
+  { value: 'Qwen3.8-Flash', label: 'Qwen3.8-Flash' },
   { value: 'Qwen3.7-Max', label: 'Qwen3.7-Max' },
   { value: 'Qwen3.7-Plus', label: 'Qwen3.7-Plus' },
   { value: 'Qwen3.7-Flash', label: 'Qwen3.7-Flash' },
