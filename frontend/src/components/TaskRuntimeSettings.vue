@@ -5,7 +5,6 @@
  * 允许在任务进行中修改:
  * - agent1 模型(仅 executor=builtin;CLI 执行器模型自管)
  * - agent2 评估模型
- * - 协作策略(评估频率 K / 协作总轮次 / 允许打断)
  *
  * 生效时机:running/paused 的当前执行线程仍用启动时加载的配置,
  * 修改在下一轮执行(completed 后追加消息 / failed 重试)时生效;
@@ -18,11 +17,10 @@ import { computed, onMounted, ref } from 'vue'
 
 import BaseSelect from '@/components/BaseSelect.vue'
 import { getMyModels } from '@/api/model_configs'
-import { getPolicyLimits, getPreferences } from '@/api/memory'
 import { updateTaskRuntimeConfig } from '@/api/task'
 import { extractErrorMessage } from '@/utils/error'
 import type { LLMConfigItemOut } from '@/types/model_configs'
-import type { RuntimePolicyUpdate, TaskDetail } from '@/types/task'
+import type { TaskDetail } from '@/types/task'
 
 const props = defineProps<{
   task: TaskDetail
@@ -35,23 +33,13 @@ const emit = defineEmits<{
   error: [message: string]
 }>()
 
-// ---- 系统默认策略(与后端 DEFAULT_AGENT_POLICY 对齐,仅面板用到的字段) ----
-const SYSTEM_DEFAULT: { max_rounds: number } = {
-  max_rounds: 4,
-}
-
+// ---- 面板状态 ----
 const expanded = ref(false)
 const saving = ref(false)
 
 /** 用户已保存的 LLM 配置列表(为空表示未配置,展示引导文案) */
 const llmConfigs = ref<LLMConfigItemOut[]>([])
 const loadingModels = ref(true)
-
-/** 协作总轮次上限(后端 env 可配,拉不到时保持默认 10) */
-const maxRoundsLimit = ref(10)
-
-// ---- 协作策略表单值(初始=系统默认 → 用户级默认 → 任务级覆盖,与 resolve_agent_policy 一致) ----
-const policyMaxRounds = ref(SYSTEM_DEFAULT.max_rounds)
 
 /** 任务是否使用内置执行器(CLI 执行器 react 模型自管,选择器禁用) */
 const isBuiltin = computed(() => (props.task.executor ?? 'builtin') === 'builtin')
@@ -74,29 +62,11 @@ const reactLlmConfigOptions = computed(() => [
   ...llmConfigs.value.map((cfg) => ({ value: cfg.id, label: modelLabel(cfg) })),
 ])
 
-/** 任务级策略覆盖(task.params._agent_policy) */
-function taskPolicyOverride(): Record<string, unknown> {
-  const p = props.task.params as Record<string, unknown> | null | undefined
-  return (p?._agent_policy as Record<string, unknown> | undefined) ?? {}
-}
-
-/** 初始化:拉模型列表 + 策略上限 + 用户级默认,合并出当前生效值 */
+/** 初始化:拉模型列表 */
 async function init(): Promise<void> {
-  const override = taskPolicyOverride()
-  // 用户级默认与限制静默失败:未登录/未配置时回退系统默认,与后端合并逻辑一致
-  const [models, limits, prefs] = await Promise.all([
-    getMyModels().catch(() => null),
-    getPolicyLimits().catch(() => null),
-    getPreferences().catch(() => null),
-  ])
+  const models = await getMyModels().catch(() => null)
   llmConfigs.value = models?.llm_configs ?? []
   loadingModels.value = false
-  if (limits) maxRoundsLimit.value = limits.max_rounds
-
-  const userDefault = prefs?.agent_policy
-  policyMaxRounds.value = Number(
-    override.max_rounds ?? userDefault?.max_rounds ?? SYSTEM_DEFAULT.max_rounds,
-  )
 }
 
 onMounted(() => {
@@ -125,7 +95,6 @@ function showToast(msg: string, type: 'success' | 'error'): void {
 async function save(req: {
   llm_config_id?: string
   react_llm_config_id?: string
-  agent_policy?: RuntimePolicyUpdate
 }): Promise<void> {
   if (saving.value) return
   saving.value = true
@@ -149,24 +118,6 @@ function onUserModelChange(value: string | number): void {
 
 function onReactModelChange(value: string | number): void {
   void save({ react_llm_config_id: String(value) })
-}
-
-/** 数字输入钳制到 [min, max],越界回退到边界值 */
-function clampNumber(raw: string, min: number, max: number, fallback: number): number {
-  const n = Number(raw)
-  if (!Number.isFinite(n)) return fallback
-  return Math.max(min, Math.min(Math.round(n), max))
-}
-
-function onMaxRoundsChange(e: Event): void {
-  const next = clampNumber(
-    (e.target as HTMLInputElement).value,
-    1,
-    maxRoundsLimit.value,
-    policyMaxRounds.value,
-  )
-  policyMaxRounds.value = next
-  void save({ agent_policy: { max_rounds: next } })
 }
 </script>
 
@@ -206,25 +157,6 @@ function onMaxRoundsChange(e: Event): void {
           </p>
         </div>
 
-        <!-- 协作策略 -->
-        <div class="rs-field rs-policy">
-          <span class="rs-label">协作策略</span>
-          <div class="rs-policy-row">
-            <label class="rs-policy-item">
-              <span class="rs-policy-name">协作总轮次</span>
-              <input
-                type="number"
-                class="rs-number"
-                min="1"
-                :max="maxRoundsLimit"
-                :value="policyMaxRounds"
-                :disabled="saving"
-                @change="onMaxRoundsChange"
-              />
-            </label>
-          </div>
-        </div>
-
         <p class="rs-note">
           修改即保存;任务运行中/暂停中修改,将在下一轮执行(完成后追加消息 / 失败重试)时生效
         </p>
@@ -236,7 +168,7 @@ function onMaxRoundsChange(e: Event): void {
       type="button"
       class="rs-toggle"
       :aria-expanded="expanded"
-      :title="expanded ? '收起运行时设置' : '展开运行时设置(模型与协作策略)'"
+      :title="expanded ? '收起运行时设置' : '展开运行时设置(模型配置)'"
       @click="expanded = !expanded"
     >
       <svg
@@ -357,48 +289,7 @@ function onMaxRoundsChange(e: Event): void {
   color: var(--color-text-muted);
 }
 
-/* ---- 协作策略 ---- */
-.rs-policy-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-3);
-  align-items: center;
-}
-
-.rs-policy-item {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  font-size: var(--fs-sm);
-  color: var(--color-text);
-  cursor: pointer;
-}
-
-.rs-policy-check {
-  gap: var(--space-1);
-}
-
-.rs-policy-name {
-  color: var(--color-text);
-}
-
-.rs-number {
-  width: 64px;
-  padding: var(--space-1) var(--space-2);
-  font-size: var(--fs-sm);
-  color: var(--color-text);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
-  outline: none;
-  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
-}
-
-.rs-number:focus {
-  border-color: var(--color-primary);
-  box-shadow: 0 0 0 3px var(--color-primary-light);
-}
-
+/* ---- 说明文案 ---- */
 .rs-note {
   margin: 0;
   font-size: var(--fs-xs);

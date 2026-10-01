@@ -180,15 +180,13 @@ agent2 是**幕后质检者**(agent1 是台前回答者):其核查过程与知�
 - authority(authoritative / credible / unknown)为域名分级**参考信号**,非权威认证;`github.com/advisories` 按路径前缀归 TIER1,整域 github.com 为 TIER2
 - 复核结论写入 result metadata(`ref_url` / `ref_status` / `ref_authority` / `ref_note`,尽力约定,消费侧容忍缺失)
 
-### 3.6 终止条件(硬性,避免死循环)
-满足以下**全部**条件后输出最终报告:
-1. agent2 确定的审查维度均有明确结论(有 / 无 / 无法确定)
-2. 每个维度至少触及一个关键检查点
-3. agent2 追问轮次 ≤ 总轮次上限(协作策略可配 1-10,默认 2;老用户已保存的旧值不回写)
-4. 最近一轮 agent1 未产生新发现,且 agent2 无新增追问点
+### 3.6 完成与审查(无协作总轮次)
+- **agent1 单轮即完成**:初始运行 agent1 只执行 1 轮,summary 落库为临时结果,任务即标记 `COMPLETED`(用户感知的完成以 agent1 结束为准)
+- **agent2 后台审查**:agent1 完成后,agent2 在同一后台线程内做**单次完整审查**(只读核查 / PoC 验证 / 引用复核),整理"重点与知识点"替换临时结果,并输出 0-3 条"建议深挖方向"(suggestions)。审查只审不改
+- **审查终止条件**:agent2 确定的审查维度均有明确结论(有 / 无 / 无法确定),每个维度至少触及一个关键检查点;审查为一次性完成,无追问轮次上限概念(原"协作总轮次 max_rounds"已移除)
+- **审查状态**:`review_status` = running / done / failed;审查失败保留 agent1 临时结果,任务仍 COMPLETED
 
-**完成后重启**:用户在任务完成后追加消息,可触发新一轮协作(resume_audit_with_message),
-最多再跑 3 轮(MAX_RESUME_ROUNDS)。重启时不复用旧 plan,让 LLM 根据新消息重新规划。
+**用户驱动多轮(resume)**:用户在任务完成后追加消息、或点击建议卡片的「深挖」按钮,可触发新一轮执行。审查进行中时会先等待审查结束(超时 120s 拒绝);agent2 先分析消息(mode=analyze)判断是否需要 agent1 再执行一轮:需要则 agent1 跑一轮后再次后台审查,无需则直接收尾。多轮完全由用户驱动,无自动轮次上限。重启时不复用旧 plan,让 LLM 根据新消息重新规划。
 
 ### 3.7 任务暂停/恢复
 用户可暂停运行中的任务:
@@ -245,6 +243,7 @@ Task(任务)
     - params._verifier: 验证智能体配置(auth_mode / auth_tokens / test_env_url,实验性)
   - allowed_skills: JSONB,用户选择的允许调用的 skill 名称列表(空=全部可用)
   - status: pending / running / paused / completed / failed
+  - review_status: 后台审查子状态(NULL 未审查 / running 审查中 / done 完成 / failed 失败;agent1 结束即 completed,审查在后台跑)
   - current_stage: 当前阶段描述(展示给前端)
   - error_message: 失败时的错误信息
   - llm_config_id: agent2 使用的 LLM 配置 ID
@@ -257,7 +256,7 @@ Conversation(对话)
   - task_id
   - round_idx: 协作轮次(从 1 起;存量数据可能含 round 0 的旧版初始评估)
   - role: user / agent1 / agent2 / system
-  - type: question / evaluation / followup / thinking / tool_call / tool_result / summary / error / message / answer(存量数据:旧版澄清提问的回答)
+  - type: question / evaluation / followup / thinking / tool_call / tool_result / summary / suggestions(agent2 建议深挖方向) / error / message / answer(存量数据:旧版澄清提问的回答)
   - content: 消息内容
   - reasoning: 思考链(仅 type=thinking 有,模型 reasoning_content)
   - created_at
@@ -275,12 +274,12 @@ Result(任务结果项,通用)
 **场景降级变更**:
 - Task 从固定 `repo_url/branch/scope` 字段改为 `user_input`(通用意图)+ `params`(JSONB 补充参数)
 - Finding 表改为通用的 Result 表,metadata 放场景专用字段
-- Task 新增 `allowed_skills`(技能过滤)、`executor`(执行器选择)、`react_llm_config_id`(react_agent 独立模型配置);曾有的 `checklist` 列(动态覆盖度清单)已随该功能移除而删除
+- Task 新增 `allowed_skills`(技能过滤)、`executor`(执行器选择)、`react_llm_config_id`(react_agent 独立模型配置)、`review_status`(后台审查子状态);曾有的 `checklist` 列(动态覆盖度清单)已随该功能移除而删除
 - Task 新增 `paused` 状态
 - Conversation 新增 `round_idx`(协作轮次)、`reasoning`(思考链)、`message`(用户补充消息)、`history_compress`(LLM 压缩缓存)等类型
 
 **后续新增表**(详见 §9.15-9.18):
-- `AgentPolicy`(agent_policies):用户级协作策略独立表(1:1,agent2 启停 / 协作轮次 / 验证权限 / 引用复核开关),从 `user_preferences` JSONB 迁移而来,任务级经 `task.params._agent_policy` 覆盖
+- `AgentPolicy`(agent_policies):用户级协作策略独立表(1:1,agent2 启停 / 验证权限 / 引用复核开关),从 `user_preferences` JSONB 迁移而来,任务级经 `task.params._agent_policy` 覆盖(曾有的 `max_rounds` 协作总轮次列已随后台审查重构移除)
 - `TaskArtifact`(task_artifacts):任务工作区产物,1:N 挂在 Task 上(`kind=git_diff` 存工作区变更 patch,`kind=repo_tree` 存仓库树快照)
 - 练习模块表族(knowledge_points / questions / user_knowledge_states / practice_sessions / attempts / practice_settings):知识点、题库、SM-2 记忆状态、会话、答题流水与用户练习设置
 

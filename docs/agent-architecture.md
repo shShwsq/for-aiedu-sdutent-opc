@@ -23,17 +23,22 @@
 │   └─ ExternalCLIAgent   → acp_base + wrapper │
 │      (qoder_cli / deepseek_cli / codex_cli)  │
 └───────┬──────────────────────────────────────┘
-                │ summary + plan
+                │ summary + plan(agent1 仅执行 1 轮)
                 ▼
-       agent2 质检评估(自行确定审查维度)
+   agent1 summary 落临时 Result → task=COMPLETED → 推 agent1_done
+   (事件总线保持打开,用户已看到"完成")
+                │  同一后台线程继续
+                ▼
+       agent2 后台审查(mode="review",自行确定审查维度)
+         只读核查 + 引用复核 +(实验性)PoC 验证 → 整理 results
                 │
-        ┌───────┴───────┐
-   done=true        missing≠∅
-        │               │
-   落库 results    followup_query → 下一轮
-        │
-        │ (实验性,允许验证时)
-        ▼
+                ▼
+   results+grouping 替换临时结果 + suggestions(建议深挖方向)
+   → review_status=done → 推 review_done → done → finish_task
+   (用户点「深挖」/追加消息 → resume:agent2 analyze → agent1 一轮 → 再审查)
+                │
+                │ (实验性,允许验证时审查中调用)
+                ▼
 ┌──────────────────────────────────────────────┐
 │ verifier_agent (独立 ReAct, 复用沙箱)         │
 │   - http_request (沙箱内 urllib)             │
@@ -54,15 +59,16 @@
 | **ExternalCLIAgent(agent1)** | 沙箱内启动外部 CLI,通过 ACP 协议通信 | 是,由 CLI 自主调工具 | CLI 自管(凭证经环境变量注入) |
 | **verifier_agent**(实验性) | 在沙箱里跑 PoC / HTTP 请求动态验证 agent1 的发现 | 是,独立工具集(`http_request` + `run_python_code`) | `task.llm_config_id`(复用 agent2 的 LLMClient) |
 
-### 1.2 协作轮次
+### 1.2 协作流程(后台审查版)
 
-- **round 1..N**：协作循环（N = 生效的总轮次上限;任务开始时无 agent2 初始评估,agent1 第 1 轮直接按用户意图执行）
-  - agent1 执行一轮 → 返回 `summary`
-  - agent2 质检评估（自行确定审查维度）→ 输出 `covered/missing/followup_query/done`
-  - `done=true` 时输出 `results + grouping`，orchestrator 落库
-- **轮次可配置**:总轮次经协作策略页配置(`AgentPolicy.max_rounds`,范围 1-10,默认 2,由 `MAX_MAX_ROUNDS=10` 钳制;任务级经 `task.params._agent_policy` 覆盖)。**默认 2 仅对新用户/未保存过策略的用户生效**,已保存过策略的老用户仍是原值(不回写已有数据)。agent2 核查优先(能自查的绝不追问),追问仅作兜底,故默认轮次从 4 收敛为 2
-- **单 agent 退化**:协作策略页关闭 Agent 2(`agent2_enabled=false`)后退化为单 agent 模式——agent1 跑 1 轮直接产出结果,无质检评估与追问
-- **resume(完成后重启)**:用户追加消息触发,最多 `MAX_RESUME_ROUNDS=3` 轮
+- **agent1 单轮执行**:初始运行只有 1 轮 agent1(无 agent2 初始评估,agent1 直接按用户意图执行)→ 返回 `summary`
+- **agent1 结束即任务完成**:summary 落库为临时 Result,`task.status=COMPLETED`、`review_status=running`,推 `agent1_done`(事件总线保持打开)。用户感知的"任务完成"以 agent1 结束为准
+- **agent2 后台审查**:在同一后台线程内以 `mode="review"` 单次完整核查(只读工具核对 / verify / check_reference),整理重点与知识点(`results + grouping`)替换临时结果,发现缺口输出"建议深挖方向"(`suggestions`,0-3 条);审查完成 `review_status=done` → 推 `review_done` → `done` → `finish_task`。agent2 只审不改
+- **审查失败/降级**:保留 agent1 summary 临时结果,`review_status=failed`,落警告对话,仍推 `review_done(review_status=failed)` → `done`;任务状态不回滚(审查失败 ≠ 任务失败)
+- **无"协作总轮次"设置**:初始运行单轮,多轮协作由用户驱动(resume)。原 `AgentPolicy.max_rounds` 已移除(启动迁移 `migrate_agent_policy_drop_max_rounds_column` 幂等 DROP 老库列)
+- **单 agent 退化**:协作策略页关闭 Agent 2(`agent2_enabled=false`)后退化为单 agent 模式——agent1 跑 1 轮直接产出结果,无后台审查,`review_status` 保持 `NULL`
+- **resume(用户驱动多轮)**:用户追加消息 / 点击建议「深挖」触发。审查进行中时 resume 先等待审查结束(`wait_for_review`,超时 120s 拒绝);agent2 以 `mode="analyze"`(无工具)判断是否需要 agent1 再执行一轮:需要则 `followup_query` → agent1 一轮 → 再次后台审查;无需则直接收尾。每次 resume = 分析 + agent1 一轮 + 后台审查
+- **review_status 状态模型**:`NULL`(未审查:单 agent / 老任务)/ `running`(审查中)/ `done`(完成)/ `failed`(失败,任务仍 COMPLETED)。启动迁移 `migrate_stale_review_status` 把遗留 `running` 置 `failed`(后端重启后审查线程已死)
 
 ### 1.3 交付物来源与上传链路(uploads → orchestrator)
 
@@ -96,26 +102,44 @@
 ```python
 def run_agent2(
     user_intent: str,                    # 用户原始意图(含仓库地址/分支)
-    react_agent_summaries: list[dict],   # 之前各轮 react_agent 的 summary
+    agent1_summaries: list[dict],        # 之前各轮 agent1 的 summary
     task_id, db, round_idx, scenario_id,
     client: LLMClient | None,            # None 时回退 env 默认
-    user_id, repo_url,
+    user_id, repo_url, task, agent_policy, repo_path,
+    mode: str = "review",                # "review"(后台审查) / "analyze"(resume 消息分析)
 ) -> dict
 ```
 
-### 2.3 输出结构
+> 双 prompt:`mode="review"` 用 `AGENT2_REVIEW_PROMPT`(单次完整审查,无 followup/done/轮次语义);`mode="analyze"` 用 `AGENT2_ANALYZE_PROMPT`(无工具,判断追加消息是否需 agent1 再执行)。旧名 `AGENT2_SYSTEM_PROMPT` 保留为 `AGENT2_REVIEW_PROMPT` 的兼容别名。
+
+### 2.3 输出结构(按 mode 区分)
+
+**review 模式**(后台审查,单次完成):
 
 ```json
 {
   "covered": ["dim_id1"],            // 已覆盖维度
-  "missing": ["dim_id2"],            // 未覆盖维度
-  "reasoning": "评估理由",
-  "followup_query": "针对 missing 的追问指令",
-  "done": false,
-  "results": [...],                  // 仅 done=true 时输出
+  "missing": ["dim_id2"],            // 未覆盖维度(转为 suggestions)
+  "reasoning": "审查理由",
+  "suggestions": ["建议深挖方向 1"],  // 0-3 条具体可执行建议
+  "results": [...],                  // 重点与知识点(3-8 条精选)
   "grouping": {"field":..., "values":[...]} | null
 }
 ```
+
+**analyze 模式**(resume 消息分析,无工具):
+
+```json
+{
+  "covered": [...],
+  "missing": [...],
+  "reasoning": "分析理由",
+  "followup_query": "给 agent1 的执行指令",
+  "done": false                      // true=无需新执行,直接收尾
+}
+```
+
+> 两种模式失败降级时均附 `degraded=true`(degrade_reason 见日志)。review 降级→调用方标 `review_status=failed`;analyze 降级→直接把用户消息交给 agent1。
 
 ### 2.4 上下文构造
 
@@ -688,7 +712,7 @@ list of `{label, header_name, header_value}`：
 | 交互类型 | 触发条件 | 传递方式 |
 |---------|---------|---------|
 | **运行中追加消息** | 用户在对话界面输入框发消息 | API 端点落库 `Conversation(role=user, type=message)` + 推 SSE；react_agent 每个迭代开头 `drain_user_messages` 注入 `messages` |
-| **完成后重启** | 任务 COMPLETED 后用户追加消息 | `resume_audit_with_message`：用户消息拼到 `task.user_input` 后面作为 `effective_intent`，从 Conversation 表加载 `react_summaries`，重启协作循环 |
+| **完成后重启(resume)** | 任务 COMPLETED 后用户追加消息 / 点击建议「深挖」 | 审查进行中先 `wait_for_review`(超时 120s 拒绝);`resume_audit_with_message`:agent2 `mode="analyze"` 判断是否需 agent1 再执行一轮 → 需要则 agent1 一轮 + 再次后台审查,无需则直接收尾。多轮由用户驱动 |
 
 ### 7.4 事件流（event_bus）
 
@@ -703,6 +727,8 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 | `plan` | react_agent / CLI agent | plan 状态更新（round_idx + steps） |
 | `verify_action` | verifier_agent | 验证动作授权请求(`per_action` 模式,前端 VerifyActionDialog) |
 | `command_confirm` | sandbox_tools (local 模式) | 危险命令确认(前端 CommandConfirmDialog) |
+| `agent1_done` | orchestrator | agent1 轮结束、任务标记 COMPLETED(非终止事件,总线保持打开;data `{status:"completed"}`) |
+| `review_done` | orchestrator | 后台审查结束(非终止事件;data `{review_status:"done"/"failed"}`) |
 | `done` / `error` | orchestrator | 任务终止事件 |
 
 ---
@@ -726,7 +752,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 ### 8.3 防止死循环
 
 - **agent1（内置 react_agent）循环检测**：连续相同调用 + 滑动窗口低多样性检测，强制转入总结
-- **协作轮次可配**：总轮次经 `AgentPolicy.max_rounds` 配置（范围 1-10，默认 2，由 `MAX_MAX_ROUNDS=10` 钳制；任务级 `task.params._agent_policy` 覆盖；老用户已保存的旧值不回写）
+- **无协作总轮次死循环**：初始运行 agent1 只跑 1 轮，agent2 后台审查单次完成（`mode="review"`）；多轮由用户 resume 驱动，每次 resume = analyze + agent1 一轮 + 一次审查，不存在自动多轮循环（原 `max_rounds` / `MAX_RESUME_ROUNDS` 已移除）
 - **MAX_ITERATIONS=30**：单轮 ReAct 迭代上限
 - **MAX_READ_TOOL_CALLS=12**：agent2 单次评估只读核查工具调用上限
 - **MAX_VERIFY_CALLS=3**：agent2 单次评估 verifier_agent 调用上限
@@ -752,7 +778,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 
 | 文件 | 职责 |
 |------|------|
-| [orchestrator.py](../backend/app/agents/orchestrator.py) | 双智能体协作编排（协作循环 + resume） |
+| [orchestrator.py](../backend/app/agents/orchestrator.py) | 双智能体协作编排（agent1 单轮 + 后台审查 + resume） |
 | [agent2.py](../backend/app/agents/agent2.py) | agent2 实现（质检评估 / 审查维度自定 / 跨轮自记忆） |
 | [react_agent.py](../backend/app/agents/react_agent.py) | 内置 react_agent（流式 LLM / 工具调用 / plan 状态机 / 三级压缩跨轮记忆 / 循环检测） |
 | [verifier_agent.py](../backend/app/agents/verifier_agent.py) | 验证智能体（独立 ReAct 循环 + http_request / run_python_code 工具 + per_action 授权） |

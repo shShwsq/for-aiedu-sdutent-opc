@@ -64,7 +64,7 @@
 
 #### 工作区变更与协作策略
 
-- **协作策略独立表(agent_policies)**:用户级默认从 `user_preferences` JSONB 迁移为独立 1:1 表(agent2 启停 / 协作轮次 / 验证权限),任务级经 `task.params._agent_policy` 覆盖。
+- **协作策略独立表(agent_policies)**:用户级默认从 `user_preferences` JSONB 迁移为独立 1:1 表(agent2 启停 / 协作轮次 / 验证权限),任务级经 `task.params._agent_policy` 覆盖。(其中的“协作轮次 max_rounds”列已随 agent2 后台审查重构移除:初始运行 agent1 单轮即完成,多轮由用户 resume 驱动。)
 - **工作区变更捕获(workspace_diff)**:任务完成时捕获已跟踪 + 未跟踪文件合成 git patch,存 `task_artifacts`(kind=git_diff,上限 100 万字符);仓库树快照(kind=repo_tree)兜底;前端任务详情页展示变更区(按行着色、可折叠)。
 - (检查点评估与软中断功能曾在本阶段实现,后因价值/成本比不高整体移除:agent2 保留 round 边界完整评估,`AgentPolicy` 表的检查点/打断列一并清理。)
 

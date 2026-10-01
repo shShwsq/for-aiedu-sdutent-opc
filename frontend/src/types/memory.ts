@@ -18,7 +18,7 @@
 export interface UserPreferenceOut {
   /** 自由文本 Markdown(≤ 2000 字符) */
   user_profile: string
-  /** agent 策略配置(agent2 启停、协作轮次、验证权限等),null=未配置(用系统默认) */
+  /** agent 策略配置(agent2 启停、验证权限等),null=未配置(用系统默认) */
   agent_policy: SaveAgentPolicyRequest | null
   /** 任务完成后是否自动生成练习题 draft(默认开;产出仍需预览确认) */
   auto_generate_practice: boolean
@@ -70,8 +70,6 @@ export interface SavePracticeSettingsRequest {
 export interface SaveAgentPolicyRequest {
   /** 是否启用 agent2(关闭=单 agent 模式,跳过评估/验证) */
   agent2_enabled: boolean
-  /** agent2 协作总轮次(1-10,仅 agent2 启用时生效;默认 2:核查优先、追问兜底) */
-  max_rounds: number
   /** agent2 是否能自己验证(实验性,先留开关) */
   allow_verify: boolean
   /** agent2 是否能复核 AI助手引用的网址(后端安全抓取+SSRF 防护,结果仅供参考信号) */
@@ -99,17 +97,6 @@ export interface UserMemoryOut {
 /** 保存全局长期记忆请求(PUT /memory/global body) */
 export interface SaveUserMemoryRequest {
   content: string
-}
-
-/**
- * 系统级策略限制(GET /memory/policy-limits)
- *
- * 前端据此动态渲染输入上限,不硬编码。后端 max_rounds 可通过
- * 环境变量 SECONDLOOK_MAX_ROUNDS_LIMIT 调整。
- */
-export interface PolicyLimitsOut {
-  /** 协作总轮次上限(与后端 MAX_MAX_ROUNDS 对齐) */
-  max_rounds: number
 }
 
 /**

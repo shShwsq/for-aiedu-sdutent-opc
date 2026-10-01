@@ -32,7 +32,7 @@ import {
   listGitProviderRepos,
 } from '@/api/git_provider'
 import { getSkills, type SkillSummary } from '@/api/skill'
-import { getPolicyLimits, getPreferences } from '@/api/memory'
+import { getPreferences } from '@/api/memory'
 import { extractErrorMessage } from '@/utils/error'
 import type { Scenario } from '@/types/task'
 import type { LLMConfigItemOut } from '@/types/model_configs'
@@ -403,8 +403,6 @@ const error = ref('')
 
 /** 是否启用 agent2(关闭=单 agent 模式,跳过评估/验证) */
 const policyAgent2Enabled = ref(true)
-/** agent2 协作总轮次(1-10,仅 agent2 启用时生效) */
-const policyMaxRounds = ref(4)
 /** agent2 是否能自己验证(实验性) */
 const policyAllowVerify = ref(false)
 /** 执行智能体命令确认模式(任务级 _executor_command_confirm 覆盖;builtin 与 CLI 执行器均生效) */
@@ -425,7 +423,6 @@ const verifierAuthModeOptions = [
 /** 系统默认策略值(与后端 DEFAULT_AGENT_POLICY 对齐,作为未配置用户级默认时的兜底) */
 const DEFAULT_POLICY = {
   agent2_enabled: true,
-  max_rounds: 4,
   allow_verify: false,
   executor_command_confirm_default: 'always_approve' as 'always_approve' | 'per_command',
 }
@@ -437,63 +434,10 @@ const DEFAULT_POLICY = {
  */
 const userPolicyDefaults = ref({
   agent2Enabled: DEFAULT_POLICY.agent2_enabled,
-  maxRounds: DEFAULT_POLICY.max_rounds,
   allowVerify: DEFAULT_POLICY.allow_verify,
   verifierAuthMode: 'per_action' as 'direct' | 'per_action',
   executorCommandConfirm: DEFAULT_POLICY.executor_command_confirm_default,
 })
-
-// 协作总轮次上限:从后端 GET /memory/policy-limits 动态拉取(默认 10 兜底)
-const MAX_ROUNDS_LIMIT = ref(10)
-
-/** 协作总轮次帮助气泡是否展开 */
-const showMaxRoundsHelp = ref(false)
-
-/** 切换协作总轮次帮助气泡 */
-function toggleMaxRoundsHelp(e: Event): void {
-  e.stopPropagation()
-  showMaxRoundsHelp.value = !showMaxRoundsHelp.value
-}
-
-/** 点击帮助气泡外部时关闭 */
-function onDocClickCloseHelp(e: MouseEvent): void {
-  const target = e.target as HTMLElement
-  if (!target.closest('.field-help-wrap')) {
-    showMaxRoundsHelp.value = false
-  }
-}
-
-/**
- * 协作总轮次输入处理:只允许非负整数,实时过滤非数字字符,钳制到 [1, MAX_ROUNDS_LIMIT]
- * - 禁止负号、小数点、字母等非法字符
- * - 超过上限自动钳制
- * - 临时空值允许(让用户能删除后重新输入),由 @blur 兜底
- */
-function onMaxRoundsInput(e: Event): void {
-  const input = e.target as HTMLInputElement
-  // 只保留数字字符,过滤负号/小数点/字母
-  const filtered = input.value.replace(/\D/g, '')
-  if (filtered !== input.value) {
-    input.value = filtered
-  }
-  if (filtered === '') return  // 临时空,不更新 ref
-  let n = parseInt(filtered, 10)
-  if (n > MAX_ROUNDS_LIMIT.value) {
-    n = MAX_ROUNDS_LIMIT.value
-    input.value = String(n)
-  }
-  if (n < 1) n = 1
-  policyMaxRounds.value = n
-}
-
-/** 协作总轮次失焦:若为空,填默认值 1 */
-function onMaxRoundsBlur(e: Event): void {
-  const input = e.target as HTMLInputElement
-  if (input.value === '') {
-    input.value = '1'
-    policyMaxRounds.value = 1
-  }
-}
 
 // builtin + agent2 关闭:agent1 模型不再有「同评估模型」选项,
 // react 模型为空时自动补齐(兼容「手动关闭」与「初始加载即默认关闭」两种时机)
@@ -803,9 +747,6 @@ async function handleSubmit(): Promise<void> {
     if (policyAgent2Enabled.value !== userPolicyDefaults.value.agent2Enabled) {
       agentPolicy.agent2_enabled = policyAgent2Enabled.value
     }
-    if (policyMaxRounds.value !== userPolicyDefaults.value.maxRounds) {
-      agentPolicy.max_rounds = policyMaxRounds.value
-    }
     if (policyAllowVerify.value !== userPolicyDefaults.value.allowVerify) {
       agentPolicy.allow_verify = policyAllowVerify.value
     }
@@ -913,28 +854,24 @@ const executorOptions = computed(() => [
 ])
 
 onMounted(async () => {
-  document.addEventListener('click', onDocClickCloseHelp)
   document.addEventListener('keydown', onDrawerKeydown)
   try {
     // 并行拉取场景、模型、各 git provider 状态、技能、agent 配置
     // git provider 状态静默失败:未绑定不影响任务提交
-    const [scenarioList, models, ghStatus, giteeStatus, skills, agentCfgs, limits, prefs] = await Promise.all([
+    const [scenarioList, models, ghStatus, giteeStatus, skills, agentCfgs, prefs] = await Promise.all([
       getScenarios(),
       getMyModels().catch(() => null),
       getGitProviderStatus('github').catch(() => null),
       getGitProviderStatus('gitee').catch(() => null),
       getSkills().catch(() => null as SkillSummary[] | null), // 静默失败,无 skill 不阻塞提交
       getAgentConfigs().catch(() => null), // 静默失败,无 agent 配置不影响提交
-      getPolicyLimits().catch(() => null), // 静默失败:拿不到限制时保留默认 10
       getPreferences().catch(() => null), // 静默失败:未配置/未登录时用系统默认策略
     ])
-    if (limits) MAX_ROUNDS_LIMIT.value = limits.max_rounds
     // 用户级默认策略(协作策略设置页保存的):填充为协作策略表单初始值,
     // 并同步为提交时的比较基准(未配置时表单保持系统默认,行为不变)
     if (prefs?.agent_policy) {
       const p = prefs.agent_policy
       policyAgent2Enabled.value = p.agent2_enabled
-      policyMaxRounds.value = p.max_rounds
       policyAllowVerify.value = p.allow_verify
       // 测试环境授权模式默认值(任务级可单独覆盖)
       verifierAuthMode.value = p.verifier_auth_mode_default
@@ -943,7 +880,6 @@ onMounted(async () => {
       // 同步比较基准
       userPolicyDefaults.value = {
         agent2Enabled: policyAgent2Enabled.value,
-        maxRounds: policyMaxRounds.value,
         allowVerify: policyAllowVerify.value,
         verifierAuthMode: verifierAuthMode.value,
         executorCommandConfirm: policyExecutorCommandConfirm.value,
@@ -988,7 +924,6 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  document.removeEventListener('click', onDocClickCloseHelp)
   document.removeEventListener('keydown', onDrawerKeydown)
 })
 </script>
@@ -1302,7 +1237,7 @@ onUnmounted(() => {
                 </svg>
                 <span>协作策略</span>
                 <span class="advanced-summary">
-                  {{ policyMaxRounds }} 轮协作{{ policyAllowVerify ? '·可自行验证' : '' }}
+                  {{ policyAllowVerify ? '可自行验证' : '默认' }}
                 </span>
                 <svg
                   class="advanced-chevron"
@@ -1331,33 +1266,6 @@ onUnmounted(() => {
                     <!-- agent2 依赖字段:关闭时整组隐藏(v-show 保留值,提交 payload 不变) -->
                     <Transition name="collapse">
                       <div v-show="policyAgent2Enabled" class="policy-dependent">
-                    <!-- 协作总轮次(仅 agent2 启用时生效) -->
-                    <label class="policy-field">
-                      <div class="field-head">
-                        <span class="policy-label">协作总轮次</span>
-                        <div class="field-help-wrap">
-                          <button type="button" class="field-help-btn" aria-label="查看说明" @click="toggleMaxRoundsHelp">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-                          </button>
-                          <Transition name="help-fade">
-                            <div v-if="showMaxRoundsHelp" class="field-help-popover" role="tooltip">
-                              检查助手与 AI助手之间的协作总轮次。每轮含 AI助手执行 + 检查助手评估。轮次越多覆盖越全面但耗时越长。仅检查助手启用时生效。上限为 {{ MAX_ROUNDS_LIMIT }}。
-                            </div>
-                          </Transition>
-                        </div>
-                      </div>
-                      <input
-                        :value="policyMaxRounds"
-                        @input="onMaxRoundsInput"
-                        @blur="onMaxRoundsBlur"
-                        type="text"
-                        inputmode="numeric"
-                        pattern="[0-9]*"
-                        class="policy-input"
-                      />
-                      <span class="policy-hint">上限 {{ MAX_ROUNDS_LIMIT }}</span>
-                    </label>
-
                     <label class="policy-toggle-row">
                       <input v-model="policyAllowVerify" class="switch" type="checkbox" />
                       <span>允许检查助手自行验证 <span class="policy-experimental">(实验性)</span></span>
