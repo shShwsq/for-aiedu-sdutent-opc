@@ -113,9 +113,14 @@ async def lifespan(app: FastAPI):
     migrate_practice_learning_columns()
     # 迁移用户级 agent_policy:user_preferences.agent_policy JSONB → agent_policies 独立表
     # (拷数据后删旧列;必须晚于 migrate_user_preference_columns,新表已由 create_all 建好)
-    from app.models.agent_policy import migrate_agent_policy_table
+    from app.models.agent_policy import (
+        migrate_agent_policy_rename_columns,
+        migrate_agent_policy_table,
+    )
 
     migrate_agent_policy_table()
+    # 重命名 agent_policies 旧列 user_agent_enabled → agent2_enabled(修复协作策略页 500)
+    migrate_agent_policy_rename_columns()
     # 加 conversations.tool_call_id 列(tool_result 关联对应 tool_call,并行调用时前端精确配对)
     from app.models.task import migrate_conversation_tool_call_id
 

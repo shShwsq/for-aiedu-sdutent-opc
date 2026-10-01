@@ -241,3 +241,36 @@ def migrate_agent_policy_table() -> None:
             "agent_policy 迁移完成: %d 条记录拷入 agent_policies,旧列已删除",
             len(rows),
         )
+
+
+def migrate_agent_policy_rename_columns() -> None:
+    """幂等重命名 agent_policies 旧列,对齐 model(修复 /memory/preferences 500)
+
+    背景:项目用 Base.metadata.create_all(无 Alembic),已存在的表不会改列名。
+    老库 agent_policies 建表时启用开关列名为 user_agent_enabled(旧命名),
+    后来模型统一改为 agent2_enabled(与 DEFAULT_AGENT_POLICY / API 契约对齐),
+    ORM SELECT 找不到列 → GET/PUT /memory/preferences 500,协作策略页加载失败。
+
+    - user_agent_enabled 存在且 agent2_enabled 不存在 → RENAME(保留数据)
+    - 全新库(已是新列名)或已迁过 → 直接返回
+    """
+    import logging
+
+    from sqlalchemy import inspect, text
+
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    with engine.connect() as conn:
+        insp = inspect(conn)
+        if not insp.has_table("agent_policies"):
+            return
+        cols = {c["name"] for c in insp.get_columns("agent_policies")}
+        if "user_agent_enabled" in cols and "agent2_enabled" not in cols:
+            conn.execute(text(
+                "ALTER TABLE agent_policies RENAME COLUMN user_agent_enabled "
+                "TO agent2_enabled"
+            ))
+            log.info("agent_policies.user_agent_enabled → agent2_enabled 列重命名完成")
+        conn.commit()
