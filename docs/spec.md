@@ -163,7 +163,7 @@ agent2 对照**动态生成的 checklist**评估每轮:
   - 用户级默认:`agent_policy.executor_command_confirm_default`("always_approve" / "per_command"),在「协作策略」页设置
   - 任务级覆盖:`task.params._executor_command_confirm`,在「新建任务」页设置(builtin 与 CLI 执行器均显示)
   - 优先级:`task.params._executor_command_confirm` > `executor_command_confirm_default` > "always_approve"
-  - 后端 `agent_checkpoint.resolve_agent_policy` 把 `executor_command_confirm_default` 映射到 `task.params._executor_command_confirm`(若任务级未显式设置)
+  - 后端 `agent_policy.resolve_agent_policy` 把 `executor_command_confirm_default` 映射到 `task.params._executor_command_confirm`(若任务级未显式设置)
   - **传递路径**:react_agent.py 读取 `task.params._executor_command_confirm` → `set_current_task(executor_command_confirm=...)` → schema.py 的 `_CURRENT_EXECUTOR_COMMAND_CONFIRM` ContextVar → `execute_tool` 自动注入到 `run_command(command_confirm_mode=...)` 参数
 
 - **内置 react_agent 行为**(`sandbox_tools.run_command`):
@@ -285,8 +285,8 @@ Result(任务结果项,通用)
 - Task 新增 `paused` 状态
 - Conversation 新增 `round_idx`(协作轮次)、`reasoning`(思考链)、`message`(用户补充消息)、`history_compress`(LLM 压缩缓存)等类型
 
-**后续新增表**(详见 §9.15-9.19):
-- `AgentPolicy`(agent_policies):用户级协作策略独立表(1:1,检查点评估频率 / 打断权限 / 验证权限),从 `user_preferences` JSONB 迁移而来,任务级经 `task.params._agent_policy` 覆盖
+**后续新增表**(详见 §9.15-9.18):
+- `AgentPolicy`(agent_policies):用户级协作策略独立表(1:1,agent2 启停 / 协作轮次 / 验证权限),从 `user_preferences` JSONB 迁移而来,任务级经 `task.params._agent_policy` 覆盖
 - `TaskArtifact`(task_artifacts):任务工作区产物,1:N 挂在 Task 上(`kind=git_diff` 存工作区变更 patch,`kind=repo_tree` 存仓库树快照)
 - 练习模块表族(knowledge_points / questions / user_knowledge_states / practice_sessions / attempts / practice_settings):知识点、题库、SM-2 记忆状态、会话、答题流水与用户练习设置
 
@@ -721,17 +721,7 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 - 版本号 `ONBOARDING_VERSION` 递增时,老用户的完成标记作废,下次登录重新看到引导
 - 支持 ESC 跳过、方向键导航、resize / scroll 重定位
 
-### 9.15 检查点评估(agent_checkpoint,迭代边界方向纠偏)
-
-在 agent1(内置 react_agent 或外部 CLI)执行过程中,每 K 个迭代边界由 agent2 做一次**轻量方向评估**,与 round 边界的完整评估互补:
-- **触发**:`agent_checkpoint.py` 按 `resolve_agent_policy` 解析的用户级默认 + 任务级覆盖(`task.params._agent_policy`)计算实际生效的 K 值(`checkpoint_interval_builtin` / `checkpoint_interval_cli`,可空=用统一间隔)
-- **评估内容**:只判断方向是否明显跑偏(不做 covered/missing),仅在明显跑偏时生成追问指令,避免频繁打断影响 agent1 工作
-- **软中断**:`agent_interrupt.py` 维护 per-task 内存队列,跑偏指令入队后由 agent1 下一迭代边界 drain 出来,作为 user 消息注入 LLM 上下文(优先级低于真实用户消息 `user_messages`)
-- **落库与展示**:检查点评估结果落库为 `Conversation(type=evaluation, checkpoint=true)`,前端任务详情页右侧栏「检查点评估聚合」展示,点击可定位到对话流对应迭代边界(横线闪烁)
-- **策略表**:用户级默认存 `AgentPolicy` 独立表(1:1),保存接口 `PUT /memory/preferences/agent_policy`;老数据从 `user_preferences` JSONB 一次性迁移
-- **开关**:协作策略页可关闭检查点评估(`checkpoint_enabled`),默认开启
-
-### 9.16 练习题生成与自适应练习(Practice)
+### 9.15 练习题生成与自适应练习(Practice)
 
 **定位**:把「审计任务产出」与「学习练习」打通——任务完成后用户可把 Results(真实发现,带 CWE/severity/代码上下文)一键转化为题库;练习时按 **到期复习优先 > 薄弱点强化 > 难度匹配 > 新知识引入** 的加权策略即时组卷。全部为客观题(单选/判断),LLM 生成、后端程序判分。
 
@@ -770,21 +760,21 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 
 **出题日志**:`backend/logs/practice_generate.log`(滚动 10MB×3),记录模型解析 / 工作区状态 / 每条 finding 的解析与丢弃原因,便于排查"一道题也没生成"。
 
-### 9.17 工作区变更捕获(diff / patch)
+### 9.16 工作区变更捕获(diff / patch)
 
 任务完成时在容器内捕获工作区变更,持久化到 `task_artifacts` 表:
 - `kind=git_diff`:已跟踪文件(暂存 + 未暂存,`git diff HEAD`)+ 未跟踪文件(`git ls-files --others` 逐个读内容拼 new file patch)合成完整 patch,可用 `git apply` 重建工作区(单条上限 100 万字符,截断后仅供查阅)
 - `kind=repo_tree`:仓库树快照(上限 5000 条目),工作区不可用时兜底展示文件清单
 - 捕获失败不阻塞任务完成状态;前端任务详情页主区「工作区变更」区只读展示(按行着色,头部显示变更文件数 / 字符数 / 截断提示,支持折叠)
 
-### 9.18 代码审查能力增强
+### 9.17 代码审查能力增强
 
 在安全审计工具之外,为代码审查场景补齐质量与依赖分析能力:
 - **`run_lint` / `run_coverage`**(`quality_tools.py`):local 模式 `shutil.which` 检测宿主机工具,缺失返回指引不静默失败;sandbox 模式缺失自动 `pip install`。run_lint:Python 用 ruff、JS/TS 仅在存在 eslint 配置时尝试;run_coverage:Python 用 pytest-cov、JS 检测 vitest
 - **`list_dependencies`**(`dependency_tools.py`):扫描常见清单文件(requirements.txt / package.json / go.mod / Cargo.toml 等)返回结构化依赖(精确版本 vs 范围约束区分),串联 query_cve 批量查已知漏洞,省去逐个 read_file 解析的迭代成本
 - **新增 code_review 场景 skill**(`backend/skills/code_review/`):`review_concurrency`(并发安全)/ `review_error_handling`(错误处理)/ `review_test_quality`(测试质量),与既有 `code_security_audit` 三个 skill 并列
 
-### 9.19 Git 平台与克隆增强
+### 9.18 Git 平台与克隆增强
 
 - **Gitee refresh token 机制**:Gitee 的 access_token 带有效期,`GitProvider.refresh_access_token(refresh_token)` 在 token 过期时用 refresh_token 换新(返回新的 OAuthTokenSet,refresh_token 可能被轮转);GitHub 不支持刷新(refresh_token=None)。绑定数据存 `user_git_bindings` 时加密保存 refresh_token,克隆前自动判断并刷新
 - **克隆深度与超时**:`REPO_CLONE_DEPTH`(0=完整克隆默认,保留 git 历史供 log/blame 追溯;>0=浅克隆 `--depth N`)+ `REPO_CLONE_TIMEOUT`(默认 600s)

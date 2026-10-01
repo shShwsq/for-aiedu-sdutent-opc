@@ -2,7 +2,7 @@
 
 借鉴 deepseek-harness(Cordis)的"事件即扩展点"思想:
 - 领域事件 = agent 协作流程在阶段边界产生的客观事实
-  (任务启动/完成/失败、checklist 确认、追问、检查点评估、验证完成等)
+  (任务启动/完成/失败、checklist 确认、追问、轮完成、验证完成等)
 - 扩展代码(审计日志、统计、未来 webhook/通知)通过 subscribe() 挂载,
   不需要修改 orchestrator / agent2 主流程
 - 订阅是可逆的:subscribe() 返回退订函数,调用即回滚该订阅
@@ -139,7 +139,7 @@ def emit(
 ) -> DomainEvent:
     """发出一个领域事件,同步分发给所有匹配的订阅者
 
-    在流程边界调用(orchestrator / agent2 / agent_checkpoint 等),
+    在流程边界调用(orchestrator / agent2 等),
     handler 的异常在这里被隔离 —— 扩展挂掉绝不拖垮主流程。
 
     返回构造出的 DomainEvent(便于测试断言与调用方日志)。

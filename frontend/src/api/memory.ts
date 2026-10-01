@@ -48,7 +48,7 @@ export function savePracticeSettings(
   return client.put('/memory/preferences/practice', body).then((r) => r.data)
 }
 
-/** 保存/更新 agent 策略配置(检查点评估频率、打断权限等) */
+/** 保存/更新 agent 策略配置(agent2 启停、协作轮次、验证权限等) */
 export function saveAgentPolicy(body: SaveAgentPolicyRequest): Promise<UserPreferenceOut> {
   return client.put('/memory/preferences/agent_policy', body).then((r) => r.data)
 }

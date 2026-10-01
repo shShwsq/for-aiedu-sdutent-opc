@@ -121,6 +121,14 @@ async def lifespan(app: FastAPI):
     migrate_agent_policy_table()
     # 重命名 agent_policies 旧列 user_agent_enabled → agent2_enabled(修复协作策略页 500)
     migrate_agent_policy_rename_columns()
+    # 检查点/打断功能移除:删 agent_policies 5 个旧列 + 清理 conversations 历史过程记录
+    from app.models.agent_policy import (
+        migrate_agent_policy_drop_checkpoint_columns,
+        migrate_conversations_drop_checkpoint_records,
+    )
+
+    migrate_agent_policy_drop_checkpoint_columns()
+    migrate_conversations_drop_checkpoint_records()
     # 加 conversations.tool_call_id 列(tool_result 关联对应 tool_call,并行调用时前端精确配对)
     from app.models.task import migrate_conversation_tool_call_id
 

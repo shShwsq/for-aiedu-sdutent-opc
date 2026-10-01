@@ -7,14 +7,13 @@
 SecondLook 的每个任务由两个智能体协作完成:
 
 - **Agent 1 —— 执行智能体(前端显示「AI助手」)**:负责实际执行代码分析,可为内置 LLM 驱动的 `react_agent`,或外部 CLI 执行器(Qoder CLI / DeepSeek Harness CLI / Codex CLI)。
-- **Agent 2 —— 质检智能体(前端显示「检查助手」)**:扮演严谨的质量审查官,职责:①质检审查 Agent 1 的结果(检查点评估);②必要时中断任务向用户追问补全;③生成题目和知识点(practice 服务);④具备读文件能力与生成 PoC 的能力(验证动作:`http_request` / `run_python_code`,支持 `per_action` / `direct` 两种授权模式)。
+- **Agent 2 —— 质检智能体(前端显示「检查助手」)**:扮演严谨的质量审查官,职责:①质检审查 Agent 1 的结果(轮次评估);②必要时中断任务向用户追问补全;③生成题目和知识点(practice 服务);④具备读文件能力与生成 PoC 的能力(验证动作:`http_request` / `run_python_code`,支持 `per_action` / `direct` 两种授权模式)。
 
-AI助手 每完成一轮,检查助手 评估一次,决定继续、追问还是完成。协作策略页可配置总轮次(1-10,默认 4)、评估频率 K、允许打断等;关闭 Agent 2 后退化为单 agent 模式。
+AI助手 每完成一轮,检查助手 评估一次,决定继续、追问还是完成。协作策略页可配置总轮次(1-10,默认 4)等;关闭 Agent 2 后退化为单 agent 模式。
 
 ## 核心特性
 
 - **双智能体协作**:Agent 1 执行智能体(`react_agent` 或外部 CLI,前端显示「AI助手」)+ Agent 2 质检智能体(质检审查 + 追问补全,前端显示「检查助手」)多轮迭代,自动补齐覆盖盲区;关闭 Agent 2 退化为单 agent 模式
-- **检查点评估**:AI助手 执行过程中,检查助手 在迭代边界做轻量方向纠偏,发现跑偏时软中断拉回
 - **执行器抽象层**:内置 react_agent / Qoder CLI / DeepSeek Harness CLI(dsh)/ Codex CLI 等可插拔执行器,通过 ACP 协议统一通信
 - **交付物上传**:任务创建页交付物来源三 Tab —— Git 仓库 / 上传 ZIP / 上传单文件;`upload_id` 与 `repo_url` 后端互斥,上传模式下任务说明必填,ZIP 有 zip-slip 防护与大小限制;上传为可选,不传时为纯文本任务
 - **场景模板化**:安全审计、代码审查等场景作为快捷模板(预设提示词 + 推荐 skill),checklist 由 LLM 动态生成 + 用户编辑确认
@@ -51,7 +50,7 @@ SecondLook/
 │   │   ├── services/         # 练习引擎(SM-2 / selector / generator)+ 记忆 / 工作区 diff
 │   │   ├── skills/           # 技能加载器 + skill 注册表
 │   │   ├── tools/            # ReAct 工具(clone_repo / search_code / run_lint / ...)
-│   │   ├── agent_checkpoint.py # 检查点评估(迭代边界方向纠偏)
+│   │   ├── agent_policy.py    # 协作策略(默认值 + 用户级/任务级合并解析)
 │   │   ├── config.py         # 环境变量配置(pydantic-settings)
 │   │   ├── git_provider.py   # Git 平台抽象层(GitHub / Gitee)
 │   │   └── main.py           # FastAPI 入口
@@ -356,7 +355,7 @@ bash deploy.sh                               # 一键构建 + 启动
 - [规格说明](docs/spec.md) —— 完整产品规格与架构设计
 - [开发路线图](docs/Roadmap.md) —— 阶段规划与进度
 - [沙箱部署指南](docs/opensandbox-deploy.md) —— OpenSandbox Server 部署与镜像构建
-- [智能体架构](docs/agent-architecture.md) —— agent1(执行)/ agent2(质检)/ CLI 智能体内幕、上下文传递与检查点评估
+- [智能体架构](docs/agent-architecture.md) —— agent1(执行)/ agent2(质检)/ CLI 智能体内幕、上下文传递与协作策略
 - [任务详情页结构](docs/task-detail-view-structure.md) —— TaskDetailView 布局与渲染管线
 
 ## 开发说明

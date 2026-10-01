@@ -63,10 +63,6 @@
   --color-plan-active-icon: #f59e0b;
   --color-plan-active-icon-bg: rgba(245, 158, 11, 0.15);
 
-  /* ---- 色彩:检查点打断卡片(agent2 interrupt) ---- */
-  --color-checkpoint-interrupt-bg: #fff7ed;
-  --color-checkpoint-interrupt-border: #fdba74;
-
   /* ---- 色彩:警告条 ---- */
   --color-alert-error-border: #fecaca;
 
@@ -205,10 +201,6 @@
   --color-plan-active-bg: rgba(251, 191, 36, 0.1);
   --color-plan-active-icon: #fbbf24;
   --color-plan-active-icon-bg: rgba(251, 191, 36, 0.18);
-
-  /* ---- 色彩:检查点打断卡片 ---- */
-  --color-checkpoint-interrupt-bg: #431407;
-  --color-checkpoint-interrupt-border: #7c2d12;
 
   /* ---- 色彩:警告条 ---- */
   --color-alert-error-border: #7f1d1d;

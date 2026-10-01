@@ -18,7 +18,7 @@
 export interface UserPreferenceOut {
   /** 自由文本 Markdown(≤ 2000 字符) */
   user_profile: string
-  /** agent 策略配置(检查点评估频率、打断权限等),null=未配置(用系统默认) */
+  /** agent 策略配置(agent2 启停、协作轮次、验证权限等),null=未配置(用系统默认) */
   agent_policy: SaveAgentPolicyRequest | null
   /** 任务完成后是否自动生成练习题 draft(默认开;产出仍需预览确认) */
   auto_generate_practice: boolean
@@ -68,20 +68,10 @@ export interface SavePracticeSettingsRequest {
  * 作为用户级默认值,任务级可通过 task.params["_agent_policy"] 覆盖。
  */
 export interface SaveAgentPolicyRequest {
-  /** 是否启用 agent2(关闭=单 agent 模式,跳过评估/打断/验证) */
+  /** 是否启用 agent2(关闭=单 agent 模式,跳过评估/验证) */
   agent2_enabled: boolean
   /** agent2 协作总轮次(1-10,仅 agent2 启用时生效) */
   max_rounds: number
-  /** 统一 K 值,每 K 个迭代评估一次 */
-  checkpoint_interval: number
-  /** 高级:内置 agent1 专用 K 值(null=用统一值) */
-  checkpoint_interval_builtin: number | null
-  /** 高级:CLI agent 专用 K 值(null=用统一值) */
-  checkpoint_interval_cli: number | null
-  /** agent2 是否能打断 agent1 */
-  allow_interrupt: boolean
-  /** 每轮最多打断次数(防死锁) */
-  max_interrupts_per_round: number
   /** agent2 是否能自己验证(实验性,先留开关) */
   allow_verify: boolean
   /** 验证授权默认模式:"direct" 直接执行 / "per_action" 逐动作授权(任务级可覆盖) */

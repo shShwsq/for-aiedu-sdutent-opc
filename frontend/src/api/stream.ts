@@ -16,7 +16,6 @@
 import { getAccessToken } from './client'
 import { clientLog } from '@/utils/clientLog'
 import type {
-  AgentCheckpointEventData,
   ChecklistReviewEventData,
   CloneProgressEventData,
   CommandConfirmEventData,
@@ -24,7 +23,6 @@ import type {
   ConversationEventData,
   ConversationUpdateEventData,
   DoneEventData,
-  InterruptCancelledEventData,
   PlanEventData,
   QuestionEventData,
   SSEEvent,
@@ -55,10 +53,6 @@ export interface StreamCallbacks {
   onVerifyAction?: (data: VerifyActionEventData) => void
   /** 危险命令确认(local 模式安全策略,LLM 执行危险命令时需用户确认) */
   onCommandConfirm?: (data: CommandConfirmEventData) => void
-  /** agent2 检查点评估结果(迭代边界轻量评估,interrupt=true 时已注入追问) */
-  onAgentCheckpoint?: (data: AgentCheckpointEventData) => void
-  /** 用户取消了待生效的检查点打断(CLI 执行器 pending 窗口内) */
-  onInterruptCancelled?: (data: InterruptCancelledEventData) => void
   onDone?: (data: DoneEventData) => void
   onError?: (data: DoneEventData) => void
 }
@@ -92,8 +86,6 @@ export function subscribeTaskStream(
     'checklist_review',
     'verify_action',
     'command_confirm',
-    'agent_checkpoint',
-    'interrupt_cancelled',
     'done',
     'error',
   ]
@@ -147,12 +139,6 @@ export function subscribeTaskStream(
             break
           case 'command_confirm':
             callbacks.onCommandConfirm?.(data as unknown as CommandConfirmEventData)
-            break
-          case 'agent_checkpoint':
-            callbacks.onAgentCheckpoint?.(data as unknown as AgentCheckpointEventData)
-            break
-          case 'interrupt_cancelled':
-            callbacks.onInterruptCancelled?.(data as unknown as InterruptCancelledEventData)
             break
           case 'done':
             // [诊断] done 事件:任务结束,记录触发时前端是否在 resume 窗口

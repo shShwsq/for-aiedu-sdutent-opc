@@ -2,9 +2,8 @@
 /**
  * 协作策略设置页(/agent-policy)
  *
- * 作为 agent2 检查点评估的用户级默认配置:
- * - 评估频率 K:每 K 个 agent1 迭代做一次轻量检查点评估
- * - 打断权限:agent2 是否能通过中断队列向 agent1 注入追问指令(软中断)
+ * 作为 agent2(检查助手)协作策略的用户级默认配置:
+ * - agent2 启停与协作总轮次
  * - 验证权限:agent2 是否能自行调用工具验证(实验性)
  * - 验证授权模式:验证动作的默认授权模式(直接执行 / 逐动作授权)
  *
@@ -41,11 +40,6 @@ const MAX_ROUNDS_LIMIT = ref(10)
 const DEFAULT_POLICY = {
   agent2_enabled: true,
   max_rounds: 4,
-  checkpoint_interval: 10,
-  checkpoint_interval_builtin: null as number | null,
-  checkpoint_interval_cli: null as number | null,
-  allow_interrupt: true,
-  max_interrupts_per_round: 2,
   allow_verify: false,
   verifier_auth_mode_default: 'per_action' as 'direct' | 'per_action',
   executor_command_confirm_default: 'always_approve' as 'always_approve' | 'per_command',
@@ -54,20 +48,10 @@ const DEFAULT_POLICY = {
 // ============================================================
 // 表单状态
 // ============================================================
-/** 是否启用 agent2(关闭=单 agent 模式,跳过评估/打断/验证) */
+/** 是否启用 agent2(关闭=单 agent 模式,跳过评估/验证) */
 const policyAgent2Enabled = ref(DEFAULT_POLICY.agent2_enabled)
 /** agent2 协作总轮次(1-10,仅 agent2 启用时生效) */
 const policyMaxRounds = ref(DEFAULT_POLICY.max_rounds)
-/** 统一 K 值:每 K 个迭代评估一次(1-20) */
-const policyInterval = ref(DEFAULT_POLICY.checkpoint_interval)
-/** 内置 agent1 专用 K 值(null=用统一值) */
-const policyIntervalBuiltin = ref<number | null>(DEFAULT_POLICY.checkpoint_interval_builtin)
-/** CLI agent 专用 K 值(null=用统一值) */
-const policyIntervalCli = ref<number | null>(DEFAULT_POLICY.checkpoint_interval_cli)
-/** agent2 是否能打断 agent1 */
-const policyAllowInterrupt = ref(DEFAULT_POLICY.allow_interrupt)
-/** 每轮最多打断次数(防死锁,0-10) */
-const policyMaxInterrupts = ref(DEFAULT_POLICY.max_interrupts_per_round)
 /** agent2 是否能自己验证(实验性) */
 const policyAllowVerify = ref(DEFAULT_POLICY.allow_verify)
 /** 验证授权默认模式(任务级可覆盖) */
@@ -87,18 +71,10 @@ const executorConfirmOptions = computed(() => [
   { value: 'per_command' as 'always_approve' | 'per_command', label: '逐命令确认(危险命令弹窗批准)' },
 ])
 
-/** 是否分别配置内置/CLI 的 K 值(高级) */
-const policyAdvanced = ref(false)
-
 /** 策略原始值(脏检查基准,hydrate 时写入) */
 const originalPolicy = ref({
   agent2Enabled: DEFAULT_POLICY.agent2_enabled,
   maxRounds: DEFAULT_POLICY.max_rounds,
-  interval: DEFAULT_POLICY.checkpoint_interval,
-  intervalBuiltin: DEFAULT_POLICY.checkpoint_interval_builtin as number | null,
-  intervalCli: DEFAULT_POLICY.checkpoint_interval_cli as number | null,
-  allowInterrupt: DEFAULT_POLICY.allow_interrupt,
-  maxInterrupts: DEFAULT_POLICY.max_interrupts_per_round,
   allowVerify: DEFAULT_POLICY.allow_verify,
   verifierAuthMode: DEFAULT_POLICY.verifier_auth_mode_default,
   executorCommandConfirm: DEFAULT_POLICY.executor_command_confirm_default,
@@ -109,11 +85,6 @@ const policyDirty = computed(() => {
   return (
     policyAgent2Enabled.value !== originalPolicy.value.agent2Enabled ||
     policyMaxRounds.value !== originalPolicy.value.maxRounds ||
-    policyInterval.value !== originalPolicy.value.interval ||
-    policyIntervalBuiltin.value !== originalPolicy.value.intervalBuiltin ||
-    policyIntervalCli.value !== originalPolicy.value.intervalCli ||
-    policyAllowInterrupt.value !== originalPolicy.value.allowInterrupt ||
-    policyMaxInterrupts.value !== originalPolicy.value.maxInterrupts ||
     policyAllowVerify.value !== originalPolicy.value.allowVerify ||
     policyVerifierAuthMode.value !== originalPolicy.value.verifierAuthMode ||
     policyExecutorCommandConfirm.value !== originalPolicy.value.executorCommandConfirm
@@ -127,15 +98,9 @@ useUnsavedGuard(policyDirty, () => handleSave())
 function resetPolicyToDefault(): void {
   policyAgent2Enabled.value = DEFAULT_POLICY.agent2_enabled
   policyMaxRounds.value = DEFAULT_POLICY.max_rounds
-  policyInterval.value = DEFAULT_POLICY.checkpoint_interval
-  policyIntervalBuiltin.value = DEFAULT_POLICY.checkpoint_interval_builtin
-  policyIntervalCli.value = DEFAULT_POLICY.checkpoint_interval_cli
-  policyAllowInterrupt.value = DEFAULT_POLICY.allow_interrupt
-  policyMaxInterrupts.value = DEFAULT_POLICY.max_interrupts_per_round
   policyAllowVerify.value = DEFAULT_POLICY.allow_verify
   policyVerifierAuthMode.value = DEFAULT_POLICY.verifier_auth_mode_default
   policyExecutorCommandConfirm.value = DEFAULT_POLICY.executor_command_confirm_default
-  policyAdvanced.value = false
 }
 
 /**
@@ -198,25 +163,13 @@ async function loadPolicy(): Promise<void> {
     const policy = data.agent_policy
     policyAgent2Enabled.value = policy?.agent2_enabled ?? DEFAULT_POLICY.agent2_enabled
     policyMaxRounds.value = policy?.max_rounds ?? DEFAULT_POLICY.max_rounds
-    policyInterval.value = policy?.checkpoint_interval ?? DEFAULT_POLICY.checkpoint_interval
-    policyIntervalBuiltin.value = policy?.checkpoint_interval_builtin ?? DEFAULT_POLICY.checkpoint_interval_builtin
-    policyIntervalCli.value = policy?.checkpoint_interval_cli ?? DEFAULT_POLICY.checkpoint_interval_cli
-    policyAllowInterrupt.value = policy?.allow_interrupt ?? DEFAULT_POLICY.allow_interrupt
-    policyMaxInterrupts.value = policy?.max_interrupts_per_round ?? DEFAULT_POLICY.max_interrupts_per_round
     policyAllowVerify.value = policy?.allow_verify ?? DEFAULT_POLICY.allow_verify
     policyVerifierAuthMode.value = policy?.verifier_auth_mode_default ?? DEFAULT_POLICY.verifier_auth_mode_default
     policyExecutorCommandConfirm.value = policy?.executor_command_confirm_default ?? DEFAULT_POLICY.executor_command_confirm_default
-    // 高级模式:仅当任一专用 K 值非 null 时展开
-    policyAdvanced.value = policyIntervalBuiltin.value !== null || policyIntervalCli.value !== null
     // 同步原始值(脏检查基准)
     originalPolicy.value = {
       agent2Enabled: policyAgent2Enabled.value,
       maxRounds: policyMaxRounds.value,
-      interval: policyInterval.value,
-      intervalBuiltin: policyIntervalBuiltin.value,
-      intervalCli: policyIntervalCli.value,
-      allowInterrupt: policyAllowInterrupt.value,
-      maxInterrupts: policyMaxInterrupts.value,
       allowVerify: policyAllowVerify.value,
       verifierAuthMode: policyVerifierAuthMode.value,
       executorCommandConfirm: policyExecutorCommandConfirm.value,
@@ -235,12 +188,6 @@ async function handleSave(): Promise<boolean> {
     const body: SaveAgentPolicyRequest = {
       agent2_enabled: policyAgent2Enabled.value,
       max_rounds: policyMaxRounds.value,
-      checkpoint_interval: policyInterval.value,
-      // 关闭高级模式时,专用 K 值强制为 null(用统一值)
-      checkpoint_interval_builtin: policyAdvanced.value ? policyIntervalBuiltin.value : null,
-      checkpoint_interval_cli: policyAdvanced.value ? policyIntervalCli.value : null,
-      allow_interrupt: policyAllowInterrupt.value,
-      max_interrupts_per_round: policyAllowInterrupt.value ? policyMaxInterrupts.value : 0,
       allow_verify: policyAllowVerify.value,
       verifier_auth_mode_default: policyVerifierAuthMode.value,
       executor_command_confirm_default: policyExecutorCommandConfirm.value,
@@ -252,24 +199,13 @@ async function handleSave(): Promise<boolean> {
     if (policy) {
       policyAgent2Enabled.value = policy.agent2_enabled
       policyMaxRounds.value = policy.max_rounds
-      policyInterval.value = policy.checkpoint_interval
-      policyIntervalBuiltin.value = policy.checkpoint_interval_builtin
-      policyIntervalCli.value = policy.checkpoint_interval_cli
-      policyAllowInterrupt.value = policy.allow_interrupt
-      policyMaxInterrupts.value = policy.max_interrupts_per_round
       policyAllowVerify.value = policy.allow_verify
       policyVerifierAuthMode.value = policy.verifier_auth_mode_default
       policyExecutorCommandConfirm.value = policy.executor_command_confirm_default
-      policyAdvanced.value = policyIntervalBuiltin.value !== null || policyIntervalCli.value !== null
     }
     originalPolicy.value = {
       agent2Enabled: policyAgent2Enabled.value,
       maxRounds: policyMaxRounds.value,
-      interval: policyInterval.value,
-      intervalBuiltin: policyIntervalBuiltin.value,
-      intervalCli: policyIntervalCli.value,
-      allowInterrupt: policyAllowInterrupt.value,
-      maxInterrupts: policyMaxInterrupts.value,
       allowVerify: policyAllowVerify.value,
       verifierAuthMode: policyVerifierAuthMode.value,
       executorCommandConfirm: policyExecutorCommandConfirm.value,
@@ -302,23 +238,15 @@ function formatTime(iso: string | null | undefined): string {
 /** 各字段帮助说明(点击问号按钮展示) */
 const FIELD_HELP: Record<string, string> = {
   agent2_enabled:
-    '开启后,检查助手参与协作(初始评估、检查点评估、打断、验证)。关闭后退化为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做覆盖度评估、不打断、不验证。适合简单任务或用户完全信任 AI助手的场景。',
+    '开启后,检查助手参与协作(初始评估、轮次评估、验证)。关闭后退化为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做覆盖度评估、不验证。适合简单任务或用户完全信任 AI助手的场景。',
   max_rounds:
     '检查助手与 AI助手之间的协作总轮次。每轮含 AI助手执行 + 检查助手评估。轮次越多覆盖越全面但耗时越长。仅检查助手启用时生效。上限为 10。',
-  checkpoint_interval:
-    '检查助手每 K 个 AI助手迭代做一次轻量检查点评估,判断方向是否跑偏。K 越小评估越频繁(更早纠偏,但开销更大),K 越大开销越小(但跑偏更晚发现)。',
-  max_interrupts:
-    '防死锁上限:单轮协作中检查助手最多打断 AI助手的次数。超过此上限后即使发现跑偏也只观察不干预,把控制权交还 AI助手。',
-  allow_interrupt:
-    '开启后,检查助手在检查点评估发现跑偏时,可通过中断队列向 AI助手注入追问指令(软中断),不强行终止当前迭代。',
   allow_verify:
     '开启后,检查助手可自行调用工具验证 AI助手的产出。目前为实验性开关,默认关闭。任务还需在提交时配置测试环境 URL 才会真正触发验证。',
   verifier_auth_mode:
     '仅在开启「自行验证」时生效。逐动作授权:每个验证动作(HTTP 请求 / PoC 脚本)执行前弹窗让用户确认;直接执行:验证动作自动执行不弹窗。此为用户级默认,任务创建或运行时可单独覆盖。',
   executor_command_confirm:
     '控制执行智能体(内置执行器 / Qoder / DeepSeek / Codex)执行危险命令时是否弹窗确认。自动批准:所有命令直接执行不弹窗(速度快,适合可信任务);逐命令确认:每个危险命令执行前弹窗让用户批准(更安全,防容器破坏/资源耗尽)。此为用户级默认,任务创建时可单独覆盖。注意:Codex CLI 受非交互模式限制,仅支持自动批准,选择「逐命令确认」时会降级并警告。',
-  policy_advanced:
-    '高级选项。内置执行器和外部 CLI agent 的迭代节奏可能不同,可分别设置评估频率。留空则使用统一 K 值。',
 }
 
 /** 当前展开帮助气泡的字段 key(null=无展开) */
@@ -374,7 +302,7 @@ onUnmounted(() => {
             <div>
               <h1>协作策略</h1>
               <p class="page-subtitle">
-                检查助手检查点评估的用户级默认。任务创建时可单独覆盖。
+                检查助手协作策略的用户级默认。任务创建时可单独覆盖。
               </p>
             </div>
             <div class="header-meta">
@@ -416,7 +344,7 @@ onUnmounted(() => {
 
             <!-- 单 agent 模式提示:agent2 关闭时说明下方依赖字段为何隐藏 -->
             <p v-if="!policyAgent2Enabled" class="policy-single-hint">
-              当前为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做覆盖度评估、打断与验证。
+              当前为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做覆盖度评估与验证。
             </p>
 
             <!-- agent2 依赖字段:关闭时整组隐藏(v-show 保留值,保存 payload 不变) -->
@@ -450,71 +378,7 @@ onUnmounted(() => {
               />
               <span class="policy-hint">上限 {{ MAX_ROUNDS_LIMIT }}</span>
             </label>
-  
-            <div class="policy-grid">
-              <label class="policy-field">
-                <div class="field-head">
-                  <span class="policy-label">评估频率 K</span>
-                  <div
-                    :ref="(el) => { if (el) fieldHelpRefs.set('checkpoint_interval', el as HTMLElement); else fieldHelpRefs.delete('checkpoint_interval') }"
-                    class="field-help-wrap"
-                  >
-                    <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('checkpoint_interval')">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-                    </button>
-                    <Transition name="help-fade">
-                      <div v-if="openHelpKey === 'checkpoint_interval'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.checkpoint_interval }}</div>
-                    </Transition>
-                  </div>
-                </div>
-                <input
-                  v-model.number="policyInterval"
-                  type="number" min="1" max="20"
-                  class="policy-input"
-                  :disabled="saving"
-                />
-              </label>
-  
-              <label class="policy-field">
-                <div class="field-head">
-                  <span class="policy-label">每轮最大打断</span>
-                  <div
-                    :ref="(el) => { if (el) fieldHelpRefs.set('max_interrupts', el as HTMLElement); else fieldHelpRefs.delete('max_interrupts') }"
-                    class="field-help-wrap"
-                  >
-                    <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('max_interrupts')">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-                    </button>
-                    <Transition name="help-fade">
-                      <div v-if="openHelpKey === 'max_interrupts'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.max_interrupts }}</div>
-                    </Transition>
-                  </div>
-                </div>
-                <input
-                  v-model.number="policyMaxInterrupts"
-                  type="number" min="0" max="10"
-                  class="policy-input"
-                  :disabled="saving || !policyAllowInterrupt"
-                />
-              </label>
-            </div>
-  
-            <label class="policy-toggle-row">
-              <input v-model="policyAllowInterrupt" class="switch" type="checkbox" :disabled="saving || !policyAgent2Enabled" />
-              <span>允许检查助手打断 AI助手</span>
-              <div
-                :ref="(el) => { if (el) fieldHelpRefs.set('allow_interrupt', el as HTMLElement); else fieldHelpRefs.delete('allow_interrupt') }"
-                class="field-help-wrap"
-              >
-                <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('allow_interrupt')">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-                </button>
-                <Transition name="help-fade">
-                  <div v-if="openHelpKey === 'allow_interrupt'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.allow_interrupt }}</div>
-                </Transition>
-              </div>
-            </label>
-  
+
             <label class="policy-toggle-row">
               <input v-model="policyAllowVerify" class="switch" type="checkbox" :disabled="saving || !policyAgent2Enabled" />
               <span>允许检查助手自行验证 <span class="policy-experimental">(实验性)</span></span>
@@ -586,51 +450,6 @@ onUnmounted(() => {
               />
             </label>
 
-            <Transition name="collapse">
-              <div v-show="policyAgent2Enabled" class="policy-dependent">
-            <label class="policy-toggle-row">
-              <input v-model="policyAdvanced" class="switch" type="checkbox" :disabled="saving" />
-              <span>分别配置内置 / CLI agent 的 K 值</span>
-              <div
-                :ref="(el) => { if (el) fieldHelpRefs.set('policy_advanced', el as HTMLElement); else fieldHelpRefs.delete('policy_advanced') }"
-                class="field-help-wrap"
-              >
-                <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('policy_advanced')">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-                </button>
-                <Transition name="help-fade">
-                  <div v-if="openHelpKey === 'policy_advanced'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.policy_advanced }}</div>
-                </Transition>
-              </div>
-            </label>
-  
-            <Transition name="collapse">
-              <div v-show="policyAdvanced" class="policy-grid">
-                <label class="policy-field">
-                  <span class="policy-label">内置执行器 K</span>
-                  <input
-                    v-model.number="policyIntervalBuiltin"
-                    type="number" min="1" max="20"
-                    class="policy-input"
-                    placeholder="留空用统一值"
-                    :disabled="saving"
-                  />
-                </label>
-                <label class="policy-field">
-                  <span class="policy-label">CLI agent K</span>
-                  <input
-                    v-model.number="policyIntervalCli"
-                    type="number" min="1" max="20"
-                    class="policy-input"
-                    placeholder="留空用统一值"
-                    :disabled="saving"
-                  />
-                </label>
-              </div>
-            </Transition>
-              </div>
-            </Transition>
-  
             <!-- 操作区 -->
             <div class="policy-actions">
               <button
@@ -821,13 +640,6 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-}
-
-.policy-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--space-3);
-  margin-bottom: var(--space-2);
 }
 
 .policy-field {

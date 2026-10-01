@@ -350,8 +350,6 @@ class RuntimePolicyUpdate(BaseModel):
     仅暴露高频字段;None=不修改该字段。
     """
 
-    checkpoint_interval: int | None = Field(default=None, ge=1, le=20)
-    allow_interrupt: bool | None = None
     max_rounds: int | None = Field(default=None, ge=1)
 
 

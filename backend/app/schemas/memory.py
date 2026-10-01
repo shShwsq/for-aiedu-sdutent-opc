@@ -32,7 +32,7 @@ class UserPreferenceOut(BaseModel):
 
     # 自由文本 Markdown(用户在记忆管理页编辑,注入 agent2)
     user_profile: str = ""
-    # agent 策略配置(检查点评估频率、打断权限、验证权限)
+    # agent 策略配置(agent2 启停、协作轮次、验证权限)
     # None 表示未配置(用系统默认),dict 表示用户自定义的覆盖值
     agent_policy: dict[str, Any] | None = None
     # 任务完成后是否自动生成练习题 draft(默认开)
@@ -95,14 +95,9 @@ class SavePracticeSettingsRequest(BaseModel):
 class SaveAgentPolicyRequest(BaseModel):
     """保存 agent 策略配置请求(PUT /memory/preferences/agent_policy)
 
-    结构与 agent_checkpoint.DEFAULT_AGENT_POLICY 对齐:
+    结构与 agent_policy.DEFAULT_AGENT_POLICY 对齐:
     - agent2_enabled: 是否启用 agent2(关闭=单 agent 模式)
     - max_rounds: agent2 协作总轮次(上限由 MAX_MAX_ROUNDS 控制)
-    - checkpoint_interval: 统一 K 值(每 K 个迭代评估一次)
-    - checkpoint_interval_builtin: 内置 react_agent 专用 K 值(null=用统一值)
-    - checkpoint_interval_cli: CLI agent 专用 K 值(null=用统一值)
-    - allow_interrupt: agent2 是否能打断 react_agent
-    - max_interrupts_per_round: 每轮最多打断次数
     - allow_verify: agent2 是否能调用 verifier_agent 验证(需任务配了 test_env_url)
     - verifier_auth_mode_default: 验证授权默认模式("direct"直接执行 / "per_action"逐动作授权)
     - executor_command_confirm_default: 执行智能体命令确认默认模式
@@ -112,11 +107,6 @@ class SaveAgentPolicyRequest(BaseModel):
     agent2_enabled: bool = True
     # 上界在路由层用 MAX_MAX_ROUNDS 动态校验(schema 层只校验下界)
     max_rounds: int = Field(default=4, ge=1)
-    checkpoint_interval: int = Field(default=10, ge=1, le=20)
-    checkpoint_interval_builtin: int | None = Field(default=None, ge=1, le=20)
-    checkpoint_interval_cli: int | None = Field(default=None, ge=1, le=20)
-    allow_interrupt: bool = True
-    max_interrupts_per_round: int = Field(default=2, ge=0, le=10)
     allow_verify: bool = False
     verifier_auth_mode_default: str = Field(default="per_action", pattern="^(direct|per_action)$")
     executor_command_confirm_default: str = Field(

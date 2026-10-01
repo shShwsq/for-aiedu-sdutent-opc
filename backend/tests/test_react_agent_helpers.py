@@ -12,7 +12,6 @@ from app.agents.react_agent import (
     _build_tool_intent,
     _extract_plan,
     _extract_text_tool_calls,
-    _format_interrupts,
     _format_plan_reminder,
     _infer_step_from_tool,
     _merge_plan,
@@ -523,42 +522,3 @@ def test_build_tool_intent_truncates_long_command():
     assert long_cmd[:40] in intent
     assert long_cmd not in intent
 
-
-# ============================================================
-# _format_interrupts:检查点中断注入文本(匿名化)
-# ============================================================
-
-def test_format_interrupts_single_query_only():
-    """单条中断:只注入 query,reason 不进 LLM 上下文。"""
-    text = _format_interrupts([
-        {"query": "转向检查认证授权", "reason": "方向跑偏", "iteration": 4},
-    ])
-    assert "转向检查认证授权" in text
-    assert "方向跑偏" not in text
-
-
-def test_format_interrupts_anonymized():
-    """注入文本不得暴露评估者身份(react_agent 不知道 agent2 存在)。"""
-    text = _format_interrupts([
-        {"query": "转向检查认证授权", "reason": "agent2 认为跑偏", "iteration": 4},
-    ])
-    assert "agent2" not in text
-    assert "评估" not in text
-    # 匿名化后的中性头部
-    assert "[方向调整]" in text
-
-
-def test_format_interrupts_multiple_numbered():
-    """多条中断(防御性路径)合并为一条消息并编号。"""
-    text = _format_interrupts([
-        {"query": "指令一", "reason": "r1", "iteration": 4},
-        {"query": "指令二", "reason": "r2", "iteration": 6},
-    ])
-    assert "[1] 指令一" in text
-    assert "[2] 指令二" in text
-
-
-def test_format_interrupts_empty_returns_empty_string():
-    """无可注入内容(空列表或 query 全空)返回空字符串。"""
-    assert _format_interrupts([]) == ""
-    assert _format_interrupts([{"query": "  ", "reason": "r", "iteration": 1}]) == ""

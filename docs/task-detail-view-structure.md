@@ -2,7 +2,7 @@
 
 > 描述对象:`frontend/src/views/TaskDetailView.vue` —— 双 Agent 协作的核心可视化界面。
 > 本文档描述**迭代摘要行("N 个工具调用: xxx")及其外框移除后**、
-> **右侧栏布局调整(状态/导出迁入标题行、结果与检查点置底、移除用户意图卡片)后**的目标结构。
+> **右侧栏布局调整(状态/导出迁入标题行、结果置底、移除用户意图卡片)后**的目标结构。
 
 ## 1. 页面整体:三栏布局
 
@@ -14,7 +14,7 @@
 │ Workspace  │ (协作对话流,页面核心)             │ (任务详情抽屉)         │
 │ Sidebar    │                                  │                       │
 │ 历史任务列表 │                                  │ 覆盖度/概览/验证/       │
-│ (可折叠隐藏) │                                  │ 结果/检查点(可折叠)     │
+│ (可折叠隐藏) │                                  │ 结果(可折叠)            │
 └────────────┴──────────────────────────────────┴───────────────────────┘
 ```
 
@@ -54,8 +54,7 @@ conversation-section
     │     └── plan-step × N        步骤条目(✓ done / ◌ in_progress / ○ pending)+ 进度 x/y
     └── messages                   消息容器(flex 纵向,gap 控制间距)
         ├── plain segment × N      平铺段(关键消息,单张卡片直接显示)
-        ├── step group × N         步骤分组(折叠块,承载迭代内容)
-        └── checkpoint divider     检查点横线(零高度,按需浮现)
+        └── step group × N         步骤分组(折叠块,承载迭代内容)
 ```
 
 ### 3.1 plain segment(平铺段)
@@ -82,12 +81,10 @@ step-block
 │   ├── "N 次迭代"
 │   └── 打字动画(含流式内容时)
 └── step-body(展开时)
-    ├── [检查点横线 × N]          afterIterationIdx=0:首个迭代之前
     └── 迭代内容 × N(直接平铺,无摘要行、无边框包装)
         ├── thinking 卡片          ConversationMessage(流式或历史)
         ├── 工具渲染行 × N          见 §3.3
-        ├── otherItems 卡片        submit 等其他项
-        └── [检查点横线 × N]        该迭代为评估边界时
+        └── otherItems 卡片        submit 等其他项
 ```
 
 **折叠策略**(`isStepExpanded`):
@@ -121,16 +118,7 @@ step-block
 工具行默认折叠,展开状态按 tool_call id 记录(`expandedToolRows`,
 子智能体内部思考用 `${callId}-think` 复合键)。
 
-### 3.4 检查点横线(checkpoint divider)
-
-agent2 在迭代边界做的轻量评估结果,**不渲染消息卡片**:
-
-- 平时隐藏:零高度元素叠加在内容分界处,不占布局空间
-  (step-body 不设 gap,零高项无需负 margin 补偿);
-- 点击右侧栏"检查点评估"条目时:先展开其所在 step 组 → 滚动定位 → 横线浮现闪烁后淡出;
-- 颜色:打断评估为橙色,继续为主题色。
-
-### 3.5 运行中等待提示(waiting-hint)
+### 3.4 运行中等待提示(waiting-hint)
 
 任务运行中且无流式项时显示:优先展示后端推送的克隆进度
 (阶段文案 + 百分比 + 进度条),否则显示通用打字动画;暂停态不显示动画。
@@ -146,10 +134,10 @@ task.conversations(正式对话,含历史 thinking 还原)
       ▼
 roundGroups(computed)
       │  每轮:segmentRoundItems()
-      │    一阶段:按 thinking 切迭代,检查点记为边界标记
+      │    一阶段:按 thinking 切迭代,非 agent1 消息记为 plain 段
       │    二阶段:迭代按 plan step 关键词推断归组(TOOL_STEP_KEYWORDS),
       │           无 plan / 无法归属 → "执行过程"组;
-      │           检查点标记挂到对应迭代边界;plain 段追加末尾
+      │           plain 段按轮内原始位置穿插到组间/组内迭代边界
       ▼
 RoundGroup { roundIdx, label, segments, planSteps }
 ```
@@ -178,8 +166,7 @@ RoundGroup { roundIdx, label, segments, planSteps }
    不再包含:状态徽标与下载/打印按钮(已移至标题行,见 §5.1)、
    用户意图卡片(不再显示;用户指令仍保留在对话流顶部 userDirective 气泡)。
 3. **动态验证**(配置了测试环境 URL 时):开关、授权模式切换、登录凭证(脱敏);不出现 verifier_agent 字样。
-4. **结果清单**:按 `task.params._grouping` 动态分组(如按严重度);卡片默认折叠,展开显示 Markdown 正文;文件类 meta 标签可点击打开左侧工作区文件。
-5. **检查点评估聚合**(最底部):条目显示"第 N 轮 · 迭代 M"+ 继续/已打断徽标 + 理由(打断时附追问内容);点击定位对话流(见 §3.4)。
+4. **结果清单**(最底部):按 `task.params._grouping` 动态分组(如按严重度);卡片默认折叠,展开显示 Markdown 正文;文件类 meta 标签可点击打开左侧工作区文件。
 
 ## 6. 全局弹窗
 
@@ -198,7 +185,7 @@ RoundGroup { roundIdx, label, segments, planSteps }
 | 流式迭代靠盒子光晕(iteration-streaming)提示 | 由 step-header 打字动画 + 流式 thinking 卡片自身样式表达 |
 | `iterationSummary()` / `toolCallCount()` 生成摘要文本 | 两个函数移除(信息已由工具行自身的单行摘要/卡片标题覆盖) |
 
-保留不变:迭代切分逻辑(`segmentRoundItems`)、检查点按迭代边界锚定、
+保留不变:迭代切分逻辑(`segmentRoundItems`)、
 step 组折叠策略、工具行四种渲染类型。
 
 ## 8. 右侧栏布局调整(本次改动)
@@ -206,19 +193,18 @@ step 组折叠策略、工具行四种渲染类型。
 | 旧结构 | 新结构 |
 |---|---|
 | 标题行仅"任务详情" + 折叠按钮 | 标题行追加:状态徽标 + 下载按钮 + 打印按钮,排在折叠按钮左侧 |
-| body 顺序:覆盖度 → 结果清单 → 检查点评估 → 任务概览 → 动态验证 | body 顺序:覆盖度 → 任务概览 → 动态验证 → 结果清单 → 检查点评估 |
+| body 顺序:覆盖度 → 结果清单 → 任务概览 → 动态验证 | body 顺序:覆盖度 → 任务概览 → 动态验证 → 结果清单 |
 | 状态徽标与下载/打印按钮在"任务概览"区块顶部(overview-header) | 迁入标题行;任务概览区块只剩元信息/当前阶段/错误 |
 | 任务概览含用户意图卡片(user_input 的 Markdown 渲染) | 移除,不再显示(对话流顶部 userDirective 气泡仍保留用户指令) |
 
 保留不变:下载/打印按钮的显示条件(completed 或有结果)、导出逻辑
-(exportMarkdown / exportPdf)、检查点条目点击定位行为、结果卡片折叠交互。
+(exportMarkdown / exportPdf)、结果卡片折叠交互。
 
 实现要点(供代码改动参考):
 
 1. `detail-sidebar-header` 内新增状态徽标 + `overview-actions`(下载/打印),
    位于 WorkspaceToggleButton 之前;原 overview-section 的 `overview-header` 整块移除。
-2. body 内把 `sidebar-results` 与 `sidebar-checkpoints` 两个 section 移到
-   `verifier-section` 之后(二者相对顺序保持:结果清单在前、检查点评估殿后)。
+2. body 内把 `sidebar-results` section 移到 `verifier-section` 之后。
 3. 移除 overview-section 内的 `.overview-input`(用户意图)块;相关 CSS 一并清理。
 4. 标题行空间有限:状态徽标与按钮需紧凑样式(小尺寸图标按钮),
    避免挤压标题;窄屏下优先保标题截断而非换行。

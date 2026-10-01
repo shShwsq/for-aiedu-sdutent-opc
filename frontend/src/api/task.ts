@@ -9,7 +9,6 @@ import type {
   AnswerRequest,
   AnswerResponse,
   ChecklistDimension,
-  PendingInterruptInfo,
   PendingQuestion,
   Scenario,
   SendMessageRequest,
@@ -195,27 +194,6 @@ export function resumeTask(taskId: string): Promise<{ status: string; message: s
  */
 export function skipPreClone(taskId: string): Promise<{ message: string }> {
   return client.post(`/tasks/${taskId}/skip_pre_clone`).then((r) => r.data)
-}
-
-/**
- * 查询任务当前待生效的检查点打断(刷新页面后恢复 pending 卡片用)
- *
- * 仅 CLI 执行器有意义(内置执行器打断即时注入无取消窗口,后端返回 null)。
- */
-export function getPendingInterrupt(taskId: string): Promise<PendingInterruptInfo | null> {
-  return client.get(`/tasks/${taskId}/pending_interrupt`).then((r) => r.data)
-}
-
-/**
- * 取消待生效的检查点打断
- *
- * CLI 执行器的打断入队后要等当前 prompt 结束才注入,期间可取消。
- * 若打断已被注入生效,后端返回 cancelled=false(竞态兜底,前端提示已生效)。
- */
-export function cancelInterrupt(
-  taskId: string,
-): Promise<{ cancelled: boolean; message: string }> {
-  return client.post(`/tasks/${taskId}/cancel_interrupt`).then((r) => r.data)
 }
 
 // ============================================================

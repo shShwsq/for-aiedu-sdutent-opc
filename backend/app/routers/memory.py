@@ -49,7 +49,7 @@ from app.schemas.memory import (
     UserMemoryOut,
     UserPreferenceOut,
 )
-from app.agent_checkpoint import MAX_MAX_ROUNDS
+from app.agent_policy import MAX_MAX_ROUNDS
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/memory", tags=["memory"])
@@ -163,7 +163,7 @@ def save_agent_policy(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> UserPreferenceOut:
-    """保存/更新 agent 策略配置(检查点评估频率、打断权限等)
+    """保存/更新 agent 策略配置(agent2 启停、协作轮次、验证权限等)
 
     作为用户级默认值(存 agent_policies 独立表),
     任务级可通过 task.params["_agent_policy"] 覆盖。

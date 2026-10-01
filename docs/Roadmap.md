@@ -19,7 +19,7 @@
 | 8 | 微信小程序 | ⬜ 未开始 |
 | 9 | 生产化与上线 | 🔨 部分完成 |
 | 10 | 练习题与自适应练习 | ✅ 已完成 |
-| 11 | 检查点评估与工作区变更 | ✅ 已完成 |
+| 11 | 工作区变更(检查点评估后移除) | ✅ 已完成 |
 
 ### 超出原规划已实现的功能
 
@@ -62,11 +62,11 @@
 - **异步 job + SSE**:出题后台线程执行,`/practice/generate/{job_id}/stream` 推送进度;出题日志落盘 `logs/practice_generate.log`。
 - **前端**:PracticeView(练习首页 / 会话答题 / 统计趋势 / 题库管理)、出题进度侧栏、生成确认弹窗、练习设置弹窗;`PRACTICE_ENABLED` 功能开关前后端联动。
 
-#### 检查点评估与工作区变更
+#### 工作区变更与协作策略
 
-- **检查点评估(agent_checkpoint)**:agent1 执行中每 K 个迭代边界由 agent2 做轻量方向评估,明显跑偏时生成追问指令;`agent_interrupt` 软中断队列在下一迭代边界注入 agent1(优先级低于真实用户消息)。
-- **协作策略独立表(agent_policies)**:用户级默认从 `user_preferences` JSONB 迁移为独立 1:1 表(评估频率 / 打断权限 / 验证权限),任务级经 `task.params._agent_policy` 覆盖。
+- **协作策略独立表(agent_policies)**:用户级默认从 `user_preferences` JSONB 迁移为独立 1:1 表(agent2 启停 / 协作轮次 / 验证权限),任务级经 `task.params._agent_policy` 覆盖。
 - **工作区变更捕获(workspace_diff)**:任务完成时捕获已跟踪 + 未跟踪文件合成 git patch,存 `task_artifacts`(kind=git_diff,上限 100 万字符);仓库树快照(kind=repo_tree)兜底;前端任务详情页展示变更区(按行着色、可折叠)。
+- (检查点评估与软中断功能曾在本阶段实现,后因价值/成本比不高整体移除:agent2 保留 round 边界完整评估,`AgentPolicy` 表的检查点/打断列一并清理。)
 
 #### 代码审查能力增强
 
@@ -417,22 +417,19 @@ uvicorn app.main:app --reload
 
 ---
 
-## 阶段 11:检查点评估与工作区变更 ✅
+## 阶段 11:工作区变更 ✅
 
-**目标**:让 agent2 在 agent1 执行过程中就能实时纠偏(不用等一轮跑完),并把任务的工作区产物留存下来。
+**目标**:把任务的工作区产物留存下来(本阶段曾实现的检查点评估/软中断因价值/成本比不高,后续已整体移除,agent2 保留 round 边界完整评估)。
 
 **做什么**:
-- 检查点评估(agent_checkpoint):每 K 个迭代边界轻量方向评估,跑偏时软中断拉回(agent_interrupt 队列)
 - AgentPolicy 独立表:用户级默认从 user_preferences JSONB 迁移,任务级可覆盖
 - 工作区变更捕获(workspace_diff):任务完成时合成 git patch 存 task_artifacts,前端只读展示
 - 代码审查能力增强:run_lint / run_coverage / list_dependencies 工具 + 3 个 code_review skill
 
 **验证方式**:
-- 跑一个任务,观察右侧栏「检查点评估聚合」出现记录,点击能定位对话流
-- 故意让 agent1 跑偏,看是否被软中断拉回
 - 任务完成后查看工作区变更区 diff 展示
 
-**完成标志**:迭代边界实时纠偏 + 工作区产物留存闭环可用。
+**完成标志**:工作区产物留存闭环可用。
 
 ---
 

@@ -5,7 +5,7 @@
  * 布局区域:
  * 1. 主区协作对话流:按 round_idx 分组,展示 agent2 与 agent1 的来回
  * 2. 右侧栏:覆盖度看板 / 结果清单(默认折叠,分组由 task.params._grouping 驱动)/
- *    检查点评估聚合(含检查点思考链,点击定位对话流) / 任务概览 / 动态验证配置
+ *    任务概览 / 动态验证配置
  *
  * 实时更新:SSE 接收每条对话/状态变更 + thinking_delta(流式 token 增量)。
  * 初始加载 GET /tasks/{id} 拿快照(补历史),然后 SSE 接收增量。
@@ -16,7 +16,6 @@
  * 流式思考显示(thinking_delta):
  * - 一次 LLM 调用对应一个 conv_id,前端按 conv_id 累积 reasoning + content
  * - 流式期间以"流式思考卡片"显示打字机效果
- * - source=checkpoint 的检查点思考链不进主对话流,路由到右侧栏检查点聚合区
  * - 思考链同时以 type=thinking 落库(agent1 / agent2),
  *   刷新页面后从 GET /tasks/{id} 还原为只读流式卡片
  */
@@ -36,10 +35,8 @@ import VerifyActionDialog from '@/components/VerifyActionDialog.vue'
 import WorkspaceSidebar from '@/components/WorkspaceSidebar.vue'
 import WorkspaceToggleButton from '@/components/WorkspaceToggleButton.vue'
 import {
-  cancelInterrupt,
   downloadTaskReportMarkdown,
   getPendingChecklist,
-  getPendingInterrupt,
   getPendingQuestion,
   getPendingVerifyAction,
   getPendingCommandConfirm,
@@ -66,7 +63,6 @@ import { parseDiffFileSegments } from '@/utils/diffFiles'
 import { renderMarkdown } from '@/utils/markdown'
 import { buildToolSegments, buildToolSummary, parseAgentTrace, toolFileTargetOf } from '@/utils/toolSummary'
 import type {
-  AgentCheckpointEventData,
   AnswerItem,
   ChecklistDimension,
   ClarificationQuestion,
@@ -215,7 +211,6 @@ interface StreamingItem {
   conv_id: string
   round_idx: number
   role: 'agent1' | 'agent2'
-  iteration?: number
   reasoning: string
   content: string
   status: 'streaming' | 'done' | 'error'
@@ -229,8 +224,6 @@ interface StreamingItem {
   insertSeq: number
   /** 是否为动态验证的思考流(verifier_agent 产生,显示"正在验证"而非"正在思考") */
   verify?: boolean
-  /** 思考流来源:'checkpoint' → 检查点思考链,路由到右侧栏检查点聚合区,不进主对话流 */
-  source?: 'checkpoint'
 }
 
 const streamingItems = reactive<Map<string, StreamingItem>>(new Map())
@@ -251,67 +244,6 @@ const convCountPerRound = reactive<Map<number, number>>(new Map())
 // ---- 计划清单(plan 事件 + 历史回放)----
 // key: round_idx,value: 该 round 最新一次的 plan 步骤列表(覆盖式更新)
 const planPerRound = reactive<Map<number, PlanStep[]>>(new Map())
-
-// ---- agent2 检查点评估结果(agent_checkpoint 事件)----
-// key: `${round_idx}:${iteration}`,value: 检查点评估结构化数据
-// 后端在检查点评估时同时推 agent_checkpoint 事件 + conversation 事件,
-// conversation 事件已由 onConversation 回调接收并渲染为 agent2 evaluation 卡片,
-// 这里存储 agent_checkpoint 的结构化字段(interrupt/reason/query)供将来扩展可视化。
-const checkpointsPerRound = reactive<Map<string, AgentCheckpointEventData>>(new Map())
-
-// ---- 待生效检查点打断(CLI 执行器:入队后到注入前可取消) ----
-// 后端检查点评估 interrupt=true 时推 agent_checkpoint 事件,此时打断已入队但
-// 未注入(要等当前 prompt 结束),窗口内用户可点右侧栏检查点条目上的
-// "取消打断"按钮;注入后([检查点中断] conversation 事件到达)或取消后窗口关闭。
-// 主对话流仅在打断真正注入后才展示追问指令卡片。
-interface PendingInterruptState {
-  round_idx: number
-  iteration: number | null
-  reason: string
-  query: string | null
-  /** pending=待生效(可取消);cancelling=取消请求已发出;cancelled=已取消 */
-  state: 'pending' | 'cancelling' | 'cancelled'
-}
-const pendingInterrupt = ref<PendingInterruptState | null>(null)
-
-/** 仅 CLI 执行器有可取消窗口(内置执行器打断在迭代边界即时注入) */
-const isCliExecutor = computed(
-  () => !!task.value?.executor && task.value.executor !== 'builtin',
-)
-
-/** 刷新页面后恢复待生效打断卡片(后端 in-memory 队列未 drain 才有) */
-async function restorePendingInterrupt(taskId: string): Promise<void> {
-  if (!isCliExecutor.value) return
-  try {
-    const p = await getPendingInterrupt(taskId)
-    if (p) {
-      pendingInterrupt.value = { ...p, state: 'pending' }
-      // 展开右侧栏,保证取消按钮可见
-      detailCollapsed.value = false
-    }
-  } catch {
-    // 无待生效打断或任务已结束,静默忽略
-  }
-}
-
-/** 用户点击取消打断;竞态输给注入时后端返回 cancelled=false */
-async function handleCancelInterrupt(): Promise<void> {
-  const p = pendingInterrupt.value
-  if (!task.value?.id || !p || p.state !== 'pending') return
-  p.state = 'cancelling'
-  try {
-    const res = await cancelInterrupt(String(task.value.id))
-    if (res.cancelled) {
-      p.state = 'cancelled'
-    } else {
-      // 打断已注入生效:正式 [检查点中断] 卡片会随 conversation 事件展示,清掉 pending 卡片
-      pendingInterrupt.value = null
-    }
-  } catch (err) {
-    p.state = 'pending'
-    error.value = extractErrorMessage(err)
-  }
-}
 
 // ---- 用户澄清提问弹窗(阶段 8)----
 // agent2 在第 0 轮评估时若 ask_user=true,后端推送 question 事件,
@@ -682,8 +614,6 @@ async function initTask(): Promise<void> {
       void restorePendingVerifyAction(taskId)
       // 恢复可能存在的待确认危险命令弹窗(local 模式刷新页面后)
       void restorePendingCommandConfirm(taskId)
-      // 恢复可能存在的待生效检查点打断(CLI 执行器,中断队列未 drain 时)
-      void restorePendingInterrupt(taskId)
     }
 
     // 3. 加载覆盖度看板(task.checklist 存在才拉取)
@@ -805,14 +735,6 @@ function connectSSE(taskId: string): void {
       // 自动滚动到底部
       nextTick(scrollToBottom)
 
-      // 检查点打断正式注入生效([检查点中断] 卡片接管展示)→ 清掉 pending 卡片
-      if (
-        data.role === 'agent2' &&
-        (data.content || '').startsWith('[检查点中断]')
-      ) {
-        pendingInterrupt.value = null
-      }
-
       // agent2 评估产出 → 刷新覆盖度看板
       if (data.role === 'agent2' && data.type === 'evaluation') {
         void loadCoverage()
@@ -870,37 +792,6 @@ function connectSSE(taskId: string): void {
     onCommandConfirm: (data) => {
       commandConfirmData.value = data
     },
-    onAgentCheckpoint: (data: AgentCheckpointEventData) => {
-      // agent2 检查点评估结果:存储结构化数据
-      // 后端同时推 conversation 事件(role=agent2, type=evaluation),
-      // 由 onConversation 回调渲染为对话卡片,这里只存储供将来扩展
-      checkpointsPerRound.set(`${data.round_idx}:${data.iteration}`, data)
-      if (data.interrupt) {
-        console.info(
-          `[检查点评估] 第${data.round_idx}轮迭代${data.iteration} 打断: ${data.reason}`,
-        )
-        // CLI 执行器:打断已入队但未注入,右侧栏检查点条目进入待生效态(带取消按钮);
-        // 主对话流不展示追问指令,要等打断真正注入后由 [检查点中断] 卡片展示
-        if (isCliExecutor.value) {
-          pendingInterrupt.value = {
-            round_idx: data.round_idx,
-            iteration: data.iteration,
-            reason: data.reason,
-            query: data.query,
-            state: 'pending',
-          }
-          // 展开右侧栏暴露取消按钮(pending 窗口有限,折叠态会错过)
-          detailCollapsed.value = false
-        }
-      }
-    },
-    onInterruptCancelled: (data) => {
-      // 后端确认取消成功(本端发起或其他端发起):侧栏条目切为已取消态
-      const p = pendingInterrupt.value
-      if (p && p.round_idx === data.round_idx) {
-        p.state = 'cancelled'
-      }
-    },
     onDone: async () => {
       // [诊断] done 事件处理:记录是否走了 resume 竞态校验分支
       clientLog(taskId, 'view_on_done', { resuming: resumingRef.value })
@@ -951,8 +842,6 @@ function connectSSE(taskId: string): void {
       // 清除克隆进度条(任务结束)
       cloneProgress.value = null
       skipClonePending.value = false
-      // 任务结束,待生效打断不再有意义(队列已随任务结束清理)
-      pendingInterrupt.value = null
       // 任务完成时后端刚写入工作区 diff,重拉一次展示(失败兜底,静默)
       void loadArtifact(taskId)
     },
@@ -973,7 +862,6 @@ function connectSSE(taskId: string): void {
       // 清除克隆进度条(任务失败)
       cloneProgress.value = null
       skipClonePending.value = false
-      pendingInterrupt.value = null
     },
   })
 }
@@ -981,7 +869,7 @@ function connectSSE(taskId: string): void {
 // ---- 流式增量处理 ----
 
 function handleThinkingDelta(data: ThinkingDeltaEventData): void {
-  const { conv_id, round_idx, role, phase, delta, iteration, verify, source } = data
+  const { conv_id, round_idx, role, phase, delta, verify } = data
 
   if (phase === 'start') {
     // 创建新的流式项:reasoning 默认折叠(用户可手动展开查看思考链)
@@ -992,7 +880,6 @@ function handleThinkingDelta(data: ThinkingDeltaEventData): void {
       conv_id,
       round_idx,
       role,
-      iteration,
       reasoning: '',
       content: '',
       status: 'streaming',
@@ -1001,7 +888,6 @@ function handleThinkingDelta(data: ThinkingDeltaEventData): void {
       seq: streamingSeqCounter++,
       insertSeq,
       verify,
-      source,
     })
     return
   }
@@ -1014,7 +900,6 @@ function handleThinkingDelta(data: ThinkingDeltaEventData): void {
       conv_id,
       round_idx,
       role,
-      iteration,
       reasoning: '',
       content: '',
       status: 'streaming',
@@ -1023,7 +908,6 @@ function handleThinkingDelta(data: ThinkingDeltaEventData): void {
       seq: streamingSeqCounter++,
       insertSeq,
       verify,
-      source,
     })
   }
 
@@ -1244,7 +1128,6 @@ function resetTaskState(): void {
   streamingItems.clear()
   planPerRound.clear()
   convCountPerRound.clear()
-  checkpointsPerRound.clear()
   historyReasoningExpanded.clear()
   // 关闭提问弹窗
   questionOpen.value = false
@@ -1336,16 +1219,6 @@ interface IterationSegment {
   hasStreaming: boolean
 }
 
-/** 检查点标记:agent2 迭代边界轻量评估,挂在对应迭代边界处。
- * 两种来源,渲染方式不同:
- * - 检查点评估([检查点评估):不渲染消息卡片,定位时浮现横线
- * - 检查点中断([检查点中断):实际生效的中断追问,渲染为可见消息卡片 */
-interface CheckpointMarker {
-  /** 显示在哪次迭代的 iteration-block 之后(该迭代的 iterationIdx);0 = 首个迭代之前 */
-  afterIterationIdx: number
-  item: DisplayItem
-}
-
 /** plan step 分组:把归属同一 step 的迭代合并 */
 interface StepGroup {
   kind: 'step'
@@ -1359,8 +1232,6 @@ interface StepGroup {
   iterations: IterationSegment[]
   /** 是否含流式中(任一迭代流式则为 true) */
   hasStreaming: boolean
-  /** 该 step 内的检查点标记(渲染在对应迭代边界处) */
-  checkpoints: CheckpointMarker[]
   /** 该 step 内的平铺消息(如用户追问/回答,位于组内迭代边界;含此消息的组默认展开) */
   plains: PlainSegment[]
 }
@@ -1467,9 +1338,6 @@ function segmentRoundItems(
   // 第一阶段:按 thinking 起点切迭代(原逻辑)
   const iterations: IterationSegment[] = []
   const plains: PlainSegment[] = []
-  /** 检查点评估/中断:发生在迭代边界,记录当时已完成的迭代数,
-   * 供第二阶段把横线(评估)/消息卡片(中断)挂到对应迭代边界 */
-  const checkpointMarkers: CheckpointMarker[] = []
   let current: IterationSegment | null = null
   let iterCounter = 0
 
@@ -1519,15 +1387,9 @@ function segmentRoundItems(
       if (isStreamingActive(item)) current.hasStreaming = true
     } else {
       closeCurrent()
-      if (isCheckpointItem(item) || isCheckpointInterruptItem(item)) {
-        // 检查点评估/中断都发生在迭代边界:记录当时已完成的迭代数,
-        // 第二阶段把横线(评估)/中断追问卡片挂到 step 组内对应迭代边界处
-        checkpointMarkers.push({ afterIterationIdx: iterCounter, item })
-      } else {
-        // 记录消息在轮内的原始位置(已完成迭代数),第二阶段按位置穿插,
-        // 避免用户追问等轮首/轮中消息被统一追加到轮末
-        plains.push({ kind: 'plain', item, afterIterationIdx: iterCounter })
-      }
+      // 记录消息在轮内的原始位置(已完成迭代数),第二阶段按位置穿插,
+      // 避免用户追问等轮首/轮中消息被统一追加到轮末
+      plains.push({ kind: 'plain', item, afterIterationIdx: iterCounter })
     }
   }
   closeCurrent()
@@ -1543,11 +1405,10 @@ function segmentRoundItems(
     status: 'none',
     iterations: [],
     hasStreaming: false,
-    checkpoints: [],
     plains: [],
   }
 
-  /** 迭代序号 → 所属 step 组(用于把检查点标记挂到对应组) */
+  /** 迭代序号 → 所属 step 组(用于把平铺消息穿插到对应组内边界) */
   const groupByIterIdx = new Map<number, StepGroup>()
 
   for (const iter of iterations) {
@@ -1564,7 +1425,6 @@ function segmentRoundItems(
           status: step?.status || 'pending',
           iterations: [],
           hasStreaming: false,
-          checkpoints: [],
           plains: [],
         }
         stepGroupsMap.set(stepId, group)
@@ -1577,21 +1437,6 @@ function segmentRoundItems(
       noStepGroup.iterations.push(iter)
       if (iter.hasStreaming) noStepGroup.hasStreaming = true
       groupByIterIdx.set(iter.iterationIdx, noStepGroup)
-    }
-  }
-
-  // 把检查点标记分配到所属 step 组:按"前一次迭代"的序号查找;
-  // 序号为 0(边界在首个迭代之前)时兜底到含首个迭代的组;
-  // 轮内尚无任何迭代时降级为 plain 段追加到末尾(极端兜底)
-  for (const marker of checkpointMarkers) {
-    const target =
-      marker.afterIterationIdx > 0
-        ? groupByIterIdx.get(marker.afterIterationIdx)
-        : groupByIterIdx.get(1)
-    if (target) {
-      target.checkpoints.push(marker)
-    } else {
-      plains.push({ kind: 'plain', item: marker.item, afterIterationIdx: marker.afterIterationIdx })
     }
   }
 
@@ -1678,14 +1523,6 @@ const roundGroups = computed<RoundGroup[]>(() => {
     // 用户指令不进 round 分组,提到最顶部单独渲染
     if (c.role === 'user' && c.type === 'question') return
 
-    // 检查点思考链(带检查点前缀的 type=thinking)路由到右侧栏检查点聚合区,
-    // 不进主对话流(与后端 agent_checkpoint 落库的 content 前缀约定一致)
-    if (
-      c.role === 'agent2' &&
-      c.type === 'thinking' &&
-      (c.content || '').startsWith('[检查点评估')
-    ) return
-
     const localIdx = roundCounter.get(c.round_idx) ?? 0
     roundCounter.set(c.round_idx, localIdx + 1)
     const seq = localIdx * 1000
@@ -1744,8 +1581,6 @@ const roundGroups = computed<RoundGroup[]>(() => {
   //     之后、tool_call2(seq=2000)之前。这样每个 thinking 紧跟它之后的 tool_call/tool_result,
   //     正确归入各自迭代,不会出现"所有 thinking 挤前面、所有 tool_call 堆最后"的错乱。
   for (const item of streamingItems.values()) {
-    // 检查点思考链在右侧栏检查点聚合区展示,不进主对话流
-    if (item.source === 'checkpoint') continue
     if (!groups.has(item.round_idx)) groups.set(item.round_idx, [])
     groups.get(item.round_idx)!.push({
       id: `stream:${item.conv_id}`,
@@ -2331,251 +2166,9 @@ function isUserMessageItem(item: DisplayItem): boolean {
   return !item.is_streaming && item.role === 'user' && item.type === 'message'
 }
 
-/**
- * 判断 DisplayItem 是否为 agent2 检查点评估(迭代边界轻量评估)。
- *
- * 与完整评估(round 边界)区分:后端 agent_checkpoint._record_checkpoint 落库时,
- * content 以 "[检查点评估 · 第N轮迭代M]" 开头;完整评估由 LLM 自由生成,
- * 不带此前缀。这里靠前缀判定,简单可靠。
- */
-function isCheckpointItem(item: DisplayItem): boolean {
-  if (item.is_streaming) return false
-  if (item.role !== 'agent2' || item.type !== 'evaluation') return false
-  return (item.content || '').startsWith('[检查点评估')
-}
-
-/**
- * 判断 DisplayItem 是否为检查点中断的追问记录(实际生效的中断)。
- *
- * 后端 acp_base 在 CLI 软中断真正发出追问 prompt 时落库,content 以
- * "[检查点中断] " 开头。与检查点评估的隐藏横线不同,它要在主对话流
- * 按时间顺序显示为可见消息卡片(同正常 agent2 追问)。
- */
-function isCheckpointInterruptItem(item: DisplayItem): boolean {
-  if (item.is_streaming) return false
-  if (item.role !== 'agent2' || item.type !== 'evaluation') return false
-  return (item.content || '').startsWith('[检查点中断]')
-}
-
-/** 解析检查点评估 content,提取 interrupt/reason/query */
-function parseCheckpointContent(c: string): {
-  isInterrupt: boolean
-  cancelled: boolean
-  reason: string
-  query: string | null
-} {
-  // content 格式(后端 agent_checkpoint._record_checkpoint):
-  //   打断:[检查点评估 · 第N轮迭代M] 打断\n理由:...\n追问指令:...
-  //   继续:[检查点评估 · 第N轮迭代M] 继续\n理由:...
-  const isInterrupt = c.startsWith('[检查点评估') && /\] 打断/.test(c)
-  // 用户取消待生效打断后,后端在评估记录末尾追加的标记(INTERRUPT_CANCEL_MARKER)
-  const cancelled = c.includes('[用户已取消该打断')
-  const reasonMatch = c.match(/理由:([^\n]*)/)
-  const queryMatch = c.match(/追问指令:([^\n]*)/)
-  return {
-    isInterrupt,
-    cancelled,
-    reason: reasonMatch ? reasonMatch[1].trim() : '',
-    query: queryMatch ? queryMatch[1].trim() : null,
-  }
-}
-
-/** 检查点评估聚合条目(右侧栏聚合列表展示) */
-interface CheckpointEntry {
-  id: string
-  roundIdx: number
-  iteration: number | null
-  isInterrupt: boolean
-  /** 打断被用户取消(评估记录带已取消标记) */
-  cancelled: boolean
-  reason: string
-  query: string | null
-  /** 检查点思考链(落库 type=thinking 或实时流式累积) */
-  thinking?: string
-  /** 思考链是否正在流式输出 */
-  thinkingStreaming?: boolean
-  /** 评估尚未落库(思考链正在流式,评估进行中) */
-  pending?: boolean
-}
-
-/** 检查点条目对应的待生效打断状态(null=该条目无对应的 pending 打断)
- *
- * 按 round + iteration 匹配 pendingInterrupt(SSE agent_checkpoint 或
- * 刷新恢复);侧栏"待生效"徽标与"取消打断"按钮均由此驱动。
- */
-function interruptPendingState(
-  cp: CheckpointEntry,
-): 'pending' | 'cancelling' | 'cancelled' | null {
-  const p = pendingInterrupt.value
-  if (!p || !cp.isInterrupt) return null
-  if (cp.roundIdx !== p.round_idx) return null
-  if (cp.iteration !== null && p.iteration !== null && cp.iteration !== p.iteration) return null
-  return p.state
-}
-
-/** 解析检查点 content 前缀中的轮次/迭代号(与后端落库格式一致) */
-function parseCheckpointPos(content: string): {
-  roundIdx: number | null
-  iteration: number | null
-} {
-  const m = content.match(/\[检查点评估 · 第(\d+)轮迭代(\d+)\]/)
-  return m
-    ? { roundIdx: parseInt(m[1], 10), iteration: parseInt(m[2], 10) }
-    : { roundIdx: null, iteration: null }
-}
-
-/**
- * 检查点评估聚合列表(右侧栏展示)。
- *
- * 三个来源合并:
- * 1. 落库的检查点评估(type=evaluation,与 isCheckpointItem 同一判定):
- *    GET 快照刷新后可还原历史,运行中 SSE conversation 事件推送实时生效;
- * 2. 落库的检查点思考链(type=thinking,content 带检查点前缀):
- *    按 轮次:迭代 挂到对应评估条目下;
- * 3. 实时流式中的检查点思考(streamingItems 中 source=checkpoint):
- *    已有对应评估条目 → 挂上实时思考链;评估尚未落库 → 生成"评估中"占位条目。
- */
-const checkpointList = computed<CheckpointEntry[]>(() => {
-  const convs = task.value?.conversations ?? []
-
-  // 落库的检查点思考链:按 轮次:迭代 索引
-  const thinkingByKey = new Map<string, string>()
-  for (const c of convs) {
-    if (c.role !== 'agent2' || c.type !== 'thinking') continue
-    const content = c.content || ''
-    if (!content.startsWith('[检查点评估')) continue
-    if (!c.reasoning) continue
-    const pos = parseCheckpointPos(content)
-    if (pos.roundIdx === null || pos.iteration === null) continue
-    thinkingByKey.set(`${pos.roundIdx}:${pos.iteration}`, c.reasoning)
-  }
-
-  // 落库的检查点评估:聚合条目主体。
-  // 同 轮次:迭代 只保留最新一条:历史缺陷曾导致同一迭代边界重复落库
-  // (同一决策回合内多个工具结果各自命中 K 边界,重复评估/推送),
-  // 去重兜底避免右侧栏重复展示;后端新数据已加防重,此处兜底存量数据。
-  const entriesByKey = new Map<string, { entry: CheckpointEntry; created_at: string | null }>()
-  for (const c of convs) {
-    if (c.role !== 'agent2' || c.type !== 'evaluation') continue
-    const content = c.content || ''
-    if (!content.startsWith('[检查点评估')) continue
-    const pos = parseCheckpointPos(content)
-    const roundIdx = pos.roundIdx ?? c.round_idx
-    // 迭代号解析失败时按记录 id 为 key(天然唯一,不参与合并)
-    const key = pos.iteration !== null ? `${roundIdx}:${pos.iteration}` : `id:${c.id}`
-    const entry: CheckpointEntry = {
-      id: c.id,
-      roundIdx,
-      iteration: pos.iteration,
-      ...parseCheckpointContent(content),
-      thinking:
-        pos.iteration !== null
-          ? thinkingByKey.get(`${roundIdx}:${pos.iteration}`)
-          : undefined,
-      thinkingStreaming: false,
-      pending: false,
-    }
-    const prev = entriesByKey.get(key)
-    // 同 key 保留最新(convs 按 created_at 升序,后者即最新;显式比较兜底乱序)
-    if (!prev || (c.created_at ?? '') >= (prev.created_at ?? '')) {
-      entriesByKey.set(key, { entry, created_at: c.created_at ?? null })
-    }
-  }
-  const list = [...entriesByKey.values()].map((v) => v.entry)
-
-  // 实时流式中的检查点思考链(source=checkpoint)
-  for (const item of streamingItems.values()) {
-    if (item.source !== 'checkpoint' || item.iteration === undefined) continue
-    const existing = list.find(
-      (e) => e.roundIdx === item.round_idx && e.iteration === item.iteration,
-    )
-    if (existing) {
-      // 评估已落库:思考链优先用实时累积(刷新前落库记录尚未进快照)
-      existing.thinking = item.reasoning || existing.thinking
-      existing.thinkingStreaming = item.status === 'streaming'
-    } else {
-      // 评估进行中:占位条目(评估落库后由上方分支接管)
-      list.push({
-        id: `live:${item.conv_id}`,
-        roundIdx: item.round_idx,
-        iteration: item.iteration,
-        isInterrupt: false,
-        cancelled: false,
-        reason: '',
-        query: null,
-        thinking: item.reasoning,
-        thinkingStreaming: item.status === 'streaming',
-        pending: true,
-      })
-    }
-  }
-
-  return list
-})
-
-/** 检查点思考链展开状态(右侧栏;流式中强制展开) */
-const checkpointThinkingExpanded = reactive<Set<string>>(new Set())
-
-function toggleCheckpointThinking(id: string): void {
-  if (checkpointThinkingExpanded.has(id)) {
-    checkpointThinkingExpanded.delete(id)
-  } else {
-    checkpointThinkingExpanded.add(id)
-  }
-}
-
-/** 思考链是否展开:流式中强制展开,其余按手动展开状态 */
-function isCheckpointThinkingExpanded(cp: CheckpointEntry): boolean {
-  return !!cp.thinkingStreaming || checkpointThinkingExpanded.has(cp.id)
-}
-
-/** 筛选 step 组内应显示在迭代 iterIdx 之后的检查点标记(0 = 首个迭代之前) */
-function checkpointsAfter(group: StepGroup, iterIdx: number): CheckpointMarker[] {
-  return group.checkpoints.filter((c) => c.afterIterationIdx === iterIdx)
-}
-
 /** 筛选 step 组内应显示在迭代 iterIdx 之后的平铺消息(0 = 首个迭代之前) */
 function plainsAfter(group: StepGroup, iterIdx: number): PlainSegment[] {
   return group.plains.filter((p) => p.afterIterationIdx === iterIdx)
-}
-
-/** 检查点横线 class 列表(打断评估为橙色、继续为主题色) */
-function checkpointDividerClass(marker: CheckpointMarker): (string | Record<string, boolean>)[] {
-  return [
-    'checkpoint-divider',
-    { 'checkpoint-divider-interrupt': parseCheckpointContent(marker.item.content || '').isInterrupt },
-  ]
-}
-
-/** 查找检查点条目所在的 step 组(定位前需先展开它) */
-function findCheckpointGroup(id: string): StepGroup | null {
-  for (const round of roundGroups.value) {
-    for (const seg of round.segments) {
-      if (seg.kind === 'step' && seg.checkpoints.some((c) => c.item.id === id)) {
-        return seg
-      }
-    }
-  }
-  return null
-}
-
-/** 点击右侧栏检查点条目:展开其所在 step 组,滚动到对话流中该检查点位置,横线浮现闪烁后淡出 */
-async function locateCheckpoint(id: string): Promise<void> {
-  // 横线渲染在 step-body 内迭代边界处:step 折叠时锚点不存在,先展开对应 step 组
-  const group = findCheckpointGroup(id)
-  if (group) {
-    collapsedSteps.delete(group.id)
-    expandedSteps.add(group.id)
-    await nextTick()
-  }
-  const el = document.getElementById(`checkpoint-anchor-${id}`)
-  if (!el) return
-  // 重复点击同一检查点时重启浮现动画
-  el.classList.remove('checkpoint-divider-active')
-  void el.offsetWidth
-  el.classList.add('checkpoint-divider-active')
-  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
-  window.setTimeout(() => el.classList.remove('checkpoint-divider-active'), 1600)
 }
 
 // ---- 右侧栏结果清单展开状态(默认折叠,点击卡片展开正文) ----
@@ -2766,7 +2359,7 @@ function toggleResult(id: string): void {
         <RouterLink to="/tasks/new">提交新任务</RouterLink>
       </div>
 
-      <!-- 任务详情(主区聚焦协作对话流;结果清单/检查点评估/覆盖度看板在右侧栏) -->
+      <!-- 任务详情(主区聚焦协作对话流;结果清单/覆盖度看板在右侧栏) -->
       <template v-else-if="task">
         <!-- 协作对话流(无外框,顶部仅在运行时显示实时徽标) -->
         <section
@@ -2811,7 +2404,7 @@ function toggleResult(id: string): void {
                 <!-- 平铺段:agent2 评估/追问/总结、user 指令等关键消息 -->
                 <!-- 用户补充消息(type=message)右对齐,与顶部 userDirective 视觉一致 -->
                 <div
-                  v-if="seg.kind === 'plain' && !isCheckpointItem(seg.item)"
+                  v-if="seg.kind === 'plain'"
                   :class="{ 'user-msg-row': isUserMessageItem(seg.item) }"
                 >
                   <ConversationMessage
@@ -2819,20 +2412,6 @@ function toggleResult(id: string): void {
                     @toggle-reasoning="toggleReasoning"
                   />
                 </div>
-
-                <!-- 检查点位置标记:平时隐藏;点击右侧栏条目时浮现横线叠加在内容分界线上(不撑开行距),
-                     打断评估为橙色、继续为主题色,闪烁后淡出 -->
-                <div
-                  v-else-if="seg.kind === 'plain' && isCheckpointItem(seg.item)"
-                  :id="`checkpoint-anchor-${seg.item.id}`"
-                  :class="[
-                    'checkpoint-divider',
-                    {
-                      'checkpoint-divider-interrupt':
-                        parseCheckpointContent(seg.item.content || '').isInterrupt,
-                    },
-                  ]"
-                />
 
                 <!-- step 分组:plan step 下含多个迭代(无 plan 时为单个"执行过程"组) -->
                 <div
@@ -2858,20 +2437,6 @@ function toggleResult(id: string): void {
                   <div v-if="isStepExpanded(seg)" class="step-body">
                     <!-- 该 step 下的所有迭代:不再折叠,内容直接平铺
                          (折叠单位上移到 step 组,浏览型工具已单行化) -->
-                    <!-- 检查点标记:渲染在迭代边界处(afterIterationIdx=0 表示首个迭代之前)。
-                         中断追问 → 可见消息卡片(按时间顺序);评估 → 隐藏横线 -->
-                    <template v-for="cp in checkpointsAfter(seg, 0)" :key="`cp-${cp.item.id}`">
-                      <ConversationMessage
-                        v-if="isCheckpointInterruptItem(cp.item)"
-                        :item="cp.item"
-                        @toggle-reasoning="toggleReasoning"
-                      />
-                      <div
-                        v-else
-                        :id="`checkpoint-anchor-${cp.item.id}`"
-                        :class="checkpointDividerClass(cp)"
-                      />
-                    </template>
                     <!-- 组内平铺消息(如用户追问/回答):渲染在迭代边界处(0 = 首个迭代之前) -->
                     <template v-for="p in plainsAfter(seg, 0)" :key="`plain-${p.item.id}`">
                       <div :class="{ 'user-msg-row': isUserMessageItem(p.item) }">
@@ -2882,8 +2447,7 @@ function toggleResult(id: string): void {
                       </div>
                     </template>
                     <template v-for="iter in seg.iterations" :key="iter.id">
-                    <!-- 迭代内容直接平铺:无摘要行、无边框包装(wrapper 仅作结构容器,
-                         保留它以免 step-body 加 gap 影响零高度检查点横线) -->
+                    <!-- 迭代内容直接平铺:无摘要行、无边框包装(wrapper 仅作结构容器) -->
                     <div class="iteration-block">
                       <div class="iteration-body">
                         <!-- thinking 项(流式或历史) -->
@@ -2984,20 +2548,6 @@ function toggleResult(id: string): void {
                         />
                       </div>
                     </div>
-                    <!-- 检查点标记:该迭代为评估/中断边界。
-                         中断追问 → 可见消息卡片;评估 → 隐藏横线(平时隐藏,定位时浮现) -->
-                    <template v-for="cp in checkpointsAfter(seg, iter.iterationIdx)" :key="`cp-${cp.item.id}`">
-                      <ConversationMessage
-                        v-if="isCheckpointInterruptItem(cp.item)"
-                        :item="cp.item"
-                        @toggle-reasoning="toggleReasoning"
-                      />
-                      <div
-                        v-else
-                        :id="`checkpoint-anchor-${cp.item.id}`"
-                        :class="checkpointDividerClass(cp)"
-                      />
-                    </template>
                     <!-- 组内平铺消息(如用户追问):渲染在该迭代之后,与迭代内容保持时间顺序 -->
                     <template v-for="p in plainsAfter(seg, iter.iterationIdx)" :key="`plain-${p.item.id}`">
                       <div :class="{ 'user-msg-row': isUserMessageItem(p.item) }">
@@ -3339,91 +2889,6 @@ function toggleResult(id: string): void {
               </article>
             </div>
           </template>
-        </section>
-
-        <!-- 检查点评估聚合(置底;含检查点思考链,点击条目定位对话流对应轮次) -->
-        <section v-if="checkpointList.length > 0" class="sidebar-checkpoints">
-          <h2>检查点评估 <span class="count">({{ checkpointList.length }})</span></h2>
-          <div class="checkpoint-list">
-            <div
-              v-for="cp in checkpointList"
-              :key="cp.id"
-              :class="['checkpoint-item', { 'checkpoint-item-interrupt': cp.isInterrupt }]"
-              :title="cp.pending ? undefined : '点击定位对话流中的检查点位置'"
-              @click="!cp.pending && locateCheckpoint(cp.id)"
-            >
-              <div class="checkpoint-item-head">
-                <span class="checkpoint-item-pos">
-                  第 {{ cp.roundIdx }} 轮<template v-if="cp.iteration !== null"> · 迭代 {{ cp.iteration }}</template>
-                </span>
-                <span v-if="cp.pending" class="checkpoint-badge checkpoint-badge-pending">
-                  评估中
-                </span>
-                <template v-else-if="cp.isInterrupt && interruptPendingState(cp)">
-                  <!-- 待生效窗口:打断已入队未注入,展示取消按钮(已取消态只剩徽标) -->
-                  <span
-                    v-if="interruptPendingState(cp) === 'cancelled'"
-                    class="checkpoint-badge checkpoint-badge-cancelled"
-                  >
-                    已取消
-                  </span>
-                  <span v-else class="checkpoint-badge checkpoint-badge-awaiting">
-                    打断待生效
-                  </span>
-                  <button
-                    v-if="interruptPendingState(cp) !== 'cancelled'"
-                    class="checkpoint-cancel-btn"
-                    :disabled="interruptPendingState(cp) === 'cancelling'"
-                    title="取消后追问指令不会下发给智能体"
-                    @click.stop="handleCancelInterrupt"
-                  >{{ interruptPendingState(cp) === 'cancelling' ? '正在取消...' : '取消打断' }}</button>
-                </template>
-                <span
-                  v-else-if="cp.isInterrupt && cp.cancelled"
-                  class="checkpoint-badge checkpoint-badge-cancelled"
-                >
-                  已取消
-                </span>
-                <span
-                  v-else
-                  :class="[
-                    'checkpoint-badge',
-                    cp.isInterrupt ? 'checkpoint-badge-interrupt' : 'checkpoint-badge-continue',
-                  ]"
-                >
-                  {{ cp.isInterrupt ? '已打断' : '继续' }}
-                </span>
-              </div>
-              <template v-if="!cp.pending">
-                <div class="checkpoint-item-reason">{{ cp.reason || '无说明' }}</div>
-                <div v-if="cp.isInterrupt && cp.query" class="checkpoint-item-query">
-                  追问:{{ cp.query }}
-                </div>
-              </template>
-              <!-- 检查点思考链(落库 type=thinking / 实时流式;默认折叠,流式中展开) -->
-              <div
-                v-if="cp.thinking"
-                class="checkpoint-thinking"
-                :class="{ 'checkpoint-thinking-active': cp.thinkingStreaming }"
-                @click.stop
-              >
-                <div
-                  class="checkpoint-thinking-header"
-                  @click="toggleCheckpointThinking(cp.id)"
-                >
-                  <span class="checkpoint-thinking-toggle">
-                    {{ isCheckpointThinkingExpanded(cp) ? '▼' : '▶' }}
-                  </span>
-                  <span>{{ cp.thinkingStreaming ? '正在思考…' : '思考过程' }}</span>
-                  <span class="checkpoint-thinking-meta">{{ cp.thinking.length }} 字</span>
-                </div>
-                <div
-                  v-if="isCheckpointThinkingExpanded(cp)"
-                  class="checkpoint-thinking-body"
-                >{{ cp.thinking }}</div>
-              </div>
-            </div>
-          </div>
         </section>
       </div>
     </aside>
@@ -3883,9 +3348,8 @@ function toggleResult(id: string): void {
   margin-bottom: var(--space-6);
 }
 
-/* 右侧栏分区标题(结果清单/检查点评估,与覆盖度区块一致) */
-.sidebar-results h2,
-.sidebar-checkpoints h2 {
+/* 右侧栏分区标题(结果清单,与覆盖度区块一致) */
+.sidebar-results h2 {
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -4259,47 +3723,6 @@ function toggleResult(id: string): void {
 
 .round-group:last-child {
   margin-bottom: 0;
-}
-
-/* 检查点位置标记(对话流):平时隐藏;浮现时元素本身高度为 0 不撑开行距,
-   横线由伪元素绝对定位叠加在内容分界线上,继续评估用主题色、打断评估用橙色 */
-.checkpoint-divider {
-  display: none;
-}
-
-.checkpoint-divider-active {
-  display: block;
-  height: 0;
-  position: relative;
-  /* .messages 为带 gap 的纵向 flex,零高项作为子项前后仍各吃一份 gap,
-     用负 margin 精确抵消,保证浮现时布局零变化 */
-  margin: calc(var(--space-3) / -2) 0;
-}
-
-/* step-body 内迭代块相邻无 gap,零高项无需负 margin 抵消(兜底 plain 场景仍用上方规则) */
-.step-body .checkpoint-divider-active {
-  margin: 0;
-}
-
-.checkpoint-divider-active::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: -2px;
-  height: 3px;
-  border-radius: var(--radius-full);
-  background: var(--color-primary);
-  animation: checkpoint-flash 1.6s ease-out forwards;
-}
-
-.checkpoint-divider-interrupt.checkpoint-divider-active::after {
-  background: #ea580c;
-}
-
-@keyframes checkpoint-flash {
-  0%, 60% { opacity: 1; }
-  100% { opacity: 0; }
 }
 
 .round-label {
@@ -4988,162 +4411,4 @@ function toggleResult(id: string): void {
 .diff-line-hunk { color: var(--color-text-muted); }
 .diff-line-meta { color: var(--color-text-secondary); font-weight: var(--fw-medium); }
 .diff-line-ctx { color: var(--color-text); }
-
-/* ============================================================
- * 检查点评估聚合列表(右侧栏)
- * - 按时间聚合 agent2 迭代边界轻量评估
- * - 打断项橙红左边框高亮;点击条目定位对话流对应轮次
- * ============================================================ */
-.checkpoint-list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
-
-.checkpoint-item {
-  padding: var(--space-2) var(--space-3);
-  background: var(--color-surface-alt);
-  border: 1px solid var(--color-border);
-  border-left: 3px solid var(--color-text-muted);
-  border-radius: var(--radius-md);
-  font-size: var(--fs-xs);
-  cursor: pointer;
-  transition: border-color var(--transition-fast);
-}
-
-.checkpoint-item:hover {
-  border-color: var(--color-border-strong);
-}
-
-.checkpoint-item-interrupt {
-  background: var(--color-checkpoint-interrupt-bg);
-  border-color: var(--color-checkpoint-interrupt-border);
-  border-left-color: #ea580c;
-}
-
-.checkpoint-item-interrupt:hover {
-  border-color: var(--color-checkpoint-interrupt-border);
-}
-
-.checkpoint-item-head {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  margin-bottom: var(--space-1);
-}
-
-.checkpoint-item-pos {
-  font-weight: var(--fw-medium);
-  color: var(--color-text-secondary);
-}
-
-.checkpoint-item-reason {
-  color: var(--color-text-secondary);
-  line-height: var(--lh-relaxed);
-  word-break: break-word;
-}
-
-.checkpoint-item-interrupt .checkpoint-item-reason {
-  color: #7c2d12;
-}
-
-.checkpoint-item-query {
-  margin-top: var(--space-1);
-  color: var(--color-text);
-  font-weight: var(--fw-medium);
-  word-break: break-word;
-}
-
-.checkpoint-badge {
-  margin-left: auto;
-  padding: 2px var(--space-2);
-  font-size: var(--fs-xs);
-  font-weight: var(--fw-semibold);
-  border-radius: var(--radius-full);
-}
-
-.checkpoint-badge-continue {
-  color: #059669;
-  background: rgba(5, 150, 105, 0.12);
-}
-
-.checkpoint-badge-interrupt {
-  color: #c2410c;
-  background: rgba(234, 88, 12, 0.15);
-}
-
-.checkpoint-badge-pending {
-  color: var(--color-text-muted);
-  background: var(--color-border);
-}
-
-.checkpoint-badge-cancelled {
-  color: #6b7280;
-  background: rgba(107, 114, 128, 0.15);
-}
-
-.checkpoint-badge-awaiting {
-  color: #c2410c;
-  background: rgba(234, 88, 12, 0.15);
-}
-
-/* 打断取消按钮(侧栏检查点条目内):待生效窗口内的橙色小按钮 */
-.checkpoint-cancel-btn {
-  padding: 1px var(--space-2);
-  font-size: var(--fs-xs);
-  font-weight: var(--fw-semibold);
-  color: #c2410c;
-  background: rgba(234, 88, 12, 0.12);
-  border: 1px solid rgba(234, 88, 12, 0.4);
-  border-radius: var(--radius-full);
-  cursor: pointer;
-  transition: filter var(--transition-fast);
-}
-
-.checkpoint-cancel-btn:hover:not(:disabled) {
-  filter: brightness(0.95);
-}
-
-.checkpoint-cancel-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-}
-
-/* 检查点思考链(条目内可折叠块;流式中 header 高亮) */
-.checkpoint-thinking {
-  margin-top: var(--space-2);
-  padding-top: var(--space-1);
-  border-top: 1px dashed var(--color-border);
-}
-
-.checkpoint-thinking-header {
-  display: flex;
-  align-items: center;
-  gap: var(--space-1);
-  color: var(--color-text-muted);
-  cursor: pointer;
-  user-select: none;
-}
-
-.checkpoint-thinking-active .checkpoint-thinking-header {
-  color: var(--color-primary);
-}
-
-.checkpoint-thinking-toggle {
-  font-size: 10px;
-}
-
-.checkpoint-thinking-meta {
-  margin-left: auto;
-}
-
-.checkpoint-thinking-body {
-  margin-top: var(--space-1);
-  max-height: 240px;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
-  color: var(--color-text-secondary);
-  line-height: var(--lh-relaxed);
-}
 </style>

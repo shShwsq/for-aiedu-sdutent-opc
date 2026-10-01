@@ -28,12 +28,7 @@ from pydantic import BaseModel
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.agent_checkpoint import INTERRUPT_CANCEL_MARKER, MAX_MAX_ROUNDS
-from app.agent_interrupt import (
-    cancel_pending_interrupt,
-    decrement_interrupt_count,
-    peek_pending_interrupt,
-)
+from app.agent_policy import MAX_MAX_ROUNDS
 from app.agents.orchestrator import (
     _err_detail,
     resume_audit_with_message,
@@ -1311,117 +1306,6 @@ def skip_pre_clone_endpoint(
     return {"message": "已提交跳过请求"}
 
 
-# ============================================================
-# 检查点打断取消(CLI 执行器:打断入队后到注入前有可操作窗口)
-# ============================================================
-
-
-@router.get("/tasks/{task_id}/pending_interrupt")
-def get_task_pending_interrupt(
-    task_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    current_user: User | None = Depends(get_optional_user),
-) -> dict[str, Any] | None:
-    """查询任务当前待生效的检查点打断(刷新页面后恢复前端 pending 态用)
-
-    读 in-memory 中断队列(未 drain 才有);无待生效打断返回 None。
-    内置执行器打断即时注入无取消窗口,直接返回 None。
-    """
-    task = db.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if task.user_id is not None:
-        if current_user is None or current_user.id != task.user_id:
-            raise HTTPException(status_code=403, detail="无权访问此任务")
-
-    if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-        return None
-    if task.executor == "builtin":
-        return None
-
-    items = peek_pending_interrupt(task.id)
-    if not items:
-        return None
-    # 新替旧语义下队列通常只有 1 条,取最新一条即可
-    it = items[-1]
-    return {
-        "round_idx": it.get("round_idx", 0),
-        "iteration": it.get("iteration"),
-        "reason": it.get("reason", ""),
-        "query": it.get("query"),
-        "created_at": it.get("created_at"),
-    }
-
-
-@router.post("/tasks/{task_id}/cancel_interrupt")
-def cancel_task_interrupt(
-    task_id: uuid.UUID,
-    db: Session = Depends(get_db),
-    current_user: User | None = Depends(get_optional_user),
-) -> dict[str, Any]:
-    """取消待生效的检查点打断(仅 CLI 执行器有意义)
-
-    CLI 执行器的打断入队后要等当前 prompt 结束才注入,期间用户可取消。
-    取消与注入共用队列锁,二者互斥:若打断已被 drain 注入,返回
-    cancelled=false,前端据此提示已生效。取消成功后:
-    1) 回补本轮打断计数(不占用 max_interrupts 配额);
-    2) 在对应检查点评估记录 content 追加已取消标记(下次评估注入
-       历史时 agent2 能看到指令被否决,避免朝同一方向重复打断),
-       并推 conversation_update 让前端实时刷新侧栏徽标;
-    3) 推 interrupt_cancelled 事件,前端把 pending 卡片切为已取消态。
-    """
-    task = db.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    if task.user_id is not None:
-        if current_user is None or current_user.id != task.user_id:
-            raise HTTPException(status_code=403, detail="无权操作此任务")
-
-    if task.status not in (TaskStatus.RUNNING, TaskStatus.PAUSED):
-        raise HTTPException(
-            status_code=409,
-            detail=f"任务状态为 {task.status.value},仅运行中/暂停态可取消打断",
-        )
-    if task.executor == "builtin":
-        raise HTTPException(
-            status_code=409,
-            detail="内置执行器的检查点打断即时注入,无取消窗口",
-        )
-
-    items = cancel_pending_interrupt(task.id)
-    if not items:
-        # 竞态:打断刚被 drain 注入(或尚未产生),无法取消
-        return {"cancelled": False, "message": "当前没有待生效的打断(可能已注入生效)"}
-
-    for it in items:
-        # 回补打断计数:取消不算一次有效打断,不占本轮配额
-        decrement_interrupt_count(task.id, it.get("round_idx", 0))
-
-        # 在检查点评估记录上追加已取消标记(定位失败时降级跳过,不影响取消本身)
-        eval_conv_id = it.get("eval_conv_id")
-        if not eval_conv_id:
-            continue
-        try:
-            conv = db.get(Conversation, uuid.UUID(eval_conv_id))
-        except ValueError:
-            continue
-        if conv is None or INTERRUPT_CANCEL_MARKER in (conv.content or ""):
-            continue
-        conv.content = (conv.content or "") + "\n" + INTERRUPT_CANCEL_MARKER
-        db.commit()
-        publish(task.id, "conversation_update", {
-            "id": str(conv.id),
-            "content": conv.content,
-        })
-
-    last = items[-1]
-    publish(task.id, "interrupt_cancelled", {
-        "round_idx": last.get("round_idx", 0),
-        "iteration": last.get("iteration"),
-    })
-    return {"cancelled": True, "message": "已取消打断,追问指令不会下发"}
-
-
 def _publish_task_status(task: Task) -> None:
     """推送任务状态变更事件(供 pause/resume 端点复用)"""
     publish(task.id, "status", {
@@ -1978,45 +1862,37 @@ def _append_result_html(
 # ============================================================
 #
 # 与前端任务详情主对话流对齐:只摘「结论类」对话,跳过思考 / 工具调用 /
-# 检查点评估 / history_compress 等过程性内容。
+# history_compress 等过程性内容。
 #
 # 跳过规则(参考 frontend/src/views/TaskDetailView.vue 主对话流过滤):
 # 1. thinking / tool_call / tool_result / history_compress —— 过程类,体积大
 #    (thinking 含 reasoning_content 思考链,可能几 KB~几十 KB,塞进报告会让
 #    .md / PDF 体积爆炸,浏览器打印会卡死)
-# 2. evaluation 类型但 content 以 "[检查点评估" / "[检查点中断]" 开头 ——
-#    检查点评估/中断过程性内容(评估在右侧栏聚合展示,中断追问卡片
-#    在主对话流按时间顺序展示),不进报告的协作轨迹
 #
 # 结论类消息保留协作决策链:用户提问 → agent2 评估/追问 → react_agent
 # 提交 → agent2 总结,读者无需展开每个工具调用细节即可重建协作脉络。
 #
 # 补充特殊处理:
-# 3. react_agent 每轮总结无独立落库类型,约定为该轮最后一条
+# 2. react_agent 每轮总结无独立落库类型,约定为该轮最后一条
 #    role=react_agent type=thinking 的 content(与 orchestrator._load_react_summaries
 #    一致),报告侧按此约定合成「提交结果」条目
-# 4. 存量数据里追问轮 question 可能整段落库了拼进提示词的
+# 3. 存量数据里追问轮 question 可能整段落库了拼进提示词的
 #    "[之前轮次的对话记忆]" 块(新数据已在 react_agent 落库侧拆分),
 #    报告侧裁剪兼容历史任务
-# 5. agent2 启用时,驱动第 r+1 轮的问题是第 r 轮 agent2 评估生成的
+# 4. agent2 启用时,驱动第 r+1 轮的问题是第 r 轮 agent2 评估生成的
 #    追问(非 done/ask_user 时评估 content 就是 followup_query),协作轨迹
 #    把这类评估归位到下一轮展示为提问/追问,避免与落库的样板 question 重复
 
 _CONVERSATION_TRACE_TYPES = {
     "question",    # 用户提问(前端跳过主对话流,单独顶部渲染,报告保留)
     "answer",      # 用户对追问的回答(前端主对话流展示)
-    "evaluation",  # agent2 评估(检查点评估/中断会被额外过滤)
+    "evaluation",  # agent2 评估
     "followup",    # agent2 追问
     "submit",      # react_agent 提交结果
     "summary",     # agent2 最终总结
     "message",     # 用户追加消息(前端主对话流右对齐展示)
     "error",       # 错误(关键失败原因,属于结论而非过程)
 }
-
-# 检查点评估/中断前缀(与前端 TaskDetailView.vue + agent_checkpoint / acp_base
-# 落库约定一致):这类消息属于检查点过程性内容,评估在前端右侧栏聚合展示,
-# 中断追问卡片在主对话流按时间顺序展示,报告协作轨迹同步跳过
-_CHECKPOINT_CONTENT_PREFIXES = ("[检查点评估", "[检查点中断")
 
 # 跨轮历史记忆注入块标记(react_agent._build_history_context 生成)。
 # 历史存量数据里追问轮 question 可能把它整段落库,报告侧需裁掉
@@ -2042,31 +1918,11 @@ def _is_ua_followup_evaluation(c) -> bool:
     """
     if c.role != "agent2" or c.type != "evaluation":
         return False
-    if _is_checkpoint_evaluation(c):
-        return False
     content = (c.content or "").strip()
     return bool(content) and not any(
         content.startswith(m) for m in _UA_EVAL_NON_FOLLOWUP_MARKERS
     )
 
-
-def _is_checkpoint_evaluation(c) -> bool:
-    """判断是否为检查点评估/中断消息(检查点过程性内容,不进报告协作轨迹)
-
-    检查点评估:agent2 的 thinking 或 evaluation 类型,content 以
-    "[检查点评估" 开头 —— 前端 TaskDetailView.vue 把这类消息从主对话流
-    过滤掉,聚到右侧栏专门展示。
-    检查点中断:acp_base 软中断生效时落库的 evaluation,content 以
-    "[检查点中断]" 开头,前端在主对话流按时间顺序展示为追问卡片,
-    同属检查点过程通知,报告协作轨迹应同步跳过。
-    """
-    if c.role != "agent2":
-        return False
-    if c.type not in ("thinking", "evaluation"):
-        return False
-    if not c.content:
-        return False
-    return any(c.content.startswith(p) for p in _CHECKPOINT_CONTENT_PREFIXES)
 
 _CONVERSATION_TYPE_LABELS = {
     "question": "用户提问",
@@ -2151,7 +2007,6 @@ def _collect_conversation_trace(task: Task) -> list[dict[str, Any]]:
     过滤规则(与前端任务详情主对话流对齐):
     - 仅保留 _CONVERSATION_TRACE_TYPES 中的类型
       (thinking/tool_call/tool_result/history_compress 不在白名单,天然跳过)
-    - 额外跳过检查点评估/中断(_is_checkpoint_evaluation)
     - react_agent 每轮总结按约定合成「提交结果」条目并入
     - question 内容裁掉存量数据里的历史记忆块
 
@@ -2166,7 +2021,6 @@ def _collect_conversation_trace(task: Task) -> list[dict[str, Any]]:
     convs = [
         c for c in task.conversations
         if c.type in _CONVERSATION_TRACE_TYPES
-        and not _is_checkpoint_evaluation(c)
     ]
     submits = _collect_react_summaries(task)
     submit_rounds = {it["round_idx"] for it in submits}

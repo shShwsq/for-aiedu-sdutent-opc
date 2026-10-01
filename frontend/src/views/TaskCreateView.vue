@@ -400,22 +400,10 @@ const error = ref('')
 
 // ---- Agent 策略配置(任务级覆盖用户级默认,在右侧设置抽屉中编辑) ----
 
-/** 是否分别配置内置/CLI 的 K 值(高级中的高级) */
-const policyAdvanced = ref(false)
-/** 统一 K 值:每 K 个迭代评估一次 */
-const policyInterval = ref(10)
-/** 内置 agent1 专用 K 值(null=用统一值) */
-const policyIntervalBuiltin = ref<number | null>(null)
-/** CLI agent 专用 K 值(null=用统一值) */
-const policyIntervalCli = ref<number | null>(null)
-/** 是否启用 agent2(关闭=单 agent 模式,跳过评估/打断/验证) */
+/** 是否启用 agent2(关闭=单 agent 模式,跳过评估/验证) */
 const policyAgent2Enabled = ref(true)
 /** agent2 协作总轮次(1-10,仅 agent2 启用时生效) */
 const policyMaxRounds = ref(4)
-/** agent2 是否能打断 agent1 */
-const policyAllowInterrupt = ref(true)
-/** 每轮最多打断次数 */
-const policyMaxInterrupts = ref(2)
 /** agent2 是否能自己验证(实验性) */
 const policyAllowVerify = ref(false)
 /** 执行智能体命令确认模式(任务级 _executor_command_confirm 覆盖;builtin 与 CLI 执行器均生效) */
@@ -437,9 +425,6 @@ const verifierAuthModeOptions = [
 const DEFAULT_POLICY = {
   agent2_enabled: true,
   max_rounds: 4,
-  checkpoint_interval: 10,
-  allow_interrupt: true,
-  max_interrupts_per_round: 2,
   allow_verify: false,
   executor_command_confirm_default: 'always_approve' as 'always_approve' | 'per_command',
 }
@@ -452,11 +437,6 @@ const DEFAULT_POLICY = {
 const userPolicyDefaults = ref({
   agent2Enabled: DEFAULT_POLICY.agent2_enabled,
   maxRounds: DEFAULT_POLICY.max_rounds,
-  interval: DEFAULT_POLICY.checkpoint_interval,
-  intervalBuiltin: null as number | null,
-  intervalCli: null as number | null,
-  allowInterrupt: DEFAULT_POLICY.allow_interrupt,
-  maxInterrupts: DEFAULT_POLICY.max_interrupts_per_round,
   allowVerify: DEFAULT_POLICY.allow_verify,
   verifierAuthMode: 'per_action' as 'direct' | 'per_action',
   executorCommandConfirm: DEFAULT_POLICY.executor_command_confirm_default,
@@ -825,34 +805,15 @@ async function handleSubmit(): Promise<void> {
     if (policyMaxRounds.value !== userPolicyDefaults.value.maxRounds) {
       agentPolicy.max_rounds = policyMaxRounds.value
     }
-    if (policyInterval.value !== userPolicyDefaults.value.interval) {
-      agentPolicy.checkpoint_interval = policyInterval.value
-    }
-    if (policyAllowInterrupt.value !== userPolicyDefaults.value.allowInterrupt) {
-      agentPolicy.allow_interrupt = policyAllowInterrupt.value
-    }
-    if (policyMaxInterrupts.value !== userPolicyDefaults.value.maxInterrupts) {
-      agentPolicy.max_interrupts_per_round = policyMaxInterrupts.value
-    }
     if (policyAllowVerify.value !== userPolicyDefaults.value.allowVerify) {
       agentPolicy.allow_verify = policyAllowVerify.value
-    }
-    // 关闭高级模式时,专用 K 值强制为 null(用统一值),与协作策略设置页保存逻辑一致;
-    // 提交 null 可覆盖用户级默认的专用 K 值
-    const intervalBuiltinVal = policyAdvanced.value ? policyIntervalBuiltin.value : null
-    const intervalCliVal = policyAdvanced.value ? policyIntervalCli.value : null
-    if (intervalBuiltinVal !== userPolicyDefaults.value.intervalBuiltin) {
-      agentPolicy.checkpoint_interval_builtin = intervalBuiltinVal
-    }
-    if (intervalCliVal !== userPolicyDefaults.value.intervalCli) {
-      agentPolicy.checkpoint_interval_cli = intervalCliVal
     }
     if (Object.keys(agentPolicy).length > 0) {
       params._agent_policy = agentPolicy
     }
 
     // 执行智能体命令确认模式(任务级 _executor_command_confirm 覆盖)
-    // 与 agent_policy 分离存储:后端 agent_checkpoint.resolve_agent_policy 会把
+    // 与 agent_policy 分离存储:后端 agent_policy.resolve_agent_policy 会把
     // executor_command_confirm_default 映射到 task.params._executor_command_confirm(若未显式设置);
     // 此处仅在用户改了用户级默认时显式提交,优先级最高。
     // builtin 与 CLI 执行器均生效:builtin 通过 ContextVar 注入到 run_command;CLI 走 ACP request_permission
@@ -973,14 +934,7 @@ onMounted(async () => {
       const p = prefs.agent_policy
       policyAgent2Enabled.value = p.agent2_enabled
       policyMaxRounds.value = p.max_rounds
-      policyInterval.value = p.checkpoint_interval
-      policyIntervalBuiltin.value = p.checkpoint_interval_builtin
-      policyIntervalCli.value = p.checkpoint_interval_cli
-      policyAllowInterrupt.value = p.allow_interrupt
-      policyMaxInterrupts.value = p.max_interrupts_per_round
       policyAllowVerify.value = p.allow_verify
-      // 高级模式:仅当任一专用 K 值非 null 时展开(与协作策略设置页一致)
-      policyAdvanced.value = p.checkpoint_interval_builtin !== null || p.checkpoint_interval_cli !== null
       // 测试环境授权模式默认值(任务级可单独覆盖)
       verifierAuthMode.value = p.verifier_auth_mode_default
       // CLI 命令确认模式默认值(任务级 _executor_command_confirm 可单独覆盖)
@@ -989,11 +943,6 @@ onMounted(async () => {
       userPolicyDefaults.value = {
         agent2Enabled: policyAgent2Enabled.value,
         maxRounds: policyMaxRounds.value,
-        interval: policyInterval.value,
-        intervalBuiltin: policyIntervalBuiltin.value,
-        intervalCli: policyIntervalCli.value,
-        allowInterrupt: policyAllowInterrupt.value,
-        maxInterrupts: policyMaxInterrupts.value,
         allowVerify: policyAllowVerify.value,
         verifierAuthMode: verifierAuthMode.value,
         executorCommandConfirm: policyExecutorCommandConfirm.value,
@@ -1095,7 +1044,7 @@ onUnmounted(() => {
               <!-- 启用开关(自协作策略抽屉移至此处):关闭=单 agent 模式,右侧模型选择器置灰 -->
               <label
                 class="ua-enable-toggle"
-                :title="policyAgent2Enabled ? '检查助手参与协作(质检 / 打断 / 验证)' : '单 agent 模式:AI助手 跑 1 轮直接产出结果'"
+                :title="policyAgent2Enabled ? '检查助手参与协作(质检 / 验证)' : '单 agent 模式:AI助手 跑 1 轮直接产出结果'"
               >
                 <input v-model="policyAgent2Enabled" class="switch" type="checkbox" />
                 <span>{{ policyAgent2Enabled ? '已启用' : '已停用' }}</span>
@@ -1352,7 +1301,7 @@ onUnmounted(() => {
                 </svg>
                 <span>协作策略</span>
                 <span class="advanced-summary">
-                  {{ policyAllowInterrupt ? `每${policyInterval}轮评估·可打断` : `每${policyInterval}轮评估·仅观察` }}{{ policyAllowVerify ? '·可自行验证' : '' }}
+                  {{ policyMaxRounds }} 轮协作{{ policyAllowVerify ? '·可自行验证' : '' }}
                 </span>
                 <svg
                   class="advanced-chevron"
@@ -1375,7 +1324,7 @@ onUnmounted(() => {
                   <div v-show="drawerOpen && drawerSection === 'policy'" class="drawer-section-body">
                     <!-- 单 agent 模式提示:agent2 关闭时(开关在 topbar 第 2 行),说明下方依赖字段为何隐藏 -->
                     <p v-if="!policyAgent2Enabled" class="policy-single-hint">
-                      当前为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做覆盖度评估、打断与验证。
+                      当前为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做覆盖度评估与验证。
                     </p>
 
                     <!-- agent2 依赖字段:关闭时整组隐藏(v-show 保留值,提交 payload 不变) -->
@@ -1407,37 +1356,7 @@ onUnmounted(() => {
                       />
                       <span class="policy-hint">上限 {{ MAX_ROUNDS_LIMIT }}</span>
                     </label>
-  
-                    <label class="policy-field">
-                      <span class="policy-label">评估频率 K</span>
-                      <input
-                        v-model.number="policyInterval"
-                        type="number" min="1" max="20"
-                        class="policy-input"
-                      />
-                      <span class="policy-hint">每 K 个迭代评估一次</span>
-                    </label>
 
-                    <label class="policy-toggle-row">
-                      <input v-model="policyAllowInterrupt" class="switch" type="checkbox" :disabled="!policyAgent2Enabled" />
-                      <span>允许检查助手打断 AI助手</span>
-                    </label>
-
-                    <!-- 每轮最大打断:仅当开启「允许打断」时展开 -->
-                    <Transition name="collapse">
-                      <div v-show="policyAllowInterrupt">
-                        <label class="policy-field">
-                          <span class="policy-label">每轮最大打断</span>
-                          <input
-                            v-model.number="policyMaxInterrupts"
-                            type="number" min="0" max="10"
-                            class="policy-input"
-                          />
-                          <span class="policy-hint">防死锁上限</span>
-                        </label>
-                      </div>
-                    </Transition>
-  
                     <label class="policy-toggle-row">
                       <input v-model="policyAllowVerify" class="switch" type="checkbox" />
                       <span>允许检查助手自行验证 <span class="policy-experimental">(实验性)</span></span>
@@ -1537,38 +1456,6 @@ onUnmounted(() => {
                       />
                       <span class="policy-hint">控制执行智能体(内置 / CLI)执行危险命令时是否弹窗确认。CLI 中 Codex 受非交互模式限制,仅支持自动批准。</span>
                     </label>
-  
-                    <Transition name="collapse">
-                      <div v-show="policyAgent2Enabled" class="policy-dependent">
-                    <label class="policy-toggle-row">
-                      <input v-model="policyAdvanced" class="switch" type="checkbox" />
-                      <span>分别配置内置 / CLI agent 的 K 值</span>
-                    </label>
-  
-                    <Transition name="collapse">
-                      <div v-show="policyAdvanced" class="policy-grid">
-                        <label class="policy-field">
-                          <span class="policy-label">内置执行器 K</span>
-                          <input
-                            v-model.number="policyIntervalBuiltin"
-                            type="number" min="1" max="20"
-                            class="policy-input"
-                            placeholder="留空用统一值"
-                          />
-                        </label>
-                        <label class="policy-field">
-                          <span class="policy-label">CLI agent K</span>
-                          <input
-                            v-model.number="policyIntervalCli"
-                            type="number" min="1" max="20"
-                            class="policy-input"
-                            placeholder="留空用统一值"
-                          />
-                        </label>
-                      </div>
-                    </Transition>
-                      </div>
-                    </Transition>
                   </div>
                 </Teleport>
             </div>

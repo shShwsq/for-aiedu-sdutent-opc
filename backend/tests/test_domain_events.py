@@ -8,7 +8,7 @@
 - 快照分发:handler 内退订不影响本轮已快照的分发列表
 - 参数校验:未知事件类型拒绝订阅
 - 审计订阅者:落库成功路径 + DB 异常时 rollback 不抛(mock SessionLocal)
-- 埋点连通:orchestrator / agent2 / agent_checkpoint 模块可导入(埋点无语法错误)
+- 埋点连通:orchestrator / agent2 模块可导入(埋点无语法错误)
 """
 import uuid
 from unittest.mock import MagicMock, patch
@@ -18,7 +18,6 @@ import pytest
 import app.domain_events as de
 from app.domain_events import (
     ALL_EVENT_TYPES,
-    CHECKPOINT_EVALUATED,
     TASK_COMPLETED,
     TASK_STARTED,
     emit,
@@ -66,10 +65,9 @@ def test_wildcard_subscriber_receives_all_events():
 
     emit(TASK_STARTED, uuid.uuid4())
     emit(TASK_COMPLETED, uuid.uuid4())
-    emit(CHECKPOINT_EVALUATED, uuid.uuid4())
 
     assert [e.type for e in received] == [
-        TASK_STARTED, TASK_COMPLETED, CHECKPOINT_EVALUATED,
+        TASK_STARTED, TASK_COMPLETED,
     ]
 
 
@@ -189,7 +187,7 @@ def test_all_event_types_covers_documented_types():
     for t in [
         "task.started", "task.completed", "task.failed",
         "checklist.confirmed", "question.raised",
-        "agent1.round_completed", "checkpoint.evaluated",
+        "agent1.round_completed",
         "verifier.completed",
     ]:
         assert t in ALL_EVENT_TYPES
@@ -260,7 +258,7 @@ class TestAuditSubscriber:
 # ============================================================
 
 def test_instrumented_modules_importable():
-    import app.agent_checkpoint  # noqa: F401
+    import app.agent_policy  # noqa: F401
     import app.agents.agent2  # noqa: F401
     import app.agents.orchestrator  # noqa: F401
 

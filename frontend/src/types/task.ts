@@ -292,8 +292,6 @@ export type SSEEventType =
   | 'command_confirm'
   | 'done'
   | 'error'
-  | 'agent_checkpoint'
-  | 'interrupt_cancelled'
 
 /** SSE 事件通用结构 */
 export interface SSEEvent {
@@ -379,11 +377,6 @@ export interface ThinkingDeltaEventData {
    * true 时前端显示"正在验证"而非"正在评估"。
    */
   verify?: boolean
-  /**
-   * 思考流来源:'checkpoint' 表示检查点评估的思考链,
-   * 前端路由到任务详情右侧栏(检查点评估聚合区),不进主对话流。
-   */
-  source?: 'checkpoint'
 }
 
 /** done/error 事件 data */
@@ -445,52 +438,6 @@ export interface ChecklistReviewEventData {
   checklist: ChecklistDimension[]
   /** agent2 生成清单的依据(展示给用户参考,可选) */
   reasoning?: string
-}
-
-/**
- * agent_checkpoint 事件 data(agent2 检查点评估结果)
- *
- * agent1(含内置 agent1 和外部 CLI agent)执行过程中,每 K 个迭代边界
- * agent2 做轻量评估,判断方向是否跑偏。评估结果通过此事件推送前端展示。
- * interrupt=true 时表示 agent2 决定打断并注入追问指令(软中断)。
- */
-export interface AgentCheckpointEventData {
-  /** 协作轮次 */
-  round_idx: number
-  /** 触发评估时的迭代序号 */
-  iteration: number
-  /** 是否打断(true=agent2 认为方向跑偏,注入追问指令) */
-  interrupt: boolean
-  /** 评估理由(展示给用户看) */
-  reason: string
-  /** 打断时的追问指令(interrupt=true 时非空,注入 agent1 作为 user 消息) */
-  query: string | null
-}
-
-/**
- * interrupt_cancelled 事件 data(用户取消了待生效的检查点打断)
- *
- * CLI 执行器的打断入队后要等当前 prompt 结束才注入,期间用户可点
- * "取消打断"。取消成功后后端推此事件,前端把 pending 卡片切为已取消态。
- */
-export interface InterruptCancelledEventData {
-  /** 被取消打断所属的协作轮次 */
-  round_idx: number
-  /** 触发打断时的迭代序号 */
-  iteration: number | null
-}
-
-/**
- * GET /tasks/{id}/pending_interrupt 响应(待生效的检查点打断)
- *
- * 刷新页面后恢复前端 pending 卡片用;无待生效打断时接口返回 null。
- */
-export interface PendingInterruptInfo {
-  round_idx: number
-  iteration: number | null
-  reason: string
-  query: string | null
-  created_at?: string
 }
 
 /**
@@ -594,10 +541,6 @@ export interface VerifyConfigUpdateRequest {
 
 /** 运行时可调整的协作策略字段(任务级覆盖,增量合并到 task.params._agent_policy) */
 export interface RuntimePolicyUpdate {
-  /** 统一 K 值,每 K 个迭代评估一次(1-20) */
-  checkpoint_interval?: number
-  /** agent2 是否能打断 agent1 */
-  allow_interrupt?: boolean
   /** agent2 协作总轮次(1-10) */
   max_rounds?: number
 }
@@ -619,26 +562,16 @@ export interface RuntimeConfigUpdateRequest {
 }
 
 /**
- * agent 策略配置(检查点评估频率、打断权限、验证权限)
+ * agent 策略配置(agent2 启停、协作轮次、验证权限)
  *
  * 用户级默认存储在 UserPreference.agent_policy,任务级覆盖存储在
  * task.params["_agent_policy"]。resolve_agent_policy 合并两者后生效。
  */
 export interface AgentPolicy {
-  /** 是否启用 agent2(关闭=单 agent 模式,跳过评估/打断/验证) */
+  /** 是否启用 agent2(关闭=单 agent 模式,跳过评估/验证) */
   agent2_enabled: boolean
   /** agent2 协作总轮次(1-10,仅 agent2 启用时生效) */
   max_rounds: number
-  /** 统一 K 值,每 K 个迭代评估一次 */
-  checkpoint_interval: number
-  /** 高级:内置 agent1 专用 K 值(null=用统一值) */
-  checkpoint_interval_builtin: number | null
-  /** 高级:CLI agent 专用 K 值(null=用统一值) */
-  checkpoint_interval_cli: number | null
-  /** agent2 是否能打断 agent1 */
-  allow_interrupt: boolean
-  /** 每轮最多打断次数(防死锁) */
-  max_interrupts_per_round: number
   /** agent2 是否能自己在测试环境验证(实验性,先留开关) */
   allow_verify: boolean
   /** 验证授权默认模式:"direct" 直接执行 / "per_action" 逐动作授权(任务级可覆盖) */

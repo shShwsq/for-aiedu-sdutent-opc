@@ -36,10 +36,8 @@ const emit = defineEmits<{
 }>()
 
 // ---- 系统默认策略(与后端 DEFAULT_AGENT_POLICY 对齐,仅面板用到的字段) ----
-const SYSTEM_DEFAULT: { checkpoint_interval: number; max_rounds: number; allow_interrupt: boolean } = {
-  checkpoint_interval: 10,
+const SYSTEM_DEFAULT: { max_rounds: number } = {
   max_rounds: 4,
-  allow_interrupt: true,
 }
 
 const expanded = ref(false)
@@ -53,9 +51,7 @@ const loadingModels = ref(true)
 const maxRoundsLimit = ref(10)
 
 // ---- 协作策略表单值(初始=系统默认 → 用户级默认 → 任务级覆盖,与 resolve_agent_policy 一致) ----
-const policyInterval = ref(SYSTEM_DEFAULT.checkpoint_interval)
 const policyMaxRounds = ref(SYSTEM_DEFAULT.max_rounds)
-const policyAllowInterrupt = ref(SYSTEM_DEFAULT.allow_interrupt)
 
 /** 任务是否使用内置执行器(CLI 执行器 react 模型自管,选择器禁用) */
 const isBuiltin = computed(() => (props.task.executor ?? 'builtin') === 'builtin')
@@ -98,14 +94,8 @@ async function init(): Promise<void> {
   if (limits) maxRoundsLimit.value = limits.max_rounds
 
   const userDefault = prefs?.agent_policy
-  policyInterval.value = Number(
-    override.checkpoint_interval ?? userDefault?.checkpoint_interval ?? SYSTEM_DEFAULT.checkpoint_interval,
-  )
   policyMaxRounds.value = Number(
     override.max_rounds ?? userDefault?.max_rounds ?? SYSTEM_DEFAULT.max_rounds,
-  )
-  policyAllowInterrupt.value = Boolean(
-    override.allow_interrupt ?? userDefault?.allow_interrupt ?? SYSTEM_DEFAULT.allow_interrupt,
   )
 }
 
@@ -168,17 +158,6 @@ function clampNumber(raw: string, min: number, max: number, fallback: number): n
   return Math.max(min, Math.min(Math.round(n), max))
 }
 
-function onIntervalChange(e: Event): void {
-  const next = clampNumber(
-    (e.target as HTMLInputElement).value,
-    1,
-    20,
-    policyInterval.value,
-  )
-  policyInterval.value = next
-  void save({ agent_policy: { checkpoint_interval: next } })
-}
-
 function onMaxRoundsChange(e: Event): void {
   const next = clampNumber(
     (e.target as HTMLInputElement).value,
@@ -188,12 +167,6 @@ function onMaxRoundsChange(e: Event): void {
   )
   policyMaxRounds.value = next
   void save({ agent_policy: { max_rounds: next } })
-}
-
-function onAllowInterruptChange(e: Event): void {
-  const next = (e.target as HTMLInputElement).checked
-  policyAllowInterrupt.value = next
-  void save({ agent_policy: { allow_interrupt: next } })
 }
 </script>
 
@@ -238,18 +211,6 @@ function onAllowInterruptChange(e: Event): void {
           <span class="rs-label">协作策略</span>
           <div class="rs-policy-row">
             <label class="rs-policy-item">
-              <span class="rs-policy-name">评估频率 K</span>
-              <input
-                type="number"
-                class="rs-number"
-                min="1"
-                max="20"
-                :value="policyInterval"
-                :disabled="saving"
-                @change="onIntervalChange"
-              />
-            </label>
-            <label class="rs-policy-item">
               <span class="rs-policy-name">协作总轮次</span>
               <input
                 type="number"
@@ -260,15 +221,6 @@ function onAllowInterruptChange(e: Event): void {
                 :disabled="saving"
                 @change="onMaxRoundsChange"
               />
-            </label>
-            <label class="rs-policy-item rs-policy-check">
-              <input
-                type="checkbox"
-                :checked="policyAllowInterrupt"
-                :disabled="saving"
-                @change="onAllowInterruptChange"
-              />
-              <span class="rs-policy-name">允许打断</span>
             </label>
           </div>
         </div>

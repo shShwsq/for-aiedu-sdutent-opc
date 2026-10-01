@@ -2,7 +2,7 @@
 
 职责:把所有领域事件 append-only 落库到 domain_event_logs 表。
 这是"事件即扩展点"的验收样例 —— 审计能力完全通过订阅挂载,
-没有改动 orchestrator / agent2 / agent_checkpoint 任何主流程逻辑。
+没有改动 orchestrator / agent2 任何主流程逻辑。
 
 后续扩展(统计、webhook、通知)照同样方式 subscribe 即可。
 

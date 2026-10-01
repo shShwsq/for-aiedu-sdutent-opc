@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 
 from app.agents.acp_base import (
     _build_base_prompt,
-    _build_cli_interrupt_message,
     _build_memory_section,
     _build_prompt_message,
     _build_repo_context_section,
@@ -163,52 +162,3 @@ def test_prompt_message_equals_base_plus_repo_and_memory():
     )
     assert msg == base + repo_section + section
 
-
-# ============================================================
-# _build_cli_interrupt_message:CLI 软中断追问(匿名化 + 展示完整)
-# ============================================================
-
-def test_cli_interrupt_send_text_anonymized_query_only():
-    """发送文本:匿名化(不含 agent2),只含 query 不含 reason。"""
-    built = _build_cli_interrupt_message([
-        {"query": "转向检查认证授权", "reason": "agent2 认为方向跑偏", "iteration": 4},
-    ])
-    assert built is not None
-    send, display = built
-    assert "转向检查认证授权" in send
-    assert "agent2" not in send
-    assert "方向跑偏" not in send
-    assert "[方向调整]" in send
-
-
-def test_cli_interrupt_display_full_and_prefixed():
-    """展示文本:带 [检查点中断] 前缀,含完整理由与追问指令(不截断)。"""
-    long_reason = "理由很" + "长" * 300
-    built = _build_cli_interrupt_message([
-        {"query": "转向检查认证授权", "reason": long_reason, "iteration": 4},
-    ])
-    assert built is not None
-    _, display = built
-    assert display.startswith("[检查点中断] ")
-    assert long_reason in display  # 不再截断到 200 字符
-    assert "追问指令:转向检查认证授权" in display
-
-
-def test_cli_interrupt_multiple_numbered():
-    """多条中断(防御性路径):发送文本编号合并,展示文本分节。"""
-    built = _build_cli_interrupt_message([
-        {"query": "指令一", "reason": "r1", "iteration": 4},
-        {"query": "指令二", "reason": "r2", "iteration": 6},
-    ])
-    assert built is not None
-    send, display = built
-    assert "[1] 指令一" in send
-    assert "[2] 指令二" in send
-    assert "理由:r1" in display
-    assert "理由:r2" in display
-
-
-def test_cli_interrupt_empty_returns_none():
-    """无可注入内容(空列表或 query 全空)返回 None。"""
-    assert _build_cli_interrupt_message([]) is None
-    assert _build_cli_interrupt_message([{"query": "  ", "reason": "r", "iteration": 1}]) is None

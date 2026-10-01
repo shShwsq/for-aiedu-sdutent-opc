@@ -180,7 +180,7 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
     placement: 'top',
     title: '协作对话流',
     content:
-      '任务运行时,这里会实时显示 AI助手与检查助手的对话流:思考、工具调用、检查点评估等过程都会按轮次展示。',
+      '任务运行时,这里会实时显示 AI助手与检查助手的对话流:思考、工具调用等过程都会按轮次展示。',
   },
   {
     id: 'detail-pause',
