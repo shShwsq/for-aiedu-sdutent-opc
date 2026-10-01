@@ -32,6 +32,9 @@ export function uploadTaskFile(file: File): Promise<UploadResult> {
   const form = new FormData()
   form.append('file', file)
   return client
-    .post<UploadResult>('/uploads', form, { timeout: 300_000 })
+    .post<UploadResult>('/uploads', form, {
+      timeout: 300_000,
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
     .then((r) => r.data)
 }
