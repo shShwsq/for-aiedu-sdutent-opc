@@ -1120,12 +1120,13 @@ def _get_result_display_config(
 
     # meta_fields:从 results 的 metadata keys 动态推断
     # 收集所有 result 的 metadata keys(保留出现顺序)
+    # practice_worthy 为布尔出题标记,报告无展示价值,跳过
     seen_keys: list[str] = []
     for r in results:
         meta = r.metadata_ or {}
         if isinstance(meta, dict):
             for k in meta.keys():
-                if k not in seen_keys and not k.startswith("_"):
+                if k not in seen_keys and not k.startswith("_") and k != "practice_worthy":
                     seen_keys.append(k)
     # file_path 类型的 key 标记为 file(可点击跳转),其余为 text
     meta_fields = []
@@ -1180,7 +1181,7 @@ def export_task_report(
 def _build_markdown_report(
     task: Task, db: Session,
 ) -> str:
-    """生成 Markdown 报告:任务信息 + 结果清单(按场景分组)"""
+    """生成 Markdown 报告:任务信息 + 重点与知识点(按 grouping 分组)"""
     lines: list[str] = []
     lines.append("# 任务报告")
     lines.append("")
@@ -1201,12 +1202,12 @@ def _build_markdown_report(
     lines.append(task.user_input)
     lines.append("")
 
-    # 结果清单(场景降级后:grouping 从 task.params._grouping 读取,
+    # 重点与知识点(场景降级后:grouping 从 task.params._grouping 读取,
     # meta_fields 从 results 的 metadata keys 动态推断)
     results = list(task.results)
     if results:
         grouping, meta_fields = _get_result_display_config(task, results)
-        lines.append("## 结果清单")
+        lines.append("## 重点与知识点")
         lines.append("")
         if grouping:
             _append_grouped_results_md(lines, results, grouping, meta_fields)
@@ -1348,11 +1349,11 @@ def _build_html_report(
     parts.append("<h2>用户意图</h2>")
     parts.append(f'<div class="intent">{html.escape(task.user_input)}</div>')
 
-    # 结果清单
+    # 重点与知识点
     results = list(task.results)
     if results:
         grouping, meta_fields = _get_result_display_config(task, results)
-        parts.append("<h2>结果清单</h2>")
+        parts.append("<h2>重点与知识点</h2>")
         if grouping:
             _append_grouped_results_html(parts, results, grouping, meta_fields)
         else:

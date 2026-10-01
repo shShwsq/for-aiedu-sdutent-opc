@@ -48,7 +48,7 @@ AGENT_TYPE = "qoder_cli"
 # 注:文档 https://docs.qoder.cn/cli/model 称可用 --model efficient 切换经济分级,
 # 但实测 CLI 报 "Invalid model 'efficient'",分级模型只能通过 TUI /model 切换,
 # --model 仅接受具体模型名(Auto/Qwen3.x-*/DeepSeek-V4-*/GLM-5.2 等)
-_TEST_ACP_ARGS = ["--model", "DeepSeek-V4-Flash", "--reasoning-effort", "low"]
+_TEST_ACP_ARGS = ["--model", "Qwen3.8-Flash", "--reasoning-effort", "low"]
 
 
 # ============================================================

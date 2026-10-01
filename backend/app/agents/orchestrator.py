@@ -81,7 +81,7 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
 
     task.status = TaskStatus.RUNNING
     task.current_stage = (
-        "双智能体协作启动" if ua_enabled else "单 agent 模式启动(agent2 已禁用)"
+        "任务启动" if ua_enabled else "任务启动(单智能体模式)"
     )
     db.commit()
     _publish_status(task)
@@ -298,7 +298,7 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
             # 暂停检查点:react_agent 跑完后、agent2 评估前
             wait_if_paused(task.id)
 
-            task.current_stage = f"第 {round_idx} 轮:agent2 评估"
+            task.current_stage = f"第 {round_idx} 轮:检查助手核查中"
             db.commit()
             _publish_status(task)
 
@@ -366,7 +366,7 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         # ---------- 标记完成 ----------
         task.status = TaskStatus.COMPLETED
         task.current_stage = (
-            f"双智能体协作完成,{len(react_summaries)} 轮,"
+            f"任务完成,{len(react_summaries)} 轮,"
             f"共 {all_results_count} 个结果"
         )
         task.completed_at = datetime.now(timezone.utc)
@@ -1161,7 +1161,7 @@ def resume_audit_with_message(
             return  # finally 块仍会执行清理
 
         # 先调 agent2 分析用户消息(round_idx = start_round_idx)
-        task.current_stage = f"第 {start_round_idx} 轮:agent2 分析用户消息"
+        task.current_stage = f"第 {start_round_idx} 轮:检查助手分析补充消息"
         db.commit()
         _publish_status(task)
 
@@ -1227,7 +1227,7 @@ def resume_audit_with_message(
             # 暂停检查点:react_agent 跑完后、agent2 评估前
             wait_if_paused(task.id)
 
-            task.current_stage = f"第 {round_idx} 轮:agent2 评估"
+            task.current_stage = f"第 {round_idx} 轮:检查助手核查中"
             db.commit()
             _publish_status(task)
 

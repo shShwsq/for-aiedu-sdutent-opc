@@ -61,8 +61,13 @@ conversation-section
 
 不进折叠块、直接渲染为单张卡片的关键消息:
 
-- agent2 的轮次评估、追问、总结;
-- 用户补充消息(type=message,右对齐,与顶部 userDirective 视觉一致)。
+- **agent2 真追问**(修正指令卡):主对话流**唯一保留**的检查助手内容,
+  包 warning 色系 `.followup-card`("⚠ 检查助手修正指令");判定函数
+  `isAgent2Followup`(role=agent2 && type=evaluation && content 非空且
+  不以三个非追问标记开头,与后端 `_is_ua_followup_evaluation` 逐字对齐);
+- 用户补充消息(type=message,右对齐,与顶部 userDirective 视觉一致);
+- 其余 agent2 输出(思考/工具核查/评估完成/总结)一律过滤出主对话流
+  (roundGroups 在 localIdx 计数后跳过),由右侧栏 Agent2Panel 展示。
 
 ### 3.2 step group(步骤分组,折叠块)
 
@@ -165,7 +170,14 @@ RoundGroup { roundIdx, label, segments, planSteps }
    不再包含:状态徽标与下载/打印按钮(已移至标题行,见 §5.1)、
    用户意图卡片(不再显示;用户指令仍保留在对话流顶部 userDirective 气泡)。
 2. **动态验证**(配置了测试环境 URL 时):开关、授权模式切换、登录凭证(脱敏);不出现 verifier_agent 字样。
-3. **结果清单**(最底部):按 `task.params._grouping` 动态分组(如按严重度);卡片默认折叠,展开显示 Markdown 正文;文件类 meta 标签可点击打开左侧工作区文件。
+3. **检查助手核查**(Agent2Panel,有 agent2 活动时):agent2 的全部过程输出——
+   按轮折叠组(进行中轮自动展开),轮内含流式思考(SSE thinking_delta,
+   verify 标记显示"动态验证")、历史思考链、工具核查(读码/PoC/引用复核,
+   tool_call 与 tool_result 配对为单行摘要+展开)、评估结论、最终总结卡。
+4. **重点与知识点**(最底部,原"结果清单"):agent2 done=true 提炼的
+   3-8 条精选知识点(老任务为全量发现,兼容);含 `learning_note` 的卡片
+   带"值得学"徽标,展开时正文上方显示学习点引用块;按 `task.params._grouping`
+   动态分组(如按严重度,老任务);文件类 meta 标签可点击打开左侧工作区文件。
 
 > 历史说明:覆盖度看板(task.checklist 驱动的维度卡片网格)已随覆盖度清单功能移除。
 

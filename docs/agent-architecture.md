@@ -49,7 +49,7 @@
 
 | 角色 | 职责 | 是否调工具 | 模型来源 |
 |------|------|-----------|---------|
-| **agent2(检查助手)** | 核查优先、追问兜底:①每轮执行后质检审查 agent1 的结果(按任务意图自行确定审查维度、读真实源码核实发现、引用复核、整理结构化结果);②done=true 整理结果时标记有学习价值的点(`practice_worthy`),任务完成后 practice 服务优先据此出题 | 是,只读核查工具(`read_file` / `list_files` / `find_files` / `search_code`,单轮上限 `MAX_READ_TOOL_CALLS=12`);可选经 verifier_agent 生成 PoC 验证(单轮上限 `MAX_VERIFY_CALLS=3`);引用复核 `check_reference`(后端安全抓取,单轮上限 `MAX_REFERENCE_CALLS=3`,`allow_reference_check` 默认开) | `task.llm_config_id` |
+| **agent2(检查助手)** | **幕后质检 + 学习点提炼**:核查 agent1 的产出(读真实源码核实/PoC/引用复核),发现错误时发修正指令(主界面追问卡),done=true 时提炼重点与知识点(results,3-8 条精选,含 learning_note);核查过程与知识点经任务详情侧栏呈现,不进主对话流 | 是,只读核查工具(`read_file` / `list_files` / `find_files` / `search_code`,单轮上限 `MAX_READ_TOOL_CALLS=12`);可选经 verifier_agent 生成 PoC 验证(单轮上限 `MAX_VERIFY_CALLS=3`);引用复核 `check_reference`(后端安全抓取,单轮上限 `MAX_REFERENCE_CALLS=3`,`allow_reference_check` 默认开) | `task.llm_config_id` |
 | **内置 react_agent(agent1)** | ReAct 循环执行代码分析(clone / search / read / semgrep 等) | 是,调用沙箱工具 | `task.react_llm_config_id`(空时回退 `llm_config_id`) |
 | **ExternalCLIAgent(agent1)** | 沙箱内启动外部 CLI,通过 ACP 协议通信 | 是,由 CLI 自主调工具 | CLI 自管(凭证经环境变量注入) |
 | **verifier_agent**(实验性) | 在沙箱里跑 PoC / HTTP 请求动态验证 agent1 的发现 | 是,独立工具集(`http_request` + `run_python_code`) | `task.llm_config_id`(复用 agent2 的 LLMClient) |
@@ -83,11 +83,12 @@
 
 ### 2.1 核心特征
 
-- **职责顺序(核查优先、追问兜底)**:①核实发现(只读工具读真实源码核对,单轮上限 `MAX_READ_TOOL_CALLS=12`)→ ②动态 PoC 验证(经 verifier_agent,单轮上限 `MAX_VERIFY_CALLS=3`,需测试环境)→ ③引用复核(`check_reference`,单轮上限 `MAX_REFERENCE_CALLS=3`)→ ④标记学习点 → ⑤输出结论 → ⑥(兜底)追问;凡能自查的绝不追问
-- **学习点标记**:done=true 整理 results 时,从中挑 3-6 个最有学习价值的点在 metadata 标 `practice_worthy: true` + `learning_note`(考察点说明);没有就不标,不硬凑。出题时 generator 优先选标记的发现(保持 agent2 原顺序,不足补未标记的;无标记任务行为不变)
-- **题目与知识点生成**:任务完成后由 orchestrator 调用 practice 服务(实现位于 `app/services/practice/`)生成练习题与知识点,选题优先覆盖 agent2 标记的学习点
+- **幕后质检定位**:agent1 是面向用户的台前回答者(其每轮 summary 即主界面用户看到的回答);agent2 的核查过程与知识点经任务详情侧栏(Agent2Panel)呈现,主对话流只保留其"真追问"(修正指令卡,判定见 `isAgent2Followup`)。"敢不敢上线"不再是硬性产出,仅当用户意图涉及上线/采用决策时在 reasoning 附判断
+- **职责顺序(核查优先、追问兜底)**:①核实发现(只读工具读真实源码核对,单轮上限 `MAX_READ_TOOL_CALLS=12`)→ ②动态 PoC 验证(经 verifier_agent,单轮上限 `MAX_VERIFY_CALLS=3`,需测试环境)→ ③引用复核(`check_reference`,单轮上限 `MAX_REFERENCE_CALLS=3`)→ ④提炼重点与知识点 → ⑤(兜底)修正追问;凡能自查的绝不追问
+- **重点与知识点产出(done=true 时 results)**:从全程提炼 **3-8 条精选知识点**,不是全量发现清单;每条 metadata 含 `learning_note`(必有,学习价值说明)、`practice_worthy: true`(默认)、可选 severity/file_path/line/verified/ref_* 系列。grouping 默认 null(平铺),仅安全审计类按严重度分组对用户有帮助时才声明
+- **题目与知识点生成**:任务完成后由 orchestrator 调用 practice 服务(实现位于 `app/services/practice/`)生成练习题与知识点,选题优先覆盖 practice_worthy 标记的知识点
 - **审查维度自定**：无预定义覆盖度清单，agent2 每次评估时根据用户意图自行确定应覆盖的审查维度（3-8 个为宜），跨轮保持维度 id 稳定
-- **流式输出**：`_stream_agent2_llm` 通过 `client.chat_stream` 收 token，实时推送 `thinking_delta` 事件给前端
+- **流式输出**：`_stream_agent2_llm` 通过 `client.chat_stream` 收 token，实时推送 `thinking_delta` 事件给前端（Agent2Panel 侧栏渲染）
 - **跨轮记忆**：第 2 轮起注入自己之前各轮的评估记录，避免 covered/missing 反复摇摆
 
 ### 2.2 输入参数（`run_agent2`）

@@ -1,0 +1,445 @@
+<script setup lang="ts">
+/**
+ * 检查助手(agent2)核查过程侧栏面板
+ *
+ * 主对话流只保留 用户↔AI助手 对话与追问修正卡(见 TaskDetailView 的
+ * roundGroups 过滤);检查助手的思考流/评估/工具核查(读码/PoC/引用复核)/
+ * 最终总结全部在本面板按轮折叠展示。
+ *
+ * 数据来源:
+ * - conversations:任务 Conversation 列表(role=agent2 的历史消息)
+ * - streamingItems:SSE thinking_delta 累积的流式思考(与 TaskDetailView
+ *   共用同一 reactive Map,本组件只读消费)
+ */
+import { computed, nextTick, ref, watch } from 'vue'
+import type { Conversation } from '@/types/task'
+import { renderMarkdown } from '@/utils/markdown'
+
+/** 与 TaskDetailView 内部 StreamingItem 对齐(本组件只读消费) */
+interface StreamingLike {
+  conv_id: string
+  round_idx: number
+  role: 'agent1' | 'agent2'
+  reasoning: string
+  content: string
+  status: 'streaming' | 'done' | 'error'
+  verify?: boolean
+}
+
+interface ToolEntry {
+  call: Conversation
+  result: Conversation | null
+}
+
+interface RoundGroup {
+  round_idx: number
+  thinking: Conversation[]
+  streaming: StreamingLike[]
+  tools: ToolEntry[]
+  evaluations: Conversation[]
+  summaries: Conversation[]
+  others: Conversation[]
+}
+
+const props = defineProps<{
+  conversations: Conversation[]
+  streamingItems: Map<string, StreamingLike>
+  isRunning: boolean
+}>()
+
+// 后端落库的 tool_call 首行意图前缀(agents/agent2.py),展示时剥离
+const TOOL_INTENT_PREFIX = /^\[agent2 质检\]\s*/
+// 评估非追问内容标记(与 orchestrator._record_agent2 / routers/tasks.py
+// _UA_EVAL_NON_FOLLOWUP_MARKERS 对齐)
+const NON_FOLLOWUP_MARKERS = ['评估完成,无需追问', '(未给出追问)', '请求用户澄清']
+
+/** agent2 全部消息按轮分组(tool_call 与 tool_result 按 id 配对) */
+const rounds = computed<RoundGroup[]>(() => {
+  const byRound = new Map<number, RoundGroup>()
+  const ensure = (r: number): RoundGroup => {
+    let g = byRound.get(r)
+    if (!g) {
+      g = {
+        round_idx: r, thinking: [], streaming: [], tools: [],
+        evaluations: [], summaries: [], others: [],
+      }
+      byRound.set(r, g)
+    }
+    return g
+  }
+  for (const c of props.conversations) {
+    if (c.role !== 'agent2') continue
+    const g = ensure(c.round_idx)
+    if (c.type === 'thinking') g.thinking.push(c)
+    else if (c.type === 'tool_call') g.tools.push({ call: c, result: null })
+    else if (c.type === 'tool_result') {
+      const hit = c.tool_call_id
+        ? g.tools.find((t) => t.call.id === c.tool_call_id)
+        : undefined
+      if (hit) hit.result = c
+      else g.others.push(c) // 孤立结果(调用记录缺失)兜底展示
+    } else if (c.type === 'evaluation') g.evaluations.push(c)
+    else if (c.type === 'summary') g.summaries.push(c)
+    else if (c.type) g.others.push(c) // 未知 type 容错(老数据形态)
+  }
+  for (const s of props.streamingItems.values()) {
+    if (s.role !== 'agent2') continue
+    ensure(s.round_idx).streaming.push(s)
+  }
+  return [...byRound.values()].sort((a, b) => a.round_idx - b.round_idx)
+})
+
+/** 轮组展开状态;默认展开最新一轮(含运行中新轮自动展开) */
+const expanded = ref<Set<number>>(new Set())
+
+watch(
+  () => rounds.value.length,
+  (n, o) => {
+    const latest = rounds.value[rounds.value.length - 1]
+    if (!latest) return
+    if (n > (o ?? 0) || o === undefined) expanded.value.add(latest.round_idx)
+  },
+  { immediate: true },
+)
+
+function toggleRound(r: number): void {
+  expanded.value.has(r) ? expanded.value.delete(r) : expanded.value.add(r)
+}
+
+// ---- 流式思考文本自动贴底(仅当用户未向上滚动时) ----
+const streamRefs = new Map<number, HTMLElement | null>()
+function setStreamRef(r: number, el: unknown): void {
+  streamRefs.set(r, (el as HTMLElement | null) || null)
+}
+watch(
+  () => rounds.value,
+  () => {
+    nextTick(() => {
+      for (const el of streamRefs.values()) {
+        if (el) el.scrollTop = el.scrollHeight
+      }
+    })
+  },
+)
+
+// ---- 展示辅助 ----
+
+function firstLine(text: string | null | undefined): string {
+  return (text || '').split('\n')[0] || ''
+}
+
+function truncate(text: string | null | undefined, n: number): string {
+  const s = text || ''
+  return s.length > n ? s.slice(0, n) + '…' : s
+}
+
+/** 工具调用单行摘要:取 intent 首行,剥质检前缀 */
+function toolIntent(c: Conversation): string {
+  return truncate(firstLine(c.content).replace(TOOL_INTENT_PREFIX, ''), 70)
+}
+
+/** 评估摘要:区分"评估完成"与"发出修正指令" */
+function evalDigest(e: Conversation): string {
+  const content = (e.content || '').trim()
+  if (content.startsWith('评估完成')) return '评估完成'
+  if (!content) return '评估'
+  return `修正指令:${truncate(content, 50)}`
+}
+
+/** 轮组标题右侧摘要,如 "3 次核查 · 1 条修正指令" */
+function roundDigest(g: RoundGroup): string {
+  const parts: string[] = []
+  const toolCount = g.tools.length + g.streaming.filter((s) => s.verify).length
+  if (toolCount) parts.push(`${toolCount} 次核查`)
+  const followups = g.evaluations.filter((e) => {
+    const c = (e.content || '').trim()
+    return !!c && !NON_FOLLOWUP_MARKERS.some((m) => c.startsWith(m))
+  }).length
+  if (followups) parts.push(`${followups} 条修正指令`)
+  if (g.summaries.length) parts.push('已完成')
+  return parts.join(' · ') || '思考完成'
+}
+
+/** 流式思考文本(reasoning 优先,限量防止 DOM 过大) */
+function streamText(s: StreamingLike): string {
+  const text = s.reasoning || s.content || ''
+  return text.length > 6000 ? text.slice(-6000) : text
+}
+
+function charCount(text: string | null | undefined): number {
+  return (text || '').length
+}
+</script>
+
+<template>
+  <section class="agent2-panel" data-onboarding="detail-agent2">
+    <h2 class="panel-title">
+      检查助手核查
+      <span v-if="isRunning" class="panel-live-dot" aria-hidden="true" />
+    </h2>
+
+    <div v-for="g in rounds" :key="g.round_idx" class="panel-round">
+      <button type="button" class="panel-round-head" @click="toggleRound(g.round_idx)">
+        <span class="panel-toggle">{{ expanded.has(g.round_idx) ? '▼' : '▶' }}</span>
+        <span class="panel-round-name">第 {{ g.round_idx }} 轮核查</span>
+        <span class="panel-round-digest">{{ roundDigest(g) }}</span>
+      </button>
+
+      <div v-if="expanded.has(g.round_idx)" class="panel-round-body">
+        <!-- 实时流式思考(SSE thinking_delta;verify 标记为动态验证) -->
+        <div v-for="s in g.streaming" :key="s.conv_id" class="panel-stream">
+          <span :class="['panel-stream-label', { 'is-verify': s.verify }]">
+            {{ s.verify ? '动态验证' : '思考中' }}{{ s.status === 'streaming' ? '…' : '' }}
+          </span>
+          <div
+            class="panel-stream-text"
+            :ref="(el) => setStreamRef(g.round_idx, el)"
+            v-text="streamText(s)"
+          />
+        </div>
+
+        <!-- 历史思考链(刷新页面后由落库记录接管) -->
+        <details v-for="t in g.thinking" :key="t.id" class="panel-item">
+          <summary>思考链 · {{ charCount(t.reasoning || t.content) }} 字</summary>
+          <div class="markdown-body panel-md" v-html="renderMarkdown(t.reasoning || t.content)" />
+        </details>
+
+        <!-- 工具核查(读码核对 / PoC / 引用复核):单行意图 + 展开看结果 -->
+        <details v-for="tool in g.tools" :key="tool.call.id" class="panel-item panel-tool">
+          <summary>{{ toolIntent(tool.call) }}</summary>
+          <div v-if="tool.result" class="panel-tool-result">{{ truncate(tool.result.content, 1500) }}</div>
+        </details>
+
+        <!-- 评估:结论行 + 展开完整评估 -->
+        <details v-for="e in g.evaluations" :key="e.id" class="panel-item panel-eval">
+          <summary>{{ evalDigest(e) }}</summary>
+          <pre class="panel-full-text">{{ e.reasoning || e.content }}</pre>
+        </details>
+
+        <!-- 最终总结(高亮) -->
+        <div v-for="s in g.summaries" :key="s.id" class="panel-summary">
+          <span class="panel-summary-label">最终结论</span>
+          <div class="markdown-body panel-md" v-html="renderMarkdown(s.content)" />
+        </div>
+
+        <!-- 未知类型容错(老数据形态) -->
+        <details v-for="o in g.others" :key="o.id" class="panel-item">
+          <summary>{{ o.type }} · {{ truncate(firstLine(o.content), 50) }}</summary>
+          <pre class="panel-full-text">{{ o.content }}</pre>
+        </details>
+      </div>
+    </div>
+  </section>
+</template>
+
+<style scoped>
+.agent2-panel {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.panel-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-2);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--color-text-primary);
+}
+
+/* 运行中呼吸点(与出题进度红点同风格) */
+.panel-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-success);
+  animation: panel-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes panel-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.7); }
+}
+
+.panel-round {
+  margin-bottom: var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.panel-round-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-xs);
+  color: var(--color-text-primary);
+  background: var(--color-surface);
+  border: none;
+  cursor: pointer;
+  text-align: left;
+}
+
+.panel-round-head:hover {
+  background: var(--color-primary-light);
+}
+
+.panel-toggle {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--color-text-tertiary);
+}
+
+.panel-round-name {
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+}
+
+.panel-round-digest {
+  margin-left: auto;
+  color: var(--color-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.panel-round-body {
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  border-top: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* 流式思考 */
+.panel-stream {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.panel-stream-label {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--color-success);
+}
+
+.panel-stream-label.is-verify {
+  color: var(--color-info);
+}
+
+.panel-stream-text {
+  max-height: 220px;
+  padding: var(--space-2);
+  overflow-y: auto;
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 折叠条目(思考链 / 工具核查 / 评估) */
+.panel-item summary {
+  cursor: pointer;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  list-style: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.panel-item summary::-webkit-details-marker {
+  display: none;
+}
+
+.panel-item summary::before {
+  content: '▸ ';
+  color: var(--color-text-tertiary);
+}
+
+.panel-item[open] summary::before {
+  content: '▾ ';
+}
+
+.panel-item summary:hover {
+  color: var(--color-primary);
+}
+
+.panel-item > *:not(summary) {
+  margin-top: var(--space-1);
+}
+
+.panel-md {
+  max-height: 240px;
+  overflow-y: auto;
+  padding: var(--space-2);
+  font-size: var(--fs-xs);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
+.panel-tool-result {
+  max-height: 200px;
+  overflow-y: auto;
+  padding: var(--space-2);
+  font-size: var(--fs-xs);
+  font-family: var(--font-mono, monospace);
+  color: var(--color-text-secondary);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.panel-eval summary {
+  color: var(--color-warning);
+  font-weight: var(--fw-medium);
+}
+
+.panel-full-text {
+  max-height: 240px;
+  overflow-y: auto;
+  margin: var(--space-1) 0 0;
+  padding: var(--space-2);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 最终结论高亮卡 */
+.panel-summary {
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-primary-light);
+  border: 1px solid var(--color-primary-border);
+  border-radius: var(--radius-md);
+}
+
+.panel-summary-label {
+  display: inline-block;
+  margin-bottom: var(--space-1);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  color: var(--color-primary);
+}
+
+.panel-summary .panel-md {
+  max-height: none;
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+</style>

@@ -21,6 +21,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { jsonrepair } from 'jsonrepair'
 
 import AppHeader from '@/components/AppHeader.vue'
+import Agent2Panel from '@/components/Agent2Panel.vue'
 import ConversationMessage from '@/components/ConversationMessage.vue'
 import PracticeGenerateDialog from '@/components/PracticeGenerateDialog.vue'
 import UserMessageInput from '@/components/UserMessageInput.vue'
@@ -1309,6 +1310,21 @@ function segmentRoundItems(
   return segments
 }
 
+// ---- agent2 消息主界面过滤(阶段重构:检查助手过程移入右侧栏)----
+// agent2 的输出中,唯一允许出现在主对话流的是"真追问"(修正指令)——
+// 它会驱动 agent1 再跑一轮,是用户需要关注的事件;其余(思考/工具核查/
+// 评估完成/总结)全部由右侧栏 Agent2Panel 展示。
+// 判定逻辑与后端 routers/tasks.py 的 _is_ua_followup_evaluation 逐字对齐
+// (常量 = _UA_EVAL_NON_FOLLOWUP_MARKERS,含旧版澄清文案,老数据兼容)。
+const AGENT2_NON_FOLLOWUP_MARKERS = ['评估完成,无需追问', '(未给出追问)', '请求用户澄清']
+
+/** agent2 评估消息是否为"真追问"(主对话流唯一保留的 agent2 内容) */
+function isAgent2Followup(c: { role?: string; type?: string; content?: string }): boolean {
+  if (c.role !== 'agent2' || c.type !== 'evaluation') return false
+  const content = (c.content || '').trim()
+  return !!content && !AGENT2_NON_FOLLOWUP_MARKERS.some((m) => content.startsWith(m))
+}
+
 const roundGroups = computed<RoundGroup[]>(() => {
   if (!task.value?.conversations && streamingItems.size === 0) return []
 
@@ -1331,6 +1347,13 @@ const roundGroups = computed<RoundGroup[]>(() => {
     const localIdx = roundCounter.get(c.round_idx) ?? 0
     roundCounter.set(c.round_idx, localIdx + 1)
     const seq = localIdx * 1000
+
+    // agent2 消息默认移入右侧栏(仅真追问保留在主对话流)。
+    // 注意:必须放在 localIdx 计数递增之后——convCountPerRound
+    // (onConversation/onDone)仍计数全部消息,此处同基准跳过,
+    // seq 留空洞无害(相对顺序不变),避免 agent1 流式 thinking 的
+    // insertSeq 定位错位。
+    if (c.role === 'agent2' && !isAgent2Followup(c)) return
 
     if (c.type === 'thinking' && c.reasoning) {
       // 还原为流式卡片(只读模式)
@@ -1386,6 +1409,8 @@ const roundGroups = computed<RoundGroup[]>(() => {
   //     之后、tool_call2(seq=2000)之前。这样每个 thinking 紧跟它之后的 tool_call/tool_result,
   //     正确归入各自迭代,不会出现"所有 thinking 挤前面、所有 tool_call 堆最后"的错乱。
   for (const item of streamingItems.values()) {
+    // agent2 流式思考(含动态验证)由右侧栏 Agent2Panel 渲染,不进主对话流
+    if (item.role === 'agent2') continue
     if (!groups.has(item.round_idx)) groups.set(item.round_idx, [])
     groups.get(item.round_idx)!.push({
       id: `stream:${item.conv_id}`,
@@ -1670,7 +1695,7 @@ const resultGroups = computed<ResultGroup[]>(() => {
 
   // 不分组:单个平铺组
   if (!grouping) {
-    return [{ key: 'all', label: '结果', color: 'unknown', results }]
+    return [{ key: 'all', label: '重点与知识点', color: 'unknown', results }]
   }
 
   // 按 grouping.field 从 metadata 取值分组
@@ -1738,6 +1763,20 @@ const isRunning = computed(
 /** 是否处于暂停态(控制按钮文案:暂停 ↔ 恢复) */
 const isPaused = computed(() => task.value?.status === 'paused')
 
+// ---- 检查助手侧栏面板(阶段重构:agent2 过程输出全部移入右侧栏)----
+/** 检查助手是否有活动内容(历史消息或流式思考);无则隐藏面板(单 agent 模式/未开始) */
+const hasAgent2Activity = computed(
+  () =>
+    !!task.value?.conversations?.some((c) => c.role === 'agent2') ||
+    [...streamingItems.values()].some((s) => s.role === 'agent2'),
+)
+/** 检查助手核查进行中(呼吸点仅在其核查阶段亮,agent1 执行时不亮) */
+const isAgent2Running = computed(
+  () =>
+    task.value?.status === 'running' &&
+    (task.value?.current_stage || '').includes('检查助手'),
+)
+
 /** 暂停/恢复按钮 loading 态(防止重复点击) */
 const pausing = ref(false)
 
@@ -1787,10 +1826,13 @@ const inferredMetaFields = computed<InferredMetaField[]>(() => {
   const results = task.value?.results ?? []
   const seen = new Set<string>()
   const fields: InferredMetaField[] = []
+  // 学习点专用字段不进通用 meta 标签区:learning_note 有独立引用块展示,
+  // practice_worthy 为布尔标记(出题用),显示出来只会是 "true"
+  const META_FIELD_SKIP = new Set(['learning_note', 'practice_worthy'])
   for (const r of results) {
     if (!r.metadata_) continue
     for (const key of Object.keys(r.metadata_)) {
-      if (seen.has(key)) continue
+      if (seen.has(key) || META_FIELD_SKIP.has(key)) continue
       seen.add(key)
       fields.push({
         name: key,
@@ -2206,13 +2248,30 @@ function toggleResult(id: string): void {
                 v-for="seg in group.segments"
                 :key="seg.kind === 'step' ? `step-${seg.id}` : `plain-${seg.item.id}`"
               >
-                <!-- 平铺段:agent2 评估/追问/总结、user 指令等关键消息 -->
+                <!-- 平铺段:agent2 追问卡、user 指令等关键消息 -->
                 <!-- 用户补充消息(type=message)右对齐,与顶部 userDirective 视觉一致 -->
                 <div
                   v-if="seg.kind === 'plain'"
                   :class="{ 'user-msg-row': isUserMessageItem(seg.item) }"
                 >
+                  <!-- agent2 真追问:醒目"修正指令"卡(主对话流唯一保留的检查助手内容) -->
+                  <div
+                    v-if="isAgent2Followup(seg.item)"
+                    class="followup-card"
+                    data-onboarding="detail-followup"
+                  >
+                    <div class="followup-card-header">
+                      <span class="followup-card-icon" aria-hidden="true">⚠</span>
+                      <span class="followup-card-title">检查助手修正指令</span>
+                      <span class="followup-card-sub">已要求 AI助手 修正/补充上述问题</span>
+                    </div>
+                    <ConversationMessage
+                      :item="seg.item"
+                      @toggle-reasoning="toggleReasoning"
+                    />
+                  </div>
                   <ConversationMessage
+                    v-else
                     :item="seg.item"
                     @toggle-reasoning="toggleReasoning"
                   />
@@ -2606,14 +2665,22 @@ function toggleResult(id: string): void {
           </div>
         </section>
 
-        <!-- 结果清单(分组由 task.params._grouping 驱动,卡片默认折叠;置底展示) -->
+        <!-- 检查助手核查过程(思考/评估/工具核查/最终结论;主对话流只留追问卡) -->
+        <Agent2Panel
+          v-if="hasAgent2Activity"
+          :conversations="task.conversations"
+          :streaming-items="streamingItems"
+          :is-running="isAgent2Running"
+        />
+
+        <!-- 重点与知识点(原"结果清单";分组由 task.params._grouping 驱动,卡片默认折叠;置底展示) -->
         <section
           v-if="task.results.length > 0"
           class="sidebar-results"
           data-onboarding="detail-results"
         >
           <h2>
-            结果清单 <span class="count">({{ task.results.length }})</span>
+            重点与知识点 <span class="count">({{ task.results.length }})</span>
             <!-- 本任务的出题 job 运行中时,隐藏「生成练习题」入口,改为展示跳转练习页看实时进度 -->
             <button
               v-if="runningGenJob"
@@ -2652,6 +2719,12 @@ function toggleResult(id: string): void {
                 <div class="result-header">
                   <span class="result-toggle">{{ expandedResults.has(r.id) ? '▼' : '▶' }}</span>
                   <h4>{{ r.title }}</h4>
+                  <!-- 学习点徽标(agent2 标记了 learning_note 的知识点) -->
+                  <span
+                    v-if="r.metadata_?.learning_note"
+                    class="learning-badge"
+                    title="检查助手标记的学习点"
+                  >值得学</span>
                   <span class="round-tag">第 {{ r.round_idx }} 轮</span>
                 </div>
                 <div v-if="getResultMetaItems(r).length > 0" class="result-meta">
@@ -2666,9 +2739,18 @@ function toggleResult(id: string): void {
                 </div>
                 <div
                   v-if="expandedResults.has(r.id)"
-                  class="result-content markdown-body"
-                  v-html="renderResultContent(r.content)"
-                />
+                  class="result-content-wrapper"
+                >
+                  <!-- 学习点说明:知识点正文上方的引用块(agent2 提炼的学习价值) -->
+                  <blockquote
+                    v-if="r.metadata_?.learning_note"
+                    class="learning-note"
+                  >{{ r.metadata_.learning_note }}</blockquote>
+                  <div
+                    class="result-content markdown-body"
+                    v-html="renderResultContent(r.content)"
+                  />
+                </div>
               </article>
             </div>
           </template>
@@ -3104,6 +3186,38 @@ function toggleResult(id: string): void {
   border: 1px solid #fecaca;
 }
 
+/* ---- agent2 追问修正卡(主对话流唯一保留的检查助手内容) ---- */
+.followup-card {
+  padding: var(--space-3) var(--space-4) var(--space-2);
+  background: var(--color-warning-light);
+  border-left: 3px solid var(--color-warning);
+  border-radius: var(--radius-md);
+}
+
+.followup-card-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+  font-size: var(--fs-xs);
+}
+
+.followup-card-icon {
+  color: var(--color-warning);
+}
+
+.followup-card-title {
+  font-weight: var(--fw-semibold);
+  color: var(--color-warning);
+}
+
+.followup-card-sub {
+  color: var(--color-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ---- 通用 section ---- */
 /* 对话流:无外框,直接铺在主区背景上(聊天式) */
 .conversation-section {
@@ -3325,6 +3439,30 @@ function toggleResult(id: string): void {
   display: flex;
   align-items: flex-start;
   gap: var(--space-2);
+}
+
+/* 学习点徽标(agent2 标记 learning_note 的知识点卡片) */
+.learning-badge {
+  flex-shrink: 0;
+  margin-top: 1px;
+  padding: 1px var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+  border: 1px solid var(--color-primary-border);
+  border-radius: var(--radius-full, 999px);
+}
+
+/* 学习点说明引用块(知识点正文上方) */
+.learning-note {
+  margin: 0 0 var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  background: var(--color-primary-light);
+  border-left: 3px solid var(--color-primary);
+  border-radius: var(--radius-sm);
 }
 
 .result-toggle {
