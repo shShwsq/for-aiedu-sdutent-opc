@@ -124,7 +124,6 @@ def run_qoder_cli_agent(
     repo_context: str | None = None,
     previous_plan: list | None = None,
     agent_type: str = AGENT_TYPE,
-    agent_policy: dict | None = None,
 ) -> tuple[list, str, list]:
     """跑一轮 Qoder CLI 执行器
 
@@ -142,7 +141,6 @@ def run_qoder_cli_agent(
         repo_context=repo_context,
         previous_plan=previous_plan,
         agent_type=agent_type,
-        agent_policy=agent_policy,
         # Qoder 无需 post_session_setup:--yolo 在 acp_args 中,模型经 --model CLI 参数设置
     )
 

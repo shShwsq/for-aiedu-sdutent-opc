@@ -76,7 +76,6 @@ class ExecutorAgent(ABC):
         client: LLMClient | None = None,
         repo_context: str | None = None,
         previous_plan: list[dict[str, Any]] | None = None,
-        agent_policy: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
         """执行一轮审计
 
@@ -88,8 +87,6 @@ class ExecutorAgent(ABC):
             client: LLMClient(仅内置 provider 使用;外部 CLI 忽略)
             repo_context: 第 1 轮专用,orchestrator 主动 clone 后的仓库上下文
             previous_plan: 上一轮结束时的 plan 状态(跨轮续接)
-            agent_policy: agent 策略配置(检查点评估频率、打断权限等)。
-                None 时用默认值(不启用检查点评估)。
 
         返回:(results, summary, final_plan)
             results: 始终为空 list(结构化结果由 agent2 在 done 时提取)
@@ -124,7 +121,6 @@ class BuiltinReactAgent(ExecutorAgent):
         client: LLMClient | None = None,
         repo_context: str | None = None,
         previous_plan: list[dict[str, Any]] | None = None,
-        agent_policy: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
         # 延迟导入避免循环依赖(react_agent 依赖 tools.schema,本模块被 orchestrator 导入)
         from app.agents.react_agent import run_react_agent
@@ -137,7 +133,6 @@ class BuiltinReactAgent(ExecutorAgent):
             client=client,
             repo_context=repo_context,
             previous_plan=previous_plan,
-            agent_policy=agent_policy,
         )
 
 
@@ -194,7 +189,6 @@ class ExternalCLIAgent(ExecutorAgent):
         client: LLMClient | None = None,
         repo_context: str | None = None,
         previous_plan: list[dict[str, Any]] | None = None,
-        agent_policy: dict[str, Any] | None = None,
     ) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
         run_func = self._load_run_func()
         logger.info(
@@ -208,7 +202,6 @@ class ExternalCLIAgent(ExecutorAgent):
             repo_context=repo_context,
             previous_plan=previous_plan,
             agent_type=self._agent_type,
-            agent_policy=agent_policy,
             # client 参数被忽略:外部 CLI 自带模型配置
         )
 

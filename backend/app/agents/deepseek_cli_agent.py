@@ -153,7 +153,6 @@ def run_deepseek_cli_agent(
     repo_context: str | None = None,
     previous_plan: list[dict[str, Any]] | None = None,
     agent_type: str = AGENT_TYPE,
-    agent_policy: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
     """跑一轮 DeepSeek Harness CLI 执行器
 
@@ -174,7 +173,6 @@ def run_deepseek_cli_agent(
         repo_context=repo_context,
         previous_plan=previous_plan,
         agent_type=agent_type,
-        agent_policy=agent_policy,
         post_session_setup=_deepseek_post_session_setup,
         credential_env_builder=_deepseek_credential_env_builder,
     )

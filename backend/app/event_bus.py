@@ -53,7 +53,6 @@ EventType = Literal[
     "conversation", "status", "thinking_delta", "plan",
     "question",  # agent2 请求用户澄清(选择题/填空题弹窗)
     "done", "error",
-    "agent_checkpoint",  # agent2 检查点评估结果(迭代边界轻量评估)
     "clone_progress",  # 仓库克隆进度(local 模式 Popen 流式解析 git stderr)
 ]
 

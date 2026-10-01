@@ -43,13 +43,12 @@ TASK_FAILED = "task.failed"              # 任务失败(主流程与 resume 的 
 CHECKLIST_CONFIRMED = "checklist.confirmed"      # 用户确认覆盖度清单,已落库 task.checklist
 QUESTION_RAISED = "question.raised"              # agent2 向用户发起澄清提问(弹窗)
 AGENT1_ROUND_COMPLETED = "agent1.round_completed"  # agent1(执行器)完成一轮执行
-CHECKPOINT_EVALUATED = "checkpoint.evaluated"    # agent2 检查点评估完成(迭代边界轻量评估)
 VERIFIER_COMPLETED = "verifier.completed"        # verifier_agent 完成一次动态验证(含失败)
 
 ALL_EVENT_TYPES = frozenset({
     TASK_STARTED, TASK_COMPLETED, TASK_FAILED,
     CHECKLIST_CONFIRMED, QUESTION_RAISED,
-    AGENT1_ROUND_COMPLETED, CHECKPOINT_EVALUATED, VERIFIER_COMPLETED,
+    AGENT1_ROUND_COMPLETED, VERIFIER_COMPLETED,
 })
 
 

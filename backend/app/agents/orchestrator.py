@@ -63,8 +63,7 @@ from app.user_interaction import (
     wait_for_answers,
     wait_for_checklist_confirmation,
 )
-from app.agent_checkpoint import resolve_agent_policy
-from app.agent_interrupt import clear_interrupt_count, clear_interrupts
+from app.agent_policy import resolve_agent_policy
 from app.user_messages import clear_user_messages
 from app.user_interaction import clear_pending_command_confirm, clear_pending_verify_action
 
@@ -78,16 +77,12 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
     """执行双智能体协作审计"""
     task_id_str = str(task.id)
 
-    # 先解析 agent 策略(检查点评估频率、打断权限等):
+    # 先解析 agent 策略(agent2 启停、协作轮次、验证权限等):
     # 启动阶段文案必须在推送前由 agent2 启停决定,
     # 否则单 agent 模式会先闪现"双智能体协作启动"误导前端
     # 合并用户级默认(agent_policies 表)+ 任务级覆盖(task.params["_agent_policy"])
     agent_policy = resolve_agent_policy(task, db)
-    logger.info(
-        f"[task={task.id}] agent_policy: K={agent_policy.get('checkpoint_interval')}, "
-        f"allow_interrupt={agent_policy.get('allow_interrupt')}, "
-        f"max_interrupts={agent_policy.get('max_interrupts_per_round')}"
-    )
+    logger.info(f"[task={task.id}] agent_policy: {agent_policy}")
 
     # agent2 启停 + 协作总轮次(替代 agent2.py 硬编码 MAX_ROUNDS)
     ua_enabled = bool(agent_policy.get("agent2_enabled", True))
@@ -202,7 +197,6 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
                 client=react_client,
                 repo_context=repo_context,
                 previous_plan=None,
-                agent_policy=agent_policy,
             )
             perf_log(task.id, "executor_run", time.perf_counter() - _t0, round_idx=1, executor=executor.name)
             emit(
@@ -423,7 +417,6 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
                 client=react_client,
                 repo_context=repo_context if is_first else None,
                 previous_plan=current_plan if not is_first else None,
-                agent_policy=agent_policy,
             )
             perf_log(task.id, "executor_run", time.perf_counter() - _t0, round_idx=round_idx, executor=executor.name)
             emit(
@@ -631,15 +624,6 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
             clear_pending_command_confirm(task.id)
         except Exception as cleanup_err:
             logger.warning(f"[task={task.id}] 清理命令待确认状态失败: {cleanup_err}")
-        # 清理 agent2 中断队列 + 打断计数(防止任务结束时仍有 in-memory 残留)
-        try:
-            clear_interrupts(task.id)
-        except Exception as cleanup_err:
-            logger.warning(f"[task={task.id}] 清理中断队列失败: {cleanup_err}")
-        try:
-            clear_interrupt_count(task.id)
-        except Exception as cleanup_err:
-            logger.warning(f"[task={task.id}] 清理打断计数失败: {cleanup_err}")
         # 延迟关闭沙箱:标记任务完成,保留 session 供前端浏览工作区文件
         # 实际清理由 workspace 路由的 cleanup_expired_sessions() 惰性触发(TTL 1 小时)
         try:
@@ -1411,14 +1395,10 @@ def resume_audit_with_message(
     # 执行器选择:按 task.executor 拿到对应的 ExecutorAgent provider
     executor = get_executor(task)
 
-    # 加载 agent 策略(检查点评估频率、打断权限等)
+    # 加载 agent 策略(agent2 启停、协作轮次、验证权限等)
     # 合并用户级默认(agent_policies 表)+ 任务级覆盖(task.params["_agent_policy"])
     agent_policy = resolve_agent_policy(task, db)
-    logger.info(
-        f"[task={task.id}] resume agent_policy: K={agent_policy.get('checkpoint_interval')}, "
-        f"allow_interrupt={agent_policy.get('allow_interrupt')}, "
-        f"max_interrupts={agent_policy.get('max_interrupts_per_round')}"
-    )
+    logger.info(f"[task={task.id}] resume agent_policy: {agent_policy}")
 
     # agent2 启停(重启场景)
     ua_enabled = bool(agent_policy.get("agent2_enabled", True))
@@ -1486,7 +1466,6 @@ def resume_audit_with_message(
                 client=react_client,
                 repo_context=None,
                 previous_plan=None,
-                agent_policy=agent_policy,
             )
             perf_log(task.id, "executor_run", time.perf_counter() - _t0, round_idx=start_round_idx, executor=executor.name)
             react_summaries.append({"round": start_round_idx, "summary": summary})
@@ -1611,7 +1590,6 @@ def resume_audit_with_message(
                 client=react_client,
                 repo_context=None,  # 重启不传 repo_context(仓库已 clone,react_agent 自行从 sandbox 取)
                 previous_plan=current_plan if round_idx > start_round_idx else None,
-                agent_policy=agent_policy,
             )
             perf_log(task.id, "executor_run", time.perf_counter() - _t0, round_idx=round_idx, executor=executor.name)
             react_summaries.append({"round": round_idx, "summary": summary})
@@ -1701,8 +1679,6 @@ def resume_audit_with_message(
             (clear_skip_state, "跳过预克隆标志"),
             (clear_user_messages, "用户消息队列"),
             (clear_pending_verify_action, "验证待授权状态"),
-            (clear_interrupts, "中断队列"),
-            (clear_interrupt_count, "打断计数"),
         ]:
             try:
                 cleanup_fn(task.id)

@@ -38,6 +38,7 @@
 import json
 import logging
 import uuid
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -434,6 +435,73 @@ def _format_checklist_for_prompt(checklist: list[dict[str, Any]] | None) -> str:
 
 
 # ============================================================
+# 工具调用窗口构造(完整评估注入)
+# ============================================================
+
+
+def build_tool_window_section(
+    db: Session,
+    task_id,
+    round_idx: int,
+    boundary: datetime | None,
+    *,
+    title: str,
+    max_calls: int = 30,
+    max_chars: int = 6000,
+    result_limit: int = 300,
+) -> str:
+    """构造指定时间窗口内的工具调用明细段落
+
+    查询本轮 boundary 之后(含;None=整轮)的 react_agent tool_call/tool_result
+    记录,格式化为"意图行 + 结果摘要":
+    - tool_call 只取 content 首行(工具意图),丢弃参数 JSON 详情
+    - tool_result 紧随其后截断至 result_limit 字符
+    - 超 max_calls 条 tool_call 或总长超 max_chars 时从最早丢弃(尾部最新最有价值)
+
+    builtin 与 CLI(acp_base)执行器落库格式一致(role=agent1、首行意图),
+    两条执行路径均可用。无记录返回空串。
+    """
+    q = db.query(Conversation).filter(
+        Conversation.task_id == task_id,
+        Conversation.round_idx == round_idx,
+        Conversation.role == "agent1",
+        Conversation.type.in_(["tool_call", "tool_result"]),
+    )
+    if boundary is not None:
+        q = q.filter(Conversation.created_at >= boundary)
+    convs = q.order_by(Conversation.created_at).all()
+    if not convs:
+        return ""
+
+    # 逐条格式化:tool_call 取首行意图,tool_result 截断作结果摘要
+    items: list[tuple[bool, str]] = []  # (is_tool_call, formatted_line)
+    for c in convs:
+        content = (c.content or "").strip()
+        if not content:
+            continue
+        if c.type == "tool_call":
+            items.append((True, f"- {content.splitlines()[0]}"))
+        else:
+            summary = content[:result_limit]
+            if len(content) > result_limit:
+                summary += "[...truncated...]"
+            items.append((False, f"  结果摘要: {summary}"))
+
+    # 兜底裁剪:tool_call 条数超限 / 总长超限,均从最早丢弃
+    while sum(1 for is_call, _ in items if is_call) > max_calls and items:
+        items.pop(0)
+    while items and sum(len(t) for _, t in items) > max_chars:
+        items.pop(0)
+    # 裁剪后若开头残留孤立的 tool_result(其 tool_call 已被丢),一并丢弃
+    while items and not items[0][0]:
+        items.pop(0)
+    if not items:
+        return ""
+
+    return title + "\n" + "\n".join(text for _, text in items)
+
+
+# ============================================================
 # agent2 执行入口
 # ============================================================
 
@@ -570,23 +638,19 @@ def run_agent2(
             + "\n\n".join(rounds_text)
         )
 
-        # 本轮检查点观察 + 最后一次检查点之后的工具调用明细(分层窗口注入):
-        # 早期区间由检查点结论覆盖,尾部给原始证据,供校验总结真实性、避免重复追问
+        # 本轮工具调用明细(截尾窗口注入):给原始证据,
+        # 供校验总结真实性、避免重复追问
         if db is not None:
             try:
-                from app.agent_checkpoint import (
-                    build_round_checkpoint_section,
-                    build_tool_tail_section,
+                tool_section = build_tool_window_section(
+                    db, task_id, round_idx, None,
+                    title="[本轮全部工具调用明细(截尾)]",
                 )
-                ckpt_section = build_round_checkpoint_section(db, task_id, round_idx)
-                tail_section = build_tool_tail_section(db, task_id, round_idx)
-                if ckpt_section:
-                    user_msg_parts.append("\n" + ckpt_section)
-                if tail_section:
-                    user_msg_parts.append("\n" + tail_section)
+                if tool_section:
+                    user_msg_parts.append("\n" + tool_section)
             except Exception as e:
                 logger.warning(
-                    f"[task={task_id}] 加载检查点/工具窗口注入失败(跳过): {e}"
+                    f"[task={task_id}] 加载工具窗口注入失败(跳过): {e}"
                 )
 
         user_msg_parts.append(
@@ -1169,12 +1233,6 @@ def _build_agent2_history(
     # 同时记录每段的"重要性"(用于超限时裁剪):missing 非空 > done=false > 其他
     priorities: list[int] = []
     for c in convs:
-        # 排除检查点评估/中断记录:与完整评估同为 evaluation type,其 reasoning 是
-        # 检查点原始 JSON,混入跨轮记忆是噪声(它们另有专门注入通道:
-        # build_round_checkpoint_section)
-        content_head = (c.content or "")
-        if content_head.startswith("[检查点评估") or content_head.startswith("[检查点中断"):
-            continue
         # reasoning 是 _record_agent2 写入的 full_eval(含 covered/missing/判断/追问)
         text = c.reasoning or c.content or ""
         if not text:
