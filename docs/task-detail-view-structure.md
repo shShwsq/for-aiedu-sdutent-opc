@@ -48,13 +48,13 @@ main
 ```
 conversation-section
 ├── user-directive                 用户指令(右对齐气泡,从对话中提取,置顶)
-└── round-group × N                轮次分组(round_idx=0 显示"初始评估",否则"第 N 轮")
-    ├── round-label                轮次标签
+└── round-group × N                轮次分组(不显示轮次标签,"轮"概念不暴露给用户)
     ├── plan-card                  计划清单(复杂任务时 agent1 输出,可无)
     │     └── plan-step × N        步骤条目(✓ done / ◌ in_progress / ○ pending)+ 进度 x/y
     └── messages                   消息容器(flex 纵向,gap 控制间距)
         ├── plain segment × N      平铺段(关键消息,单张卡片直接显示)
-        └── step group × N         步骤分组(折叠块,承载迭代内容)
+        ├── step group × N         步骤分组(折叠块,承载迭代内容)
+        └── conclusion segment     本轮结论(该轮 agent1 最终总结,不折叠直接可见;每轮至多 1 个)
 ```
 
 ### 3.1 plain segment(平铺段)
@@ -95,9 +95,8 @@ step-block
 **折叠策略**(`isStepExpanded`):
 
 1. 用户手动收起优先级最高(`collapsedSteps`);
-2. 用户手动展开、或组内含流式中内容 → 展开;
-3. 任务已结束且是该界面最后一个 step 组(最终总结所在)→ 展开;
-4. 其余默认折叠。
+2. 用户手动展开、或组内含流式中内容、或组内有用户消息(追问/回答)→ 展开;
+3. 其余默认折叠(过程是噪音,结论由结论段承担,见 §3.4)。
 
 ### 3.3 迭代与工具渲染行
 
@@ -123,7 +122,24 @@ step-block
 工具行默认折叠,展开状态按 tool_call id 记录(`expandedToolRows`,
 子智能体内部思考用 `${callId}-think` 复合键)。
 
-### 3.4 运行中等待提示(waiting-hint)
+### 3.4 conclusion segment(本轮结论段)
+
+该轮 agent1 的最终总结,**从最后一个 step 组中提出、平铺直接可见**,是主对话流里
+用户回看时的视觉焦点:
+
+- **来源**:agent1 每轮总结 = 该轮最后一条 thinking 的 content(ReAct 循环在无工具
+  调用时结束,见后端 `react_agent`);即最后一个"纯思考"迭代(有 thinking、无
+  toolItems/otherItems、content 非空);
+- **提取时机(轮闭合判定)**:该轮已有 agent2 活动(思考/评估在 agent1 该轮结束后
+  才开始记录)、或任务不在运行中、或不是最后一轮。运行中的末轮不提取——新迭代开头
+  也是纯思考,提前提取会造成结论闪现再跳回过程组;
+- **位置**:所有 step 组之后、轮末平铺消息(如修正指令卡)之前;
+- **渲染**:`.conclusion-seg` 包裹,顶部"本轮结论"胶囊标签(`.conclusion-tag`),
+  下接 ConversationMessage 正常卡片(思考可折叠展开,结论正文直接可见);
+- **plain 定位补偿**:提取后用"虚拟迭代数"保持 plain 消息的原有时间顺序——结论前
+  的 plain 仍落在过程组与结论之间,结论后的(评估/修正指令)仍落轮末。
+
+### 3.5 运行中等待提示(waiting-hint)
 
 任务运行中且无流式项时显示:优先展示后端推送的克隆进度
 (阶段文案 + 百分比 + 进度条),否则显示通用打字动画;暂停态不显示动画。
@@ -138,13 +154,16 @@ task.conversations(正式对话,含历史 thinking 还原)
       │   保证 thinking 恰好插在其后 tool_call 之前)
       ▼
 roundGroups(computed)
+      │  轮闭合判定:该轮有 agent2 活动 / 任务不在运行中 / 非末轮
       │  每轮:segmentRoundItems()
       │    一阶段:按 thinking 切迭代,非 agent1 消息记为 plain 段
+      │    一阶段半:轮闭合时,最后一个纯思考迭代提为 conclusion 段
       │    二阶段:迭代按 plan step 关键词推断归组(TOOL_STEP_KEYWORDS),
       │           无 plan / 无法归属 → "执行过程"组;
       │           plain 段按轮内原始位置穿插到组间/组内迭代边界
+      │           (结论迭代占虚拟槽位,保持结论前后 plain 的时间顺序)
       ▼
-RoundGroup { roundIdx, label, segments, planSteps }
+RoundGroup { roundIdx, segments, planSteps }
 ```
 
 ## 5. 右侧栏 detail-sidebar
@@ -171,7 +190,8 @@ RoundGroup { roundIdx, label, segments, planSteps }
    用户意图卡片(不再显示;用户指令仍保留在对话流顶部 userDirective 气泡)。
 2. **动态验证**(配置了测试环境 URL 时):开关、授权模式切换、登录凭证(脱敏);不出现 verifier_agent 字样。
 3. **检查助手核查**(Agent2Panel,有 agent2 活动时):agent2 的全部过程输出——
-   按轮折叠组(进行中轮自动展开),轮内含流式思考(SSE thinking_delta,
+   按轮折叠组(进行中轮自动展开),轮组标题为核查摘要文案(如"3 次核查 · 1 条
+   修正指令",不显示轮次数字),轮内含流式思考(SSE thinking_delta,
    verify 标记显示"动态验证")、历史思考链、工具核查(读码/PoC/引用复核,
    tool_call 与 tool_result 配对为单行摘要+展开)、评估结论、最终总结卡。
 4. **重点与知识点**(最底部,原"结果清单"):agent2 done=true 提炼的
@@ -219,3 +239,24 @@ step 组折叠策略、工具行四种渲染类型。
 3. 移除 overview-section 内的 `.overview-input`(用户意图)块;相关 CSS 一并清理。
 4. 标题行空间有限:状态徽标与按钮需紧凑样式(小尺寸图标按钮),
    避免挤压标题;窄屏下优先保标题截断而非换行。
+
+## 9. 结论段提取 + 移除轮次显示(本次改动)
+
+| 旧结构 | 新结构 |
+|---|---|
+| 每轮最终总结埋在 step 组(执行过程)内,完成后折叠,要点开才能看 | 总结提为 conclusion 段平铺,顶部"本轮结论"标签,直接可见(见 §3.4) |
+| 任务完成后最后一组 step 默认展开(兜底露出最终总结) | 规则移除:过程组一律默认折叠,结论由结论段承担 |
+| 主对话流每轮显示轮次标签("初始评估"/"第 N 轮") | 移除,"轮"概念不暴露给用户(轮边界由修正指令卡自然标示) |
+| 重点与知识点卡片带"第 N 轮"徽标 | 移除徽标 |
+| Agent2Panel 轮组标题"第 N 轮核查" + 右侧摘要 | 标题即摘要文案("核查中…"/"3 次核查 · 1 条修正指令 · 已完成"/"核查完成") |
+
+保留不变:迭代切分逻辑、工具行四种渲染类型、step 组的手动展开/收起状态、
+修正指令卡判定(`isAgent2Followup`)、Agent2Panel 轮组折叠结构(仅换标题)。
+
+实现要点(供代码改动参考):
+
+1. `segmentRoundItems` 增加 `roundClosed` 参数,一阶段半提取结论;
+   提取后 plain 定位用"虚拟迭代数"补偿(见 §3.4)。
+2. 轮闭合判定在 `roundGroups`:该轮有 agent2 活动(`agent2Rounds`)/
+   任务非运行中(`!isRunning`)/非末轮(`roundIdx !== lastRoundIdx`)。
+3. 结论卡复用 ConversationMessage(思考折叠 + 正文卡),外层仅加标签,不引入新渲染逻辑。

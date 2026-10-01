@@ -963,8 +963,9 @@ watch(
 // 层级结构:
 //   round
 //     ├─ plain segment     (agent2 评估/追问/总结、user 指令等关键节点,平铺)
-//     └─ step group        (plan step,文字=step.text,内含多个迭代;无 plan 时回退为单个平铺组)
-//          └─ iteration segment (agent1 一次 ReAct 循环:thinking + N 个工具调用/结果)
+//     ├─ step group        (plan step,文字=step.text,内含多个迭代;无 plan 时回退为单个平铺组)
+//     │    └─ iteration segment (agent1 一次 ReAct 循环:thinking + N 个工具调用/结果)
+//     └─ conclusion segment (该轮 agent1 最终总结,轮闭合后平铺直接可见,不折叠)
 //
 // 迭代识别:遇到 agent1 的 thinking 项(实时流式或历史 type=thinking)就开新迭代,
 // 后续 agent1 的 tool_call/tool_result/submit 归入当前迭代,
@@ -975,7 +976,8 @@ watch(
 // (复用后端 _TOOL_STEP_KEYWORDS 映射,与 plan 状态推进逻辑一致)
 //
 // 折叠策略:
-// - step 组:默认折叠(完成后)或展开(含流式中)。文字=step.text,唯一折叠单位。
+// - step 组:默认折叠(完成后)或展开(含流式中/组内有用户消息)。文字=step.text,唯一折叠单位。
+// - 结论段:该轮最终总结不折叠,平铺直接可见(用户只关心结论,过程默认收起)。
 // - 迭代:不再单独折叠,内容在 step-body 内直接平铺(无摘要行、无边框包装)。
 // - 工具行:默认折叠(compact 单行 / agent、toolpair 卡片,按 tool_call id 记录展开)。
 
@@ -1042,11 +1044,17 @@ interface StepGroup {
   plains: PlainSegment[]
 }
 
-type RoundSegment = PlainSegment | StepGroup
+/** 结论段:该轮 agent1 的最终总结(最后一个纯思考迭代),轮闭合后提出平铺,
+ *  渲染在所有 step 组之后、修正指令卡之前,不折叠直接可见 */
+interface ConclusionSegment {
+  kind: 'conclusion'
+  item: DisplayItem
+}
+
+type RoundSegment = PlainSegment | StepGroup | ConclusionSegment
 
 interface RoundGroup {
   roundIdx: number
-  label: string
   segments: RoundSegment[]
   /** 该 round 的计划清单(复杂任务时 agent1 输出,空数组表示无 plan) */
   planSteps: PlanStep[]
@@ -1135,11 +1143,14 @@ function inferStepFromIteration(
   return null
 }
 
-/** 把单个 round 内的 DisplayItem 列表先按迭代分段,再按 plan step 分组 */
+/** 把单个 round 内的 DisplayItem 列表先按迭代分段,再按 plan step 分组。
+ *  roundClosed:该轮是否已结束(由 roundGroups 按 agent2 活动/运行态/非末轮判定);
+ *  闭合时把最后一个"纯思考"迭代提为结论段平铺,避免总结被折叠的过程组藏住 */
 function segmentRoundItems(
   roundIdx: number,
   items: DisplayItem[],
   planSteps: PlanStep[],
+  roundClosed: boolean,
 ): RoundSegment[] {
   // 第一阶段:按 thinking 起点切迭代(原逻辑)
   const iterations: IterationSegment[] = []
@@ -1199,6 +1210,29 @@ function segmentRoundItems(
     }
   }
   closeCurrent()
+
+  // 一阶段半:轮闭合时提取该轮最终结论
+  // agent1 的每轮总结 = 该轮最后一条 thinking 的 content(无工具调用即结束 ReAct 循环,
+  // 见后端 react_agent)。未闭合的轮不提取——运行中新迭代开头也是"纯思考",
+  // 后续还会跟工具调用,提前提出会造成结论闪现再跳回过程组。
+  let conclusion: DisplayItem | null = null
+  if (roundClosed && iterations.length > 0) {
+    const last = iterations[iterations.length - 1]
+    const lastThinking = last.thinkingItems[last.thinkingItems.length - 1]
+    const conclusionText = lastThinking
+      ? (lastThinking.is_streaming
+          ? lastThinking.streaming?.content
+          : lastThinking.content) || ''
+      : ''
+    if (
+      last.toolItems.length === 0 &&
+      last.otherItems.length === 0 &&
+      conclusionText.trim()
+    ) {
+      conclusion = lastThinking!
+      iterations.pop()
+    }
+  }
 
   // 第二阶段:按 plan step 分组迭代
   // 无 plan 时,所有迭代归入单个"执行过程"组(保持折叠体验一致)
@@ -1272,11 +1306,15 @@ function segmentRoundItems(
   const headPlains: PlainSegment[] = []
   const tailPlains: PlainSegment[] = []
   const afterGroupPlains = new Map<StepGroup, PlainSegment[]>()
+  // 虚拟迭代数:结论迭代虽已提出,但仍占一个边界槽位,保证
+  // "结论前"的 plain 落在过程组后、结论前(时间顺序正确),
+  // "结论后"的 plain(评估/修正指令)仍落轮末
+  const virtualIterLen = iterations.length + (conclusion ? 1 : 0)
   for (const p of plains) {
     const n = p.afterIterationIdx
     if (n <= 0) {
       headPlains.push(p)
-    } else if (n >= iterations.length) {
+    } else if (n >= virtualIterLen) {
       tailPlains.push(p)
     } else {
       const group = groupByIterIdx.get(n)
@@ -1305,6 +1343,9 @@ function segmentRoundItems(
     const after = afterGroupPlains.get(g)
     if (after) segments.push(...after)
   }
+  // 结论段排在所有过程组之后、轮末平铺消息(如修正指令卡)之前:
+  // 时间顺序上 agent1 总结 → agent2 评估/追问,视觉上"过程(折叠) → 结论 → 修正指令"
+  if (conclusion) segments.push({ kind: 'conclusion', item: conclusion })
   segments.push(...tailPlains)
 
   return segments
@@ -1422,16 +1463,27 @@ const roundGroups = computed<RoundGroup[]>(() => {
     })
   }
 
+  // 轮闭合判定(结论提取的前提):
+  // - 该轮已有 agent2 活动(思考/评估在 agent1 该轮结束后才开始记录)→ 闭合;
+  // - 任务不在运行中(completed/failed/paused)→ 全部闭合;
+  // - 不是最后一轮(后续轮已开跑,前轮必然结束)→ 闭合。
+  // 运行中的末轮不闭合:新迭代开头也是纯思考,提前提取会造成结论闪现再跳回。
+  const agent2Rounds = new Set(
+    convs.filter((c) => c.role === 'agent2').map((c) => c.round_idx),
+  )
+  const lastRoundIdx = groups.size ? Math.max(...groups.keys()) : -1
+
   return [...groups.entries()]
     .sort(([a], [b]) => a - b)
     .map(([roundIdx, items]) => {
       // 用 seq 排序(稳定,不依赖跨来源的 created_at)
       const sorted = items.sort((a, b) => a.seq - b.seq)
       const steps = planPerRound.get(roundIdx) ?? []
+      const roundClosed =
+        agent2Rounds.has(roundIdx) || !isRunning.value || roundIdx !== lastRoundIdx
       return {
         roundIdx,
-        label: roundIdx === 0 ? '初始评估' : `第 ${roundIdx} 轮`,
-        segments: segmentRoundItems(roundIdx, sorted, steps),
+        segments: segmentRoundItems(roundIdx, sorted, steps, roundClosed),
         planSteps: steps,
       }
     })
@@ -1458,12 +1510,13 @@ const userDirective = computed<DisplayItem | null>(() => {
 // ---- 折叠状态查询/切换 ----
 
 /** step 组是否展开:手动收起优先;否则手动展开 OR 含流式(自动展开)
- * OR 任务已结束且是最后一组(最终总结直接可见,不折叠) */
+ * OR 组内有用户消息(追问/回答必须可见)。最终总结已提为结论段平铺,
+ * 过程组一律默认折叠 */
 function isStepExpanded(group: StepGroup): boolean {
   if (collapsedSteps.has(group.id)) return false
   // 含流式或含组内平铺消息(如用户追问/回答)时自动展开,保证消息可见
   if (expandedSteps.has(group.id) || group.hasStreaming || group.plains.length > 0) return true
-  return !isRunning.value && isLastStepGroup(group)
+  return false
 }
 
 function toggleStep(group: StepGroup): void {
@@ -1474,15 +1527,6 @@ function toggleStep(group: StepGroup): void {
     collapsedSteps.delete(group.id)
     expandedSteps.add(group.id)
   }
-}
-
-/** 是否为最后一个 round 的最后一个 step 组(最终总结所在) */
-function isLastStepGroup(group: StepGroup): boolean {
-  const groups = roundGroups.value
-  if (!groups.length) return false
-  const lastRound = groups[groups.length - 1]
-  const last = lastRound.segments[lastRound.segments.length - 1]
-  return !!last && last.kind === 'step' && last.id === group.id
 }
 
 /** step 组的状态图标:done=✓,in_progress=◌,pending=○,none=· */
@@ -2223,7 +2267,6 @@ function toggleResult(id: string): void {
           </div>
 
           <div v-for="group in roundGroups" :key="group.roundIdx" class="round-group">
-            <div class="round-label">{{ group.label }}</div>
             <!-- 计划清单(复杂任务时 agent1 输出,展示接下来要做的步骤 + 进度) -->
             <div v-if="group.planSteps.length > 0" class="plan-card">
               <div class="plan-header">
@@ -2246,7 +2289,7 @@ function toggleResult(id: string): void {
             <div class="messages">
               <template
                 v-for="seg in group.segments"
-                :key="seg.kind === 'step' ? `step-${seg.id}` : `plain-${seg.item.id}`"
+                :key="seg.kind === 'step' ? `step-${seg.id}` : `${seg.kind}-${seg.item.id}`"
               >
                 <!-- 平铺段:agent2 追问卡、user 指令等关键消息 -->
                 <!-- 用户补充消息(type=message)右对齐,与顶部 userDirective 视觉一致 -->
@@ -2423,6 +2466,15 @@ function toggleResult(id: string): void {
                     </template>
                     </template>
                   </div>
+                </div>
+
+                <!-- 结论段:该轮 agent1 最终总结,平铺直接可见(过程默认折叠) -->
+                <div v-else-if="seg.kind === 'conclusion'" class="conclusion-seg">
+                  <span class="conclusion-tag">本轮结论</span>
+                  <ConversationMessage
+                    :item="seg.item"
+                    @toggle-reasoning="toggleReasoning"
+                  />
                 </div>
               </template>
             </div>
@@ -2725,7 +2777,6 @@ function toggleResult(id: string): void {
                     class="learning-badge"
                     title="检查助手标记的学习点"
                   >值得学</span>
-                  <span class="round-tag">第 {{ r.round_idx }} 轮</span>
                 </div>
                 <div v-if="getResultMetaItems(r).length > 0" class="result-meta">
                   <span
@@ -3481,15 +3532,6 @@ function toggleResult(id: string): void {
   word-break: break-word;
 }
 
-.round-tag {
-  flex-shrink: 0;
-  font-size: var(--fs-xs);
-  color: var(--color-text-muted);
-  padding: var(--space-1) var(--space-2);
-  background: var(--color-surface-alt);
-  border-radius: var(--radius-sm);
-}
-
 .result-content {
   margin-top: var(--space-2);
   font-size: var(--fs-xs);
@@ -3556,15 +3598,22 @@ function toggleResult(id: string): void {
   margin-bottom: 0;
 }
 
-.round-label {
+/* ---- 本轮结论段:该轮 agent1 最终总结,平铺直接可见 ---- */
+.conclusion-seg {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.conclusion-tag {
   display: inline-block;
-  padding: var(--space-1) var(--space-3);
+  align-self: flex-start;
+  padding: var(--space-1) var(--space-2);
   font-size: var(--fs-xs);
   font-weight: var(--fw-semibold);
   color: var(--color-primary);
   background: var(--color-primary-light);
   border-radius: var(--radius-full);
-  margin-bottom: var(--space-3);
 }
 
 /* ---- 计划清单卡片 ---- */

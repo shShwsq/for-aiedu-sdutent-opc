@@ -146,10 +146,12 @@ function evalDigest(e: Conversation): string {
   return `修正指令:${truncate(content, 50)}`
 }
 
-/** 轮组标题右侧摘要,如 "3 次核查 · 1 条修正指令" */
+/** 轮组标题文案(轮组唯一标题,不显示轮次数字):
+ *  流式中 → "核查中…",否则如 "3 次核查 · 1 条修正指令 · 已完成" */
 function roundDigest(g: RoundGroup): string {
+  if (g.streaming.length) return '核查中…'
   const parts: string[] = []
-  const toolCount = g.tools.length + g.streaming.filter((s) => s.verify).length
+  const toolCount = g.tools.length
   if (toolCount) parts.push(`${toolCount} 次核查`)
   const followups = g.evaluations.filter((e) => {
     const c = (e.content || '').trim()
@@ -157,7 +159,7 @@ function roundDigest(g: RoundGroup): string {
   }).length
   if (followups) parts.push(`${followups} 条修正指令`)
   if (g.summaries.length) parts.push('已完成')
-  return parts.join(' · ') || '思考完成'
+  return parts.join(' · ') || '核查完成'
 }
 
 /** 流式思考文本(reasoning 优先,限量防止 DOM 过大) */
@@ -181,7 +183,6 @@ function charCount(text: string | null | undefined): number {
     <div v-for="g in rounds" :key="g.round_idx" class="panel-round">
       <button type="button" class="panel-round-head" @click="toggleRound(g.round_idx)">
         <span class="panel-toggle">{{ expanded.has(g.round_idx) ? '▼' : '▶' }}</span>
-        <span class="panel-round-name">第 {{ g.round_idx }} 轮核查</span>
         <span class="panel-round-digest">{{ roundDigest(g) }}</span>
       </button>
 
@@ -293,14 +294,10 @@ function charCount(text: string | null | undefined): number {
   color: var(--color-text-tertiary);
 }
 
-.panel-round-name {
-  font-weight: var(--fw-medium);
-  white-space: nowrap;
-}
-
+/* 轮组标题 = 核查摘要文案(不显示轮次数字) */
 .panel-round-digest {
-  margin-left: auto;
-  color: var(--color-text-tertiary);
+  font-weight: var(--fw-medium);
+  color: var(--color-text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
