@@ -965,8 +965,8 @@ watch(
 //     ├─ plain segment     (agent2 评估/追问/总结、user 指令等关键节点,平铺)
 //     ├─ step group        (plan step,文字=step.text,内含多个迭代;无 plan 时回退为单个"执行过程"折叠组)
 //     │    └─ iteration segment (agent1 一次 ReAct 循环:thinking + N 个工具调用/结果)
-//     └─ conclusion segment (该轮 agent1 最终回答,轮闭合后提出组外,
-//                            正常消息样式直接可见,无特殊标签)
+//     └─ conclusion segment (该轮 agent1 最终回答,轮闭合后提出组外,纯正文消息;
+//                            最终思考 reasoning 留在 step 组内)
 //
 // 迭代识别:遇到 agent1 的 thinking 项(实时流式或历史 type=thinking)就开新迭代,
 // 后续 agent1 的 tool_call/tool_result/submit 归入当前迭代,
@@ -1046,7 +1046,8 @@ interface StepGroup {
 }
 
 /** 结论段:该轮 agent1 的最终回答(最后一个纯思考迭代),轮闭合后提出组外,
- *  渲染在所有 step 组之后、修正指令卡之前,正常消息样式直接可见(无特殊标签) */
+ *  渲染在所有 step 组之后、修正指令卡之前,纯正文消息(无标签无思考卡,
+ *  最终思考 reasoning 留在过程组内) */
 interface ConclusionSegment {
   kind: 'conclusion'
   item: DisplayItem
@@ -1144,6 +1145,29 @@ function inferStepFromIteration(
   return null
 }
 
+/** 读取 DisplayItem 的正文/思考文本(流式与正式两种形态) */
+function itemFieldText(item: DisplayItem | undefined, field: 'content' | 'reasoning'): string {
+  if (!item) return ''
+  if (item.is_streaming && item.streaming) return item.streaming[field] || ''
+  return (field === 'content' ? item.content : item.reasoning) || ''
+}
+
+/** 克隆项并清空正文(仅保留思考卡):最终思考留在过程组内的展示形态 */
+function stripItemContent(item: DisplayItem): DisplayItem {
+  if (item.is_streaming && item.streaming) {
+    return { ...item, id: `${item.id}-think`, streaming: { ...item.streaming, content: '' } }
+  }
+  return { ...item, id: `${item.id}-think`, content: '' }
+}
+
+/** 克隆项并清空思考(仅保留正文卡):组外结论消息的展示形态 */
+function stripItemReasoning(item: DisplayItem): DisplayItem {
+  if (item.is_streaming && item.streaming) {
+    return { ...item, id: `${item.id}-body`, streaming: { ...item.streaming, reasoning: '' } }
+  }
+  return { ...item, id: `${item.id}-body`, reasoning: null }
+}
+
 /** 把单个 round 内的 DisplayItem 列表先按迭代分段,再按 plan step 分组。
  *  roundClosed:该轮是否已结束(由 roundGroups 按 agent2 活动/运行态/非末轮判定);
  *  闭合时把最后一个"纯思考"迭代提为结论段平铺,避免总结被折叠的过程组藏住 */
@@ -1216,22 +1240,31 @@ function segmentRoundItems(
   // agent1 的每轮总结 = 该轮最后一条 thinking 的 content(无工具调用即结束 ReAct 循环,
   // 见后端 react_agent)。未闭合的轮不提取——运行中新迭代开头也是"纯思考",
   // 后续还会跟工具调用,提前提出会造成结论闪现再跳回过程组。
+  // 思考(reasoning)不随结论外移:有思考时组内该项只保留思考卡、结论只保留正文卡,
+  // 保持"过程(含最终思考)全在组内、组外只有纯正文消息"的干净结构。
   let conclusion: DisplayItem | null = null
+  // 结论迭代是否整块提出(无思考可留时):true 时 plain 定位需补一个虚拟槽位
+  let conclusionPopped = false
   if (roundClosed && iterations.length > 0) {
     const last = iterations[iterations.length - 1]
     const lastThinking = last.thinkingItems[last.thinkingItems.length - 1]
-    const conclusionText = lastThinking
-      ? (lastThinking.is_streaming
-          ? lastThinking.streaming?.content
-          : lastThinking.content) || ''
-      : ''
+    const conclusionText = itemFieldText(lastThinking, 'content')
+    const reasoningText = itemFieldText(lastThinking, 'reasoning')
     if (
       last.toolItems.length === 0 &&
       last.otherItems.length === 0 &&
       conclusionText.trim()
     ) {
-      conclusion = lastThinking!
-      iterations.pop()
+      if (reasoningText.trim() && lastThinking) {
+        // 思考留组内:组内只显示思考卡,结论只显示正文卡(克隆时改 id 保证 key 唯一)
+        last.thinkingItems[last.thinkingItems.length - 1] = stripItemContent(lastThinking)
+        conclusion = stripItemReasoning(lastThinking)
+      } else {
+        // 无思考可留:整迭代提出,组内不留空壳
+        conclusion = lastThinking!
+        iterations.pop()
+        conclusionPopped = true
+      }
     }
   }
 
@@ -1308,10 +1341,10 @@ function segmentRoundItems(
   const headPlains: PlainSegment[] = []
   const tailPlains: PlainSegment[] = []
   const afterGroupPlains = new Map<StepGroup, PlainSegment[]>()
-  // 虚拟迭代数:结论迭代虽已提出,但仍占一个边界槽位,保证
-  // "结论前"的 plain 落在过程组后、结论前(时间顺序正确),
-  // "结论后"的 plain(评估/修正指令)仍落轮末
-  const virtualIterLen = iterations.length + (conclusion ? 1 : 0)
+  // 虚拟迭代数:结论迭代整块提出时(无思考留组内)仍占一个边界槽位,保证
+  // "结论前"的 plain 落在过程组与结论之间(时间顺序正确),
+  // "结论后"的 plain(评估/修正指令)仍落轮末;思考留组内时迭代未动,无需补偿
+  const virtualIterLen = iterations.length + (conclusionPopped ? 1 : 0)
   for (const p of plains) {
     const n = p.afterIterationIdx
     if (n <= 0) {
@@ -2332,10 +2365,10 @@ function toggleResult(id: string): void {
                   <div class="step-header" @click="toggleStep(seg)">
                     <span class="step-toggle">{{ isStepExpanded(seg) ? '▼' : '▶' }}</span>
                     <span
+                      v-if="seg.status !== 'none'"
                       :class="['step-status-icon', `step-status-${seg.status}`]"
                     >{{ stepStatusIcon(seg.status) }}</span>
                     <span class="step-text">{{ seg.text }}</span>
-                    <span class="step-iter-count">{{ seg.iterations.length }} 次迭代</span>
                     <span v-if="seg.hasStreaming" class="step-streaming-tag">
                       <span class="typing-dots"><span></span><span></span><span></span></span>
                     </span>
@@ -2467,8 +2500,8 @@ function toggleResult(id: string): void {
                   </div>
                 </div>
 
-                <!-- 结论段:该轮 agent1 最终回答,正常消息样式直接可见(无标签,组外不折叠);
-                     上方保留可折叠思考卡(ChatGPT "Thought for N seconds" 模式) -->
+                <!-- 结论段:该轮 agent1 最终回答,纯正文消息直接可见
+                     (无标签无思考卡;最终思考留在上方过程组内) -->
                 <ConversationMessage
                   v-else-if="seg.kind === 'conclusion'"
                   :item="seg.item"
@@ -3776,11 +3809,6 @@ function toggleResult(id: string): void {
   background: #10b981;
 }
 
-.step-status-none {
-  color: var(--color-text-muted);
-  background: transparent;
-}
-
 @keyframes step-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.6; transform: scale(0.9); }
@@ -3800,15 +3828,6 @@ function toggleResult(id: string): void {
   color: var(--color-text-secondary);
   text-decoration: line-through;
   text-decoration-color: var(--color-text-muted);
-}
-
-.step-iter-count {
-  flex-shrink: 0;
-  font-size: var(--fs-xs);
-  color: var(--color-text-muted);
-  padding: var(--space-1) var(--space-2);
-  background: var(--color-surface-alt);
-  border-radius: var(--radius-full);
 }
 
 .step-streaming-tag {
