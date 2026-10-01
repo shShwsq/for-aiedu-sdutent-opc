@@ -113,7 +113,7 @@ export interface SaveUserMemoryRequest {
  * 系统级策略限制(GET /memory/policy-limits)
  *
  * 前端据此动态渲染输入上限,不硬编码。后端 max_rounds 可通过
- * 环境变量 AGENTPAIR_MAX_ROUNDS_LIMIT 调整。
+ * 环境变量 SECONDLOOK_MAX_ROUNDS_LIMIT 调整。
  */
 export interface PolicyLimitsOut {
   /** 协作总轮次上限(与后端 MAX_MAX_ROUNDS 对齐) */

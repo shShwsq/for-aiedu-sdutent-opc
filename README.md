@@ -368,10 +368,6 @@ See [deploy/.env.production.example](deploy/.env.production.example) for per-var
 - **Add a CLI executor**: Register an `agent_type` in the `backend/app/agents/` registry, implementing ACP protocol communication.
 - **Practice feature**: `PRACTICE_ENABLED=false` disables `/practice/*` routes and auto-generation; question-generation logs are written to `backend/logs/practice_generate.log`.
 
-## Acknowledgements
-
-SecondLook is based on the open-source AgentPair project (reference code kept under `references/agentpair`).
-
 ## License
 
 [MIT License](./LICENSE) © 2026 shShwsq

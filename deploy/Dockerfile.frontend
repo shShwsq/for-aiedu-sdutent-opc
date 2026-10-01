@@ -1,5 +1,5 @@
-# AgentPair 前端镜像:node 构建静态产物 → nginx 托管
-# 构建:docker build -f deploy/Dockerfile.frontend -t agentpair-frontend .
+# SecondLook 前端镜像:node 构建静态产物 → nginx 托管
+# 构建:docker build -f deploy/Dockerfile.frontend -t secondlook-frontend .
 FROM node:22-alpine AS build
 WORKDIR /app
 

@@ -147,7 +147,7 @@ def send_verification_email(user: User, token_plain: str) -> None:
     verify_url = f"{settings.APP_BASE_URL}/auth/verify-email?token={token_plain}"
     send_email(
         to=user.email,
-        subject="[AgentPair] 验证你的邮箱",
+        subject="[SecondLook] 验证你的邮箱",
         body=f"请点击以下链接验证邮箱(24 小时内有效):\n\n{verify_url}\n\n如果不是你本人操作,请忽略此邮件。",
     )
 
@@ -157,6 +157,6 @@ def send_password_reset_email(user: User, token_plain: str) -> None:
     reset_url = f"{settings.APP_BASE_URL}/auth/password/reset?token={token_plain}"
     send_email(
         to=user.email,
-        subject="[AgentPair] 重置你的密码",
+        subject="[SecondLook] 重置你的密码",
         body=f"请点击以下链接重置密码(30 分钟内有效):\n\n{reset_url}\n\n如果不是你本人操作,请忽略此邮件。",
     )

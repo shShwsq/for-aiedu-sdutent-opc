@@ -368,10 +368,6 @@ bash deploy.sh                               # 一键构建 + 启动
 - **新增 CLI 执行器**:在 `backend/app/agents/` 的 registry 注册 agent_type,实现 ACP 协议通信。
 - **练习功能**:`PRACTICE_ENABLED=false` 会关闭 `/practice/*` 路由与自动出题;出题日志落在 `backend/logs/practice_generate.log`。
 
-## 致谢
-
-SecondLook 基于开源 AgentPair 项目构建(参考代码保留在 `references/agentpair`)。
-
 ## License
 
 [MIT License](./LICENSE) © 2026 shShwsq

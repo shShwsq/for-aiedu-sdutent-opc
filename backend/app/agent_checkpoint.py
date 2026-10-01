@@ -35,9 +35,9 @@ logger = logging.getLogger(__name__)
 # 默认策略 + 配置解析
 # ============================================================
 
-# 协作总轮次上限(可通过环境变量 AGENTPAIR_MAX_ROUNDS_LIMIT 调整,默认 10)
+# 协作总轮次上限(可通过环境变量 SECONDLOOK_MAX_ROUNDS_LIMIT 调整,默认 10)
 # 前端展示的"最大 10"与此对齐;改环境变量后前端需同步(或未来通过 API 下发)
-MAX_MAX_ROUNDS = int(os.environ.get("AGENTPAIR_MAX_ROUNDS_LIMIT", "10"))
+MAX_MAX_ROUNDS = int(os.environ.get("SECONDLOOK_MAX_ROUNDS_LIMIT", "10"))
 
 DEFAULT_AGENT_POLICY: dict[str, Any] = {
     "agent2_enabled": True,  # 是否启用 agent2(关闭=单 agent 模式,跳过评估/打断/验证)

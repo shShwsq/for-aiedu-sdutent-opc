@@ -60,10 +60,10 @@ def _codex_pre_bridge_hook(
 
     config.toml 关键字段:
     - model:模型名(如 gpt-5)
-    - model_provider:使用的 provider 名(默认 "agentpair")
+    - model_provider:使用的 provider 名(默认 "secondlook")
     - approval_policy:审批策略("never" = 从不审批,非交互模式必须)
     - sandbox_mode:沙箱模式("danger-full-access" = 关闭 Codex 内部沙箱,我们用 OpenSandbox)
-    - [model_providers.agentpair]:自定义 provider 配置
+    - [model_providers.secondlook]:自定义 provider 配置
       - base_url:API 端点(必须支持 /v1/responses)
       - wire_api:通信协议(固定 "responses",chat 已被 codex 移除)
       - env_key:读取哪个环境变量的 API Key
@@ -101,11 +101,11 @@ def _codex_pre_bridge_hook(
     # 构建 config.toml
     # 注意:base_url 留空时不写 model_provider,让 Codex 用默认 OpenAI provider
     if base_url:
-        # 自定义端点:写入 [model_providers.agentpair] 表
-        config_toml = f"""# Codex CLI 配置(由 AgentPair 自动生成)
+        # 自定义端点:写入 [model_providers.secondlook] 表
+        config_toml = f"""# Codex CLI 配置(由 SecondLook 自动生成)
 # 模型配置
 model = "{model}"
-model_provider = "agentpair"
+model_provider = "secondlook"
 
 # 审批策略:never = 从不审批(非交互模式必须)
 # 合法值:untrusted / on-failure / on-request / granular / never
@@ -115,15 +115,15 @@ approval_policy = "never"
 sandbox_mode = "danger-full-access"
 
 # 自定义 model provider
-[model_providers.agentpair]
-name = "AgentPair Custom Provider"
+[model_providers.secondlook]
+name = "SecondLook Custom Provider"
 base_url = "{base_url}"
 wire_api = "{wire_api}"
 env_key = "CODEX_API_KEY"
 """
     else:
         # 使用 OpenAI 官方端点(不需要自定义 provider)
-        config_toml = f"""# Codex CLI 配置(由 AgentPair 自动生成)
+        config_toml = f"""# Codex CLI 配置(由 SecondLook 自动生成)
 # 模型配置
 model = "{model}"
 

@@ -131,7 +131,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="AgentPair",
+    title="SecondLook",
     description="双智能体协作系统",
     version="0.2.0",
     lifespan=lifespan,
@@ -157,4 +157,4 @@ if settings.PRACTICE_ENABLED:
 
 @app.get("/")
 def root() -> dict:
-    return {"name": "AgentPair", "version": "0.2.0", "docs": "/docs"}
+    return {"name": "SecondLook", "version": "0.2.0", "docs": "/docs"}

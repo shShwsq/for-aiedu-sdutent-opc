@@ -200,7 +200,7 @@ def get_policy_limits(
 ) -> PolicyLimitsOut:
     """系统级策略限制(前端据此动态渲染输入上限,不硬编码)
 
-    返回当前后端 MAX_MAX_ROUNDS(可通过环境变量 AGENTPAIR_MAX_ROUNDS_LIMIT 调整)。
+    返回当前后端 MAX_MAX_ROUNDS(可通过环境变量 SECONDLOOK_MAX_ROUNDS_LIMIT 调整)。
     """
     return PolicyLimitsOut(max_rounds=MAX_MAX_ROUNDS)
 

@@ -185,7 +185,7 @@ SecondLook 是一个**双智能体协作系统**:用户描述任务后,两个智
 
 首次进入首页 / 提交任务页 / 任务详情页时会自动弹出新手指引气泡。可点击"跳过引导"关闭,完成后不再自动弹出。引导文案有大改时会递增版本号,老用户会重新看到引导。
 
-> 若想重新查看新手引导:目前未提供入口。如需重看,清浏览器 localStorage 中 `agentpair:onboarding:completed:*` 相关 key 即可。
+> 若想重新查看新手引导:目前未提供入口。如需重看,清浏览器 localStorage 中 `secondlook:onboarding:completed:*` 相关 key 即可。
 
 ## 常见问题
 

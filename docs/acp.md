@@ -1,6 +1,6 @@
 # ACP(Agent Client Protocol)说明
 
-本文档说明 ACP 是什么、核心协议内容,以及本项目如何参考 `references/agentpair` 用 ACP 接入三个 CLI agent(Qoder、DeepSeek Harness、Codex)。
+本文档说明 ACP 是什么、核心协议内容,以及本项目如何用 ACP 接入三个 CLI agent(Qoder、DeepSeek Harness、Codex)。
 
 ---
 
@@ -101,13 +101,13 @@ ACP(Agent Client Protocol)是一个开放协议,由 Zed 编辑器团队发起,�
 
 ## 4. 本项目接入的三个 CLI agent
 
-参考 `references/agentpair`(其 registry 注册了五种 CLI agent),本项目**仅保留以下三种**:
+本项目接入以下三种 CLI agent:
 
 ### 4.1 Qoder CLI —— 原生 ACP
 
 | 项 | 内容 |
 |----|------|
-| 源码位置 | 无本地源码(参考 agentpair 的接入代码 `references/agentpair/backend/app/agents/qoder_cli_agent.py`) |
+| 源码位置 | 无本地源码 |
 | 启动方式 | `qodercli --acp --yolo`(`--acp` 启动 ACP stdio 服务,`--yolo` 跳过权限确认) |
 | 认证 | PAT(Personal Access Token),经环境变量 `QODER_PERSONAL_ACCESS_TOKEN` 注入,`initialize` 后需 `authenticate` |
 | 模型 | 由 Qoder 账号配额管理,经 `--model` CLI 参数指定(如 `DeepSeek-V4-Flash`),后端不直接管理 LLM 调用 |
@@ -145,7 +145,7 @@ ACP(Agent Client Protocol)是一个开放协议,由 Zed 编辑器团队发起,�
 | 通信协议 | 仅支持 OpenAI **Responses API**(wire_api 固定 `responses`),端点必须实现 `/v1/responses`;只支持 `/v1/chat/completions` 的中转/Ollama/vLLM 无法直连 |
 | 安装 | Node.js ≥ 16,`npm install -g @openai/codex` |
 
-JSONL 事件(定义于 `codex-rs/exec/src/exec_events.rs`)与 ACP 通知的映射关系(参考 agentpair 的 `codex_bridge.py`):
+JSONL 事件(定义于 `codex-rs/exec/src/exec_events.rs`)与 ACP 通知的映射关系:
 
 | Codex JSONL 事件 | ACP 通知 |
 |------------------|----------|
@@ -173,7 +173,7 @@ JSONL 事件(定义于 `codex-rs/exec/src/exec_events.rs`)与 ACP 通知的映�
 
 ## 5. 架构
 
-本项目的做法(架构继承自开源 AgentPair 的参考实现):**不在后端直接 spawn CLI**,而是在沙箱内运行一个轻量 HTTP ↔ stdio 桥接服务,后端统一用 HTTP/SSE 与之通信。相关源码(本项目 `backend/app/agents/`,参考实现见 `references/agentpair/backend/app/agents/`):
+本项目的做法:**不在后端直接 spawn CLI**,而是在沙箱内运行一个轻量 HTTP ↔ stdio 桥接服务,后端统一用 HTTP/SSE 与之通信。相关源码(本项目 `backend/app/agents/`):
 
 ```
 后端(FastAPI)
@@ -212,11 +212,6 @@ ACP CLI 子进程(qodercli --acp --yolo / dsh --profile acp)
 | 内容 | 路径 |
 |------|------|
 | ACP 官方规范 | <https://agentclientprotocol.com>(协议版本 1) |
-| 通用 ACP 桥接(参考实现) | `references/agentpair/backend/app/agents/acp_bridge.py` |
-| Codex 桥接(JSONL → ACP 翻译) | `references/agentpair/backend/app/agents/codex_bridge.py` |
-| ACP 客户端与共享基础设施 | `references/agentpair/backend/app/agents/acp_base.py` |
-| Agent 注册表(接入配置范例) | `references/agentpair/backend/app/agents/registry.py` |
-| agentpair 架构文档 | `references/agentpair/docs/agent-architecture.md` |
 | DeepSeek Harness ACP 包说明 | `references/deepseek-harness-master/packages/acp/acp/README.zh.md` |
 | DeepSeek Harness 仓库根文档 | `references/deepseek-harness-master/README.md` |
 | Codex JSONL 事件定义 | `references/codex-main/codex-rs/exec/src/exec_events.rs` |

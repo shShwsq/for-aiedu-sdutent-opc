@@ -434,7 +434,7 @@ class ACPClient:
             "params": {
                 "protocolVersion": ACP_PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "AgentPair", "version": "1.0.0"},
+                "clientInfo": {"name": "SecondLook", "version": "1.0.0"},
             },
             "id": self._next_id(),
         })

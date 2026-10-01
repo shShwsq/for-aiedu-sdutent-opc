@@ -23,7 +23,7 @@ import {
 } from '@/data/onboardingSteps'
 
 /** localStorage key 前缀;按用户 email + 版本号区分 */
-const LS_KEY_PREFIX = 'agentpair:onboarding:completed'
+const LS_KEY_PREFIX = 'secondlook:onboarding:completed'
 
 // ---- 模块级单例状态 ----
 
@@ -50,7 +50,7 @@ const hasPrev = computed(() => currentIndex.value > 0)
 
 // ---- localStorage 读写 ----
 
-/** 构造 localStorage key:agentpair:onboarding:completed:{email}:{routeName}:v{version} */
+/** 构造 localStorage key:secondlook:onboarding:completed:{email}:{routeName}:v{version} */
 function buildLsKey(email: string, routeName: string): string {
   // email 中可能含特殊字符,encodeURIComponent 防止 key 解析异常
   const emailPart = encodeURIComponent(email)

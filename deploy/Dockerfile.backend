@@ -1,5 +1,5 @@
-# AgentPair 后端镜像(Python 3.13 + uvicorn)
-# 构建:docker build -f deploy/Dockerfile.backend -t agentpair-backend .
+# SecondLook 后端镜像(Python 3.13 + uvicorn)
+# 构建:docker build -f deploy/Dockerfile.backend -t secondlook-backend .
 FROM python:3.13-slim
 
 # git:沙箱未启用时本地 clone / 部分工具链需要;curl:可选排查用

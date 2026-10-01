@@ -174,7 +174,7 @@ bash scripts/build-sandbox-image.sh --registry docker.m.daocloud.io
 脚本会:
 1. 检查 docker 可用(含 daemon 是否运行、当前用户是否在 docker 组)
 2. 按参数生成 `Dockerfile.sandbox`(已存在且配置一致则跳过;配置变更会备份原文件后重新生成)
-3. `docker build -t agentpair-sandbox:latest`
+3. `docker build -t secondlook-sandbox:latest`
 4. 逐个验证镜像内 `git` / `rg` / `python3` / `awk` / `find` / `curl` 及所选 CLI 都能找到
 
 **国内镜像加速**(服务器在国内时推荐):`--cn-mirror` 一键启用三项国内源:
@@ -191,7 +191,7 @@ bash scripts/build-sandbox-image.sh --registry docker.m.daocloud.io
 
 > Node 版本策略:qodercli 要求 >= 20.0.0,dsh 要求 >= 20,codex 要求 >= 16。只要 qoder_cli / deepseek_cli / codex_cli 任一启用,统一装 Node 22.x(三者都兼容)。
 
-完成后在 SecondLook 的 `.env` 里设 `SANDBOX_IMAGE=agentpair-sandbox:latest`。
+完成后在 SecondLook 的 `.env` 里设 `SANDBOX_IMAGE=secondlook-sandbox:latest`。
 
 ### 2.2 手动构建(了解脚本做了什么)
 
@@ -227,10 +227,10 @@ WORKDIR /home/user
 手动构建命令:
 
 ```bash
-docker build -f Dockerfile.sandbox -t agentpair-sandbox:latest .
+docker build -f Dockerfile.sandbox -t secondlook-sandbox:latest .
 # 验证
-docker run --rm agentpair-sandbox:latest rg --version
-docker run --rm agentpair-sandbox:latest git --version
+docker run --rm secondlook-sandbox:latest rg --version
+docker run --rm secondlook-sandbox:latest git --version
 ```
 
 Server 直接用本地 Docker daemon,无需推到 registry。
@@ -263,7 +263,7 @@ RUN npm install -g @qoder-ai/qodercli
 构建后验证:
 
 ```bash
-docker run --rm agentpair-sandbox:latest qodercli --version
+docker run --rm secondlook-sandbox:latest qodercli --version
 ```
 
 #### 方式 B:运行时自动安装(首次启动慢,需沙箱能访问外网)
@@ -311,8 +311,8 @@ RUN npm install -g @deepseek-ai/dsh \
 构建后验证:
 
 ```bash
-docker run --rm agentpair-sandbox:latest dsh --version
-docker run --rm agentpair-sandbox:latest node --version   # 应输出 v22.x
+docker run --rm secondlook-sandbox:latest dsh --version
+docker run --rm secondlook-sandbox:latest node --version   # 应输出 v22.x
 ```
 
 #### 方式 B:运行时自动安装(首次启动慢,需沙箱能访问外网)
@@ -377,7 +377,7 @@ RUN npm install -g @openai/codex \
 构建后验证:
 
 ```bash
-docker run --rm agentpair-sandbox:latest codex --version
+docker run --rm secondlook-sandbox:latest codex --version
 ```
 
 #### 方式 B:运行时自动安装(首次启动慢,需沙箱能访问外网)
@@ -398,9 +398,9 @@ Codex 从 `~/.codex/config.toml` 读取模型/provider 配置,API Key 经 `CODEX
 | 用户填写字段 | 注入方式 | 必填 | 默认值 |
 |--------------|----------|------|--------|
 | API Key | `CODEX_API_KEY` 环境变量 | 是 | — |
-| API Base URL | config.toml `model_providers.agentpair.base_url` | 否 | 留空用 OpenAI 官方端点 |
+| API Base URL | config.toml `model_providers.secondlook.base_url` | 否 | 留空用 OpenAI 官方端点 |
 | 模型名 | config.toml `model` | 否 | `gpt-5` |
-| Wire API | config.toml `model_providers.agentpair.wire_api` | 否 | `responses`(Responses API) |
+| Wire API | config.toml `model_providers.secondlook.wire_api` | 否 | `responses`(Responses API) |
 
 后端注入流程(由 [codex_cli_agent.py](../backend/app/agents/codex_cli_agent.py) 的 `pre_bridge_hook` 自动完成):
 1. **`credential_env`**(registry 静态映射):`api_key` → `CODEX_API_KEY` 环境变量
@@ -408,7 +408,7 @@ Codex 从 `~/.codex/config.toml` 读取模型/provider 配置,API Key 经 `CODEX
    - `model`(模型名)
    - `approval_policy = "full-auto"`(跳过审批)
    - `sandbox_mode = "danger-full-access"`(关闭 Codex 内部沙箱)
-   - 若填了 `base_url`:额外写 `[model_providers.agentpair]` 表(base_url + wire_api + env_key),并设 `model_provider = "agentpair"`
+   - 若填了 `base_url`:额外写 `[model_providers.secondlook]` 表(base_url + wire_api + env_key),并设 `model_provider = "secondlook"`
    - 若 `base_url` 留空:不写自定义 provider,Codex 用默认 OpenAI provider
 
 `wire_api` 两种取值:
@@ -500,7 +500,7 @@ SANDBOX_SERVER_URL=http://your-server-ip:8080
 SANDBOX_API_KEY=
 
 # 沙箱镜像(第二节构建的自定义镜像)
-SANDBOX_IMAGE=agentpair-sandbox:latest
+SANDBOX_IMAGE=secondlook-sandbox:latest
 
 # 沙箱超时(分钟)
 SANDBOX_TIMEOUT_MINUTES=30
@@ -570,11 +570,11 @@ uvicorn app.main:app --reload
 
 **原因**:用了 `ubuntu` 官方镜像,没装 ripgrep。
 
-**解决**:按第二节构建 `agentpair-sandbox:latest` 自定义镜像,并在 `.env` 设 `SANDBOX_IMAGE=agentpair-sandbox:latest`。
+**解决**:按第二节构建 `secondlook-sandbox:latest` 自定义镜像,并在 `.env` 设 `SANDBOX_IMAGE=secondlook-sandbox:latest`。
 
 ### 6.5 沙箱创建失败:image pull 超时
 
-`ubuntu` / `agentpair-sandbox` 镜像在 Server 本地。若用了远程 registry 镜像,国内拉取可能慢:
+`ubuntu` / `secondlook-sandbox` 镜像在 Server 本地。若用了远程 registry 镜像,国内拉取可能慢:
 - 配置 Docker 镜像加速器(阿里云 ACR 等)
 - 或预先 `docker pull` 到本地
 

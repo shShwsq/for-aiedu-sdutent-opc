@@ -2,7 +2,7 @@
  * 主题管理(浅色 / 深色 / 跟随系统)
  *
  * 职责:
- * - 持久化用户选择到 localStorage(键:agentpair-theme-mode)
+ * - 持久化用户选择到 localStorage(键:secondlook-theme-mode)
  * - 通过 <html data-theme="..."> 驱动 tokens.css 中的深浅色变量(全局换肤)
  * - system 模式下监听系统 prefers-color-scheme 变化,自动跟随
  *
@@ -13,7 +13,7 @@ import { computed, ref } from 'vue'
 
 export type ThemeMode = 'light' | 'dark' | 'system'
 
-const STORAGE_KEY = 'agentpair_theme_mode'
+const STORAGE_KEY = 'secondlook_theme_mode'
 
 /** 系统深色偏好媒体查询(jsdom 等测试环境可能缺失) */
 const darkMedia: MediaQueryList | null =

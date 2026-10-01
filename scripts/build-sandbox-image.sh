@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 构建 AgentPair 沙箱镜像(预装 git / ripgrep / python3 / awk / find,Semgrep 默认预装可 --no-semgrep 省略)
+# 构建 SecondLook 沙箱镜像(预装 git / ripgrep / python3 / awk / find,Semgrep 默认预装可 --no-semgrep 省略)
 #
 # 默认同时预装三款 CLI 执行器:
 #   - Qoder CLI(国际版):Node.js + @qoder-ai/qodercli,需 qoder.com 账号
@@ -23,12 +23,12 @@
 #   bash scripts/build-sandbox-image.sh --cn-mirror                           # 一键国内源(Docker+apt+npm)
 #   bash scripts/build-sandbox-image.sh --registry docker.m.daocloud.io       # 仅换 Docker 基础镜像源
 #
-# 构建 agentpair-sandbox:latest 后,在 AgentPair backend/.env 设:
-#   SANDBOX_IMAGE=agentpair-sandbox:latest
+# 构建 secondlook-sandbox:latest 后,在 SecondLook backend/.env 设:
+#   SANDBOX_IMAGE=secondlook-sandbox:latest
 
 set -euo pipefail
 
-IMAGE_NAME="agentpair-sandbox"
+IMAGE_NAME="secondlook-sandbox"
 IMAGE_TAG="latest"
 DOCKERFILE="Dockerfile.sandbox"
 
@@ -486,7 +486,7 @@ fi
 
 # ---------- 完成 ----------
 echo ""
-echo "[OK] 全部就绪。在 AgentPair backend/.env 设:"
+echo "[OK] 全部就绪。在 SecondLook backend/.env 设:"
 echo "    SANDBOX_IMAGE=$IMAGE_NAME:$IMAGE_TAG"
 if [ "$WITH_QODER_CLI" -eq 1 ] || [ "$WITH_DEEPSEEK_CLI" -eq 1 ] || [ "$WITH_CODEX_CLI" -eq 1 ]; then
     echo ""

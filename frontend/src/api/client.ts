@@ -16,8 +16,8 @@ import axios, {
 } from 'axios'
 
 const TOKEN_KEYS = {
-  access: 'agentpair_access_token',
-  refresh: 'agentpair_refresh_token',
+  access: 'secondlook_access_token',
+  refresh: 'secondlook_refresh_token',
 } as const
 
 /** 从 localStorage 读 access token */

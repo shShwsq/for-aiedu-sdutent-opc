@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     )
 
     # 数据库
-    DATABASE_URL: str = "postgresql+psycopg://localhost/agentpair"
+    DATABASE_URL: str = "postgresql+psycopg://localhost/secondlook"
     # 显式开启才会 drop_all + create_all 重建表,避免每次启动丢数据
     DB_REBUILD_ON_START: bool = False
 
@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     REPO_CLONE_TIMEOUT: int = 600
 
     # 用户上传 skill 存储目录(默认相对后端运行目录)
-    # 生产环境可指向独立可写 volume(如 /data/agentpair/user_skills);
+    # 生产环境可指向独立可写 volume(如 /data/secondlook/user_skills);
     # 内置 skill 始终在代码目录 backend/skills/,不经过此配置
     USER_SKILLS_DIR: str = "./user_skills"
 

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================
-# AgentPair 一键部署脚本(在 Linux 服务器上执行)
+# SecondLook 一键部署脚本(在 Linux 服务器上执行)
 #
 # 步骤:
-#   1. git clone <repo-url> AgentPair && cd AgentPair/deploy
+#   1. git clone <repo-url> SecondLook && cd SecondLook/deploy
 #   2. cp .env.production.example .env.production
 #      编辑 .env.production(数据库/密钥/沙箱地址/OAuth)
 #   3. bash deploy.sh
 #
 # 日常更新:
-#   cd AgentPair && git pull && cd deploy && bash deploy.sh
+#   cd SecondLook && git pull && cd deploy && bash deploy.sh
 # ============================================================
 set -euo pipefail
 
