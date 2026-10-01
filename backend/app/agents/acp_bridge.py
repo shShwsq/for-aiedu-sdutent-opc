@@ -78,6 +78,13 @@ class ACPCLIProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            # ACP 是 newline-delimited JSON,CLI(Node 等)固定收发 UTF-8。
+            # Windows 上 text=True 默认用 locale 编码(中文系统 GBK),
+            # 遇到 UTF-8 多字节字符(如 em-dash 的续字节 0x94)会
+            # UnicodeDecodeError 杀死读线程,响应流中断;stdin 同理会把
+            # 中文 prompt 以 GBK 乱码发给 CLI。显式 UTF-8 + replace 容错。
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,  # 行缓冲
         )
         # 启动 stdout 读取线程(阻塞 readline 推入队列,跨平台替代 select)
@@ -106,7 +113,16 @@ class ACPCLIProcess:
         if not self.proc or not self.proc.stderr:
             return
         for line in self.proc.stderr:
-            print(f"[cli stderr] {line.rstrip()}", file=sys.stderr, flush=True)
+            text = line.rstrip()
+            try:
+                print(f"[cli stderr] {text}", file=sys.stderr, flush=True)
+            except UnicodeEncodeError:
+                # bridge 自身 stderr 用宿主 locale 编码(Windows 如 GBK),
+                # CLI stderr 中该编码表示不了的字符(emoji 等)降级替换,
+                # 避免异常杀死本线程导致后续 stderr 转发中断
+                enc = sys.stderr.encoding or "utf-8"
+                safe = text.encode(enc, "replace").decode(enc)
+                print(f"[cli stderr] {safe}", file=sys.stderr, flush=True)
 
     @property
     def alive(self) -> bool:
@@ -244,6 +260,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 line_count = 0
                 idle_secs = 0.0
                 last_idle_log = 0.0
+                got_final = False
 
                 while True:
                     # 从队列取一行(5s 超时,便于周期性检查进程存活)
@@ -317,10 +334,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         msg = json.loads(line)
                         if request_id is not None and msg.get("id") == request_id:
                             print(f"[bridge] 收到匹配 id={request_id} 的最终响应,结束流", file=sys.stderr, flush=True)
+                            got_final = True
                             break
                     except json.JSONDecodeError:
                         continue
 
+                if not got_final:
+                    # 流在收到最终响应前结束(读失败/EOF/CLI 退出/客户端断开):
+                    # 关闭连接让客户端立即收到 EOF 快速失败,而非等它自己的
+                    # read 超时(keep-alive 下连接会一直开着)
+                    self.close_connection = True
                 if line_count == 0:
                     print(f"[bridge] 警告:CLI 未输出任何响应行(method={request_method})", file=sys.stderr, flush=True)
         except Exception as e:
