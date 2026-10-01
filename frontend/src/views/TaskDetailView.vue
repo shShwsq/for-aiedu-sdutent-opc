@@ -963,9 +963,10 @@ watch(
 // 层级结构:
 //   round
 //     ├─ plain segment     (agent2 评估/追问/总结、user 指令等关键节点,平铺)
-//     ├─ step group        (plan step,文字=step.text,内含多个迭代;无 plan 时回退为单个平铺组)
+//     ├─ step group        (plan step,文字=step.text,内含多个迭代;无 plan 时回退为单个"执行过程"折叠组)
 //     │    └─ iteration segment (agent1 一次 ReAct 循环:thinking + N 个工具调用/结果)
-//     └─ conclusion segment (该轮 agent1 最终总结,轮闭合后平铺直接可见,不折叠)
+//     └─ conclusion segment (该轮 agent1 最终回答,轮闭合后提出组外,
+//                            正常消息样式直接可见,无特殊标签)
 //
 // 迭代识别:遇到 agent1 的 thinking 项(实时流式或历史 type=thinking)就开新迭代,
 // 后续 agent1 的 tool_call/tool_result/submit 归入当前迭代,
@@ -975,10 +976,10 @@ watch(
 // step 归属推断:用迭代内首个工具调用的工具名匹配 plan step 关键词
 // (复用后端 _TOOL_STEP_KEYWORDS 映射,与 plan 状态推进逻辑一致)
 //
-// 折叠策略:
-// - step 组:默认折叠(完成后)或展开(含流式中/组内有用户消息)。文字=step.text,唯一折叠单位。
-// - 结论段:该轮最终总结不折叠,平铺直接可见(用户只关心结论,过程默认收起)。
-// - 迭代:不再单独折叠,内容在 step-body 内直接平铺(无摘要行、无边框包装)。
+// 折叠策略(过程整体收起,结论直接可见;运行中流式自动展开,完成/轮结束自动收起):
+// - 无 plan:所有迭代进单个"执行过程"折叠组(结论已提出组外,组内是纯过程噪音);
+// - 有 plan:每个 step 一个折叠组(默认收起),无法归属的迭代进"执行过程"兜底折叠组;
+// - 结论段:该轮最终回答不折叠,像正常消息一样直接可见(无特殊标签,ChatGPT 式);
 // - 工具行:默认折叠(compact 单行 / agent、toolpair 卡片,按 tool_call id 记录展开)。
 
 interface DisplayItem {
@@ -1044,8 +1045,8 @@ interface StepGroup {
   plains: PlainSegment[]
 }
 
-/** 结论段:该轮 agent1 的最终总结(最后一个纯思考迭代),轮闭合后提出平铺,
- *  渲染在所有 step 组之后、修正指令卡之前,不折叠直接可见 */
+/** 结论段:该轮 agent1 的最终回答(最后一个纯思考迭代),轮闭合后提出组外,
+ *  渲染在所有 step 组之后、修正指令卡之前,正常消息样式直接可见(无特殊标签) */
 interface ConclusionSegment {
   kind: 'conclusion'
   item: DisplayItem
@@ -1235,7 +1236,8 @@ function segmentRoundItems(
   }
 
   // 第二阶段:按 plan step 分组迭代
-  // 无 plan 时,所有迭代归入单个"执行过程"组(保持折叠体验一致)
+  // - 无 plan:所有迭代归入单个"执行过程"折叠组(结论已提出组外,组内是纯过程)
+  // - 有 plan:迭代归属各 step 折叠组;无法归属的迭代进"执行过程"兜底折叠组
   const segments: RoundSegment[] = []
   const stepGroupsMap = new Map<number, StepGroup>()
   const noStepGroup: StepGroup = {
@@ -1505,6 +1507,20 @@ const userDirective = computed<DisplayItem | null>(() => {
     type: c.type,
     content: c.content,
   }
+})
+
+/** 侧栏"任务清单":取有 plan 的最大 round(计划随轮次更新,最新一轮即当前进度);
+ *  数据来自 SSE plan 事件与历史对话提取(extractPlanFromHistory),均写入 planPerRound */
+const latestPlanSteps = computed<PlanStep[]>(() => {
+  let best: PlanStep[] = []
+  let bestRound = -1
+  for (const [roundIdx, steps] of planPerRound) {
+    if (steps.length > 0 && roundIdx > bestRound) {
+      bestRound = roundIdx
+      best = steps
+    }
+  }
+  return best
 })
 
 // ---- 折叠状态查询/切换 ----
@@ -2267,25 +2283,7 @@ function toggleResult(id: string): void {
           </div>
 
           <div v-for="group in roundGroups" :key="group.roundIdx" class="round-group">
-            <!-- 计划清单(复杂任务时 agent1 输出,展示接下来要做的步骤 + 进度) -->
-            <div v-if="group.planSteps.length > 0" class="plan-card">
-              <div class="plan-header">
-                <span class="plan-title">计划清单</span>
-                <span class="plan-progress">{{ planProgress(group.planSteps) }}</span>
-              </div>
-              <div class="plan-steps">
-                <div
-                  v-for="s in group.planSteps"
-                  :key="s.id"
-                  :class="['plan-step', `plan-step-${s.status}`]"
-                >
-                  <span class="plan-step-icon">{{
-                    s.status === 'done' ? '✓' : s.status === 'in_progress' ? '◌' : '○'
-                  }}</span>
-                  <span class="plan-step-text">{{ s.text }}</span>
-                </div>
-              </div>
-            </div>
+            <!-- 计划清单已移至右侧栏"任务清单"(latestPlanSteps),主对话流只保留消息流 -->
             <div class="messages">
               <template
                 v-for="seg in group.segments"
@@ -2320,7 +2318,8 @@ function toggleResult(id: string): void {
                   />
                 </div>
 
-                <!-- step 分组:plan step 下含多个迭代(无 plan 时为单个"执行过程"组) -->
+                <!-- step 分组:plan step 各自折叠;无 plan 时为单个"执行过程"折叠组。
+                     过程整体默认收起,该轮最终回答由结论段在组外直接展示 -->
                 <div
                   v-else-if="seg.kind === 'step'"
                   class="step-block"
@@ -2468,14 +2467,13 @@ function toggleResult(id: string): void {
                   </div>
                 </div>
 
-                <!-- 结论段:该轮 agent1 最终总结,平铺直接可见(过程默认折叠) -->
-                <div v-else-if="seg.kind === 'conclusion'" class="conclusion-seg">
-                  <span class="conclusion-tag">本轮结论</span>
-                  <ConversationMessage
-                    :item="seg.item"
-                    @toggle-reasoning="toggleReasoning"
-                  />
-                </div>
+                <!-- 结论段:该轮 agent1 最终回答,正常消息样式直接可见(无标签,组外不折叠);
+                     上方保留可折叠思考卡(ChatGPT "Thought for N seconds" 模式) -->
+                <ConversationMessage
+                  v-else-if="seg.kind === 'conclusion'"
+                  :item="seg.item"
+                  @toggle-reasoning="toggleReasoning"
+                />
               </template>
             </div>
           </div>
@@ -2665,6 +2663,27 @@ function toggleResult(id: string): void {
           </div>
           <div v-if="task.error_message" class="alert alert-error">
             {{ task.error_message }}
+          </div>
+        </section>
+
+        <!-- 任务清单(原主对话流"计划清单"卡迁入;复杂任务时 agent1 输出,
+             最新一轮的计划与实时进度,随 SSE plan 事件/历史提取更新) -->
+        <section v-if="latestPlanSteps.length > 0" class="plan-section">
+          <h2 class="plan-section-title">
+            任务清单
+            <span class="plan-progress">{{ planProgress(latestPlanSteps) }}</span>
+          </h2>
+          <div class="plan-steps">
+            <div
+              v-for="s in latestPlanSteps"
+              :key="s.id"
+              :class="['plan-step', `plan-step-${s.status}`]"
+            >
+              <span class="plan-step-icon">{{
+                s.status === 'done' ? '✓' : s.status === 'in_progress' ? '◌' : '○'
+              }}</span>
+              <span class="plan-step-text">{{ s.text }}</span>
+            </div>
           </div>
         </section>
 
@@ -3598,46 +3617,21 @@ function toggleResult(id: string): void {
   margin-bottom: 0;
 }
 
-/* ---- 本轮结论段:该轮 agent1 最终总结,平铺直接可见 ---- */
-.conclusion-seg {
+/* ---- 任务清单(右侧栏,原主对话流"计划清单"卡迁入) ---- */
+.plan-section {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
+  gap: var(--space-2);
 }
 
-.conclusion-tag {
-  display: inline-block;
-  align-self: flex-start;
-  padding: var(--space-1) var(--space-2);
-  font-size: var(--fs-xs);
-  font-weight: var(--fw-semibold);
-  color: var(--color-primary);
-  background: var(--color-primary-light);
-  border-radius: var(--radius-full);
-}
-
-/* ---- 计划清单卡片 ---- */
-.plan-card {
-  margin-bottom: var(--space-3);
-  padding: var(--space-3) var(--space-4);
-  background: var(--color-plan-bg);
-  border: 1px solid var(--color-plan-border);
-  border-radius: var(--radius-lg);
-}
-
-.plan-header {
+.plan-section-title {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  margin-bottom: var(--space-2);
-}
-
-.plan-title {
-  font-size: var(--fs-xs);
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--fs-base);
   font-weight: var(--fw-semibold);
-  color: var(--color-plan-title);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  color: var(--color-text);
 }
 
 .plan-progress {
