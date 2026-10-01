@@ -44,6 +44,7 @@ from uuid import UUID
 from json_repair import repair_json
 from sqlalchemy.orm import Session
 
+from app.domain_events import VERIFIER_COMPLETED, emit
 from app.event_bus import publish
 from app.llm.client import LLMClient
 from app.models.task import Conversation, Task
@@ -743,9 +744,21 @@ def run_agent2(
                 verify_result = run_verifier_agent(
                     task, db, verification_request, client, round_idx
                 )
+                # 领域事件:一次动态验证完成(成功路径)
+                emit(
+                    VERIFIER_COMPLETED, task_id,
+                    round_idx=round_idx, attempt=verify_count, success=True,
+                    request=verification_request[:200],
+                )
             except Exception as e:
                 logger.exception(f"[task={task_id}] verifier_agent 执行失败")
                 verify_result = f"[验证失败: {e}]"
+                # 领域事件:一次动态验证失败(异常路径)
+                emit(
+                    VERIFIER_COMPLETED, task_id,
+                    round_idx=round_idx, attempt=verify_count, success=False,
+                    request=verification_request[:200], error=str(e)[:300],
+                )
 
             messages.append({
                 "role": "tool",

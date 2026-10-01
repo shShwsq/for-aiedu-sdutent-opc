@@ -76,6 +76,7 @@ async def lifespan(app: FastAPI):
     from app.models import user_llm_config  # noqa: F401
     from app.models import project  # noqa: F401
     from app.models import practice  # noqa: F401  # 练习模块全新表,随 create_all 建表
+    from app.models import domain_event_log  # noqa: F401  # 领域事件审计日志,随 create_all 建表
 
     if settings.DB_REBUILD_ON_START:
         Base.metadata.drop_all(bind=engine)
@@ -119,7 +120,14 @@ async def lifespan(app: FastAPI):
     from app.models.task import migrate_conversation_tool_call_id
 
     migrate_conversation_tool_call_id()
+
+    # 领域事件:注册审计订阅者(所有事件 append-only 落库 domain_event_logs;
+    # 建表已完成,后续扩展按同样方式 subscribe,见 app/domain_events.py)
+    from app.services.domain_event_audit import register_audit_subscriber
+
+    _unsub_audit = register_audit_subscriber()
     yield
+    _unsub_audit()  # 优雅关闭:退订审计订阅
 
 
 app = FastAPI(

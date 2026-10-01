@@ -23,6 +23,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.domain_events import CHECKPOINT_EVALUATED, emit
 from app.event_bus import publish
 from app.llm.client import LLMClient
 from app.models.task import Conversation, Task
@@ -795,6 +796,12 @@ def _record_checkpoint(
         "reason": reason,
         "query": query,
     })
+    # 领域事件:检查点评估完成(迭代边界轻量评估结果)
+    emit(
+        CHECKPOINT_EVALUATED, task.id,
+        round_idx=round_idx, iteration=iteration,
+        interrupt=bool(interrupt), reason=(reason or "")[:300],
+    )
 
     # 同时推 conversation 事件(让前端对话流也能展示)
     publish(task.id, "conversation", {

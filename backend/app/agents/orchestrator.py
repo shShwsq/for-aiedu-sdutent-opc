@@ -36,6 +36,15 @@ from app.agents.agent2 import (
 )
 from app.clone_skip import clear_skip_state
 from app.config import settings
+from app.domain_events import (
+    AGENT1_ROUND_COMPLETED,
+    CHECKLIST_CONFIRMED,
+    QUESTION_RAISED,
+    TASK_COMPLETED,
+    TASK_FAILED,
+    TASK_STARTED,
+    emit,
+)
 from app.event_bus import finish_task, publish
 from app.llm.client import LLMClient
 from app.models.task import Conversation, Result, Task, TaskStatus
@@ -99,6 +108,12 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
     )
     db.commit()
     _publish_status(task)
+    # 领域事件:任务启动(订阅者:审计日志等,见 app/domain_events.py)
+    emit(
+        TASK_STARTED, task.id,
+        ua_enabled=ua_enabled, executor=task.executor or "builtin",
+        scenario=task.scenario, max_rounds=max_rounds,
+    )
 
     scenario_id = task.scenario
 
@@ -190,6 +205,11 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
                 agent_policy=agent_policy,
             )
             perf_log(task.id, "executor_run", time.perf_counter() - _t0, round_idx=1, executor=executor.name)
+            emit(
+                AGENT1_ROUND_COMPLETED, task.id,
+                round_idx=1, executor=executor.name,
+                results_count=len(_results),
+            )
             react_summaries.append({"round": 1, "summary": summary})
 
             # 用 summary 作为唯一结构化结果(agent2 已禁用,不做结构化提取)
@@ -216,6 +236,13 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
             _publish_status(task)
 
             # 单 agent 模式不写 agent2 总结对话(无评估可展示,避免误导)
+
+            # 领域事件:任务完成(单 agent 路径)
+            emit(
+                TASK_COMPLETED, task.id,
+                mode="single_agent", rounds=len(react_summaries),
+                results_count=all_results_count,
+            )
 
             # 提前推送 done 事件:results 已落库,让前端立即拉取展示
             publish(task.id, "done", {"status": "completed"})
@@ -361,6 +388,12 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
             logger.info(
                 f"[task={task.id}] 覆盖度清单已确认,{len(task_checklist)} 个维度"
             )
+            # 领域事件:意图对齐完成(用户确认 checklist 并落库)
+            emit(
+                CHECKLIST_CONFIRMED, task.id,
+                dimensions=len(task_checklist),
+                edited=(task_checklist != generated_checklist),
+            )
 
         followup = ua_result_0.get("followup_query", effective_intent)
 
@@ -393,6 +426,11 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
                 agent_policy=agent_policy,
             )
             perf_log(task.id, "executor_run", time.perf_counter() - _t0, round_idx=round_idx, executor=executor.name)
+            emit(
+                AGENT1_ROUND_COMPLETED, task.id,
+                round_idx=round_idx, executor=executor.name,
+                results_count=len(_results),
+            )
 
             react_summaries.append({
                 "round": round_idx,
@@ -480,6 +518,13 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         db.commit()
         _publish_status(task)
 
+        # 领域事件:任务完成(双 agent 协作路径)
+        emit(
+            TASK_COMPLETED, task.id,
+            mode="dual_agent", rounds=len(react_summaries),
+            results_count=all_results_count,
+        )
+
         # agent2 最终总结:只展示最终评估本身
         # (轮次/结果数等元信息在任务概览与结果清单已可见,不在对话流重复)
         _add_conversation(
@@ -532,6 +577,8 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         task.current_stage = "执行失败"
         db.commit()
         _publish_status(task)
+        # 领域事件:任务失败(主流程 except 路径)
+        emit(TASK_FAILED, task.id, error=err_detail[:500], stage="run")
         _add_conversation(
             db, task, round_idx=0,
             role="agent2", type="error",
@@ -689,6 +736,12 @@ def _handle_ask_user(
         "reasoning": reasoning,
         "conversation_id": str(conv.id),
     })
+    # 领域事件:agent2 发起澄清提问
+    emit(
+        QUESTION_RAISED, task.id,
+        ask_round=ask_round, question_count=len(questions),
+        conversation_id=str(conv.id),
+    )
 
     # 4. 更新任务状态
     task.current_stage = f"等待用户回答澄清问题(第 {ask_round + 1} 次)"
@@ -1621,6 +1674,8 @@ def resume_audit_with_message(
         task.current_stage = err_stage
         db.commit()
         _publish_status(task)
+        # 领域事件:任务失败(resume/重试续跑 except 路径)
+        emit(TASK_FAILED, task.id, error=err_detail[:500], stage=err_stage)
         _add_conversation(
             db, task, round_idx=0,
             role="agent2", type="error",
@@ -1769,6 +1824,8 @@ def _finish_resume(
     task.completed_at = datetime.now(timezone.utc)
     db.commit()
     _publish_status(task)
+    # 领域事件:任务完成(resume/重试续跑路径)
+    emit(TASK_COMPLETED, task.id, mode="resume", rounds=len(react_summaries))
     if ua_result is not None:
         # 与主流程一致:总结只展示最终评估本身
         _add_conversation(
