@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -38,11 +38,6 @@ class AgentPolicy(Base):
     # 是否启用 agent2(关闭=单 agent 模式,跳过评估/验证)
     agent2_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="true", default=True
-    )
-    # agent2 协作总轮次(上限由 MAX_MAX_ROUNDS 控制,写入时钳制)
-    # 默认 2(核查优先、追问兜底);不回写已有用户数据,仅影响新行
-    max_rounds: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default="2", default=2
     )
     # agent2 是否能调用 verifier_agent 验证(需任务配了 test_env_url)
     allow_verify: Mapped[bool] = mapped_column(
@@ -79,7 +74,6 @@ class AgentPolicy(Base):
         """转成与 DEFAULT_AGENT_POLICY 键对齐的 dict(resolve_agent_policy 合并用)"""
         return {
             "agent2_enabled": self.agent2_enabled,
-            "max_rounds": self.max_rounds,
             "allow_verify": self.allow_verify,
             "allow_reference_check": self.allow_reference_check,
             "verifier_auth_mode_default": self.verifier_auth_mode_default,
@@ -93,14 +87,13 @@ class AgentPolicy(Base):
 
 
 def normalize_policy_dict(
-    raw: dict | None, defaults: dict[str, Any], max_rounds_limit: int
+    raw: dict | None, defaults: dict[str, Any],
 ) -> dict[str, Any]:
     """把原始策略 dict(可能缺字段/类型错乱)规整为全字段 dict。
 
     迁移老 user_preferences.agent_policy JSONB 用:逐字段做类型防御,
-    非法值回退 defaults 对应值;max_rounds 钳制到 [1, max_rounds_limit]
-    (与保存路由的钳制逻辑一致)。老数据里的检查点/打断键直接丢弃
-    (该功能已移除)。
+    非法值回退 defaults 对应值。老数据里的检查点/打断/max_rounds 键直接丢弃
+    (功能已移除)。
     """
     raw = raw if isinstance(raw, dict) else {}
 
@@ -108,22 +101,12 @@ def normalize_policy_dict(
         v = raw.get(key)
         return v if isinstance(v, bool) else defaults[key]
 
-    def _int(key: str) -> int:
-        try:
-            return int(raw.get(key))
-        except (TypeError, ValueError):
-            return defaults[key]
-
     def _enum(key: str, allowed: tuple[str, ...]) -> str:
         v = raw.get(key)
         return v if v in allowed else defaults[key]
 
-    max_rounds = _int("max_rounds")
-    max_rounds = max(1, min(max_rounds, max_rounds_limit))
-
     return {
         "agent2_enabled": _bool("agent2_enabled"),
-        "max_rounds": max_rounds,
         "allow_verify": _bool("allow_verify"),
         # 老数据无此键 → 回退 defaults(True)
         "allow_reference_check": _bool("allow_reference_check"),
@@ -150,7 +133,7 @@ def migrate_agent_policy_table() -> None:
 
     from sqlalchemy import inspect, text
 
-    from app.agent_policy import DEFAULT_AGENT_POLICY, MAX_MAX_ROUNDS
+    from app.agent_policy import DEFAULT_AGENT_POLICY
     from app.database import engine
 
     log = logging.getLogger(__name__)
@@ -172,24 +155,23 @@ def migrate_agent_policy_table() -> None:
         for user_id, raw in rows:
             if not isinstance(raw, dict):
                 continue  # 脏数据跳过(等价于老行为:非 dict 不参与合并)
-            d = normalize_policy_dict(raw, DEFAULT_AGENT_POLICY, MAX_MAX_ROUNDS)
+            d = normalize_policy_dict(raw, DEFAULT_AGENT_POLICY)
             conn.execute(
                 text(
                     """
                     INSERT INTO agent_policies (
-                        id, user_id, agent2_enabled, max_rounds,
+                        id, user_id, agent2_enabled,
                         allow_verify, allow_reference_check,
                         verifier_auth_mode_default,
                         executor_command_confirm_default
                     ) VALUES (
-                        :id, :user_id, :agent2_enabled, :max_rounds,
+                        :id, :user_id, :agent2_enabled,
                         :allow_verify, :allow_reference_check,
                         :verifier_auth_mode_default,
                         :executor_command_confirm_default
                     )
                     ON CONFLICT (user_id) DO UPDATE SET
                         agent2_enabled = EXCLUDED.agent2_enabled,
-                        max_rounds = EXCLUDED.max_rounds,
                         allow_verify = EXCLUDED.allow_verify,
                         allow_reference_check = EXCLUDED.allow_reference_check,
                         verifier_auth_mode_default = EXCLUDED.verifier_auth_mode_default,
@@ -273,6 +255,33 @@ def migrate_agent_policy_rename_columns() -> None:
             ))
             log.info("agent_policies.user_agent_enabled → agent2_enabled 列重命名完成")
         conn.commit()
+
+
+def migrate_agent_policy_drop_max_rounds_column() -> None:
+    """幂等删除 agent_policies 的 max_rounds 旧列
+
+    背景:agent2 审查移到后台执行后,初始运行只有 1 轮 agent1、多轮由用户
+    驱动(resume),"协作总轮次"设置不再有生效方,模型不再映射该列。
+    create_all 不会删已存在的列,老库需显式 DROP。列已删(全新库)时直接返回。
+    """
+    import logging
+
+    from sqlalchemy import inspect, text
+
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    with engine.connect() as conn:
+        insp = inspect(conn)
+        if not insp.has_table("agent_policies"):
+            return
+        cols = {c["name"] for c in insp.get_columns("agent_policies")}
+        if "max_rounds" not in cols:
+            return  # 全新库或已迁过
+        conn.execute(text("ALTER TABLE agent_policies DROP COLUMN max_rounds"))
+        conn.commit()
+    log.info("agent_policies.max_rounds 旧列已删除(协作总轮次设置移除)")
 
 
 # 检查点/打断功能移除后要删除的旧列(存在才删,幂等)

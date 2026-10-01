@@ -128,20 +128,30 @@ async def lifespan(app: FastAPI):
     # 检查点/打断功能移除:删 agent_policies 5 个旧列 + 清理 conversations 历史过程记录
     from app.models.agent_policy import (
         migrate_agent_policy_drop_checkpoint_columns,
+        migrate_agent_policy_drop_max_rounds_column,
         migrate_conversations_drop_checkpoint_records,
     )
 
     migrate_agent_policy_drop_checkpoint_columns()
     migrate_conversations_drop_checkpoint_records()
+    # 协作总轮次设置移除:删 agent_policies.max_rounds 旧列(后台审查后初始运行单轮,
+    # 多轮由用户 resume 驱动;须晚于 migrate_agent_policy_table,其 INSERT 已不写该列)
+    migrate_agent_policy_drop_max_rounds_column()
     # 加 conversations.tool_call_id 列(tool_result 关联对应 tool_call,并行调用时前端精确配对)
     from app.models.task import (
         migrate_conversation_tool_call_id,
+        migrate_stale_review_status,
+        migrate_task_add_review_status_column,
         migrate_task_drop_checklist_column,
     )
 
     migrate_conversation_tool_call_id()
     # 覆盖度清单功能移除:删 tasks.checklist 旧列(幂等)
     migrate_task_drop_checklist_column()
+    # agent2 后台审查:加 tasks.review_status 列 + 清理遗留 running 状态
+    # (后端重启后审查线程已死,启动时置 failed,避免前端永远"检查中")
+    migrate_task_add_review_status_column()
+    migrate_stale_review_status()
 
     # 领域事件:注册审计订阅者(所有事件 append-only 落库 domain_event_logs;
     # 建表已完成,后续扩展按同样方式 subscribe,见 app/domain_events.py)

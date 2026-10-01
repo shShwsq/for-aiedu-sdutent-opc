@@ -8,6 +8,17 @@
 export type TaskStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed'
 
 /**
+ * 后台审查状态(agent2 审查移到后台后的子状态,后端 ReviewStatus)
+ *
+ * agent1 结束即任务完成(completed),agent2 的检查在后台执行:
+ * - running: 审查进行中(侧栏显示"检查中"角标,SSE 持续接收审查事件)
+ * - done: 审查完成(重点与知识点已替换临时结果)
+ * - failed: 审查失败/降级(保留 agent1 执行结果,不影响任务状态)
+ * - null: 未审查(单 agent 模式 / 老任务)
+ */
+export type ReviewStatus = 'running' | 'done' | 'failed'
+
+/**
  * 场景信息(后端 ScenarioInfo,精简模板)
  *
  * 场景降级为模板后,仅保留 id/名称/描述/预设 prompt/推荐 skill,
@@ -106,7 +117,9 @@ export interface Conversation {
   role: string
   /**
    * 消息类型:
-   * - evaluation: agent2 评估
+   * - evaluation: agent2 评估(resume 消息分析)
+   * - review: agent2 后台审查结论(侧栏展示)
+   * - suggestions: agent2 建议深挖方向(JSON,侧栏卡片+深挖按钮)
    * - question: agent2 向用户提问 / agent1 接收的 user 指令(原始意图)
    * - answer: 用户对澄清提问的回答
    * - message: 用户在对话界面下方输入框主动发送的补充消息
@@ -148,6 +161,8 @@ export interface TaskDetail {
   /** 执行器:"builtin"(内置 agent1)或某个 agent_type(如 "qoder_cli") */
   executor?: string
   status: TaskStatus
+  /** 后台审查状态(running/done/failed;null=未审查,单 agent 模式或老任务) */
+  review_status?: ReviewStatus | null
   current_stage: string | null
   error_message: string | null
   created_at: string

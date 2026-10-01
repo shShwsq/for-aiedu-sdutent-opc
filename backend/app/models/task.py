@@ -22,6 +22,20 @@ class TaskStatus(str, PyEnum):
     FAILED = "failed"
 
 
+class ReviewStatus(str, PyEnum):
+    """后台审查状态(agent2 审查移到后台后的子状态)
+
+    agent1 结束即任务 COMPLETED,agent2 的整个检查在此状态下后台执行:
+    - running: 审查进行中(前端侧栏显示"检查中"角标,SSE 持续接收审查事件)
+    - done:    审查完成(重点与知识点已替换临时结果)
+    - failed:  审查失败/降级(保留 agent1 summary 临时结果,不影响任务状态)
+    NULL:      未审查(单 agent 模式 / 老任务)
+    """
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+
+
 class Task(Base):
     __tablename__ = "tasks"
 
@@ -74,6 +88,15 @@ class Task(Base):
     #   NOT NULL DEFAULT 'builtin';)
     executor: Mapped[str] = mapped_column(
         String(32), default="builtin", server_default="builtin", nullable=False
+    )
+
+    # 后台审查状态(agent2 审查移到后台后的子状态,见 ReviewStatus)
+    # agent1 结束即任务 COMPLETED,本字段表达"审查进行到哪一步":
+    # running(审查中)/done(完成)/failed(失败,保留临时结果)/NULL(单 agent 模式或老任务)
+    # 升级时需手动执行:ALTER TABLE tasks ADD COLUMN review_status VARCHAR(16);
+    # (幂等迁移见 migrate_task_add_review_status_column)
+    review_status: Mapped[str | None] = mapped_column(
+        String(16), nullable=True, default=None
     )
 
     created_at: Mapped[datetime] = mapped_column(
@@ -230,6 +253,67 @@ def migrate_task_drop_checklist_column() -> None:
         conn.execute(text("ALTER TABLE tasks DROP COLUMN checklist"))
         conn.commit()
     log.info("tasks.checklist 旧列已删除(覆盖度清单功能移除)")
+
+
+def migrate_task_add_review_status_column() -> None:
+    """幂等给 tasks 加 review_status 列(后台审查子状态)
+
+    背景:agent2 审查移到后台执行,agent1 结束即任务 COMPLETED,
+    需要独立子状态表达审查进度(running/done/failed)。
+    项目用 Base.metadata.create_all(无 Alembic),已存在的表不会自动加新列,
+    启动时检查缺失列并 ALTER TABLE ADD COLUMN。老库已有行为 NULL(未审查),
+    与"单 agent 模式 / 老任务"语义一致,无需回填。
+    """
+    import logging
+
+    from sqlalchemy import inspect, text
+
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    with engine.connect() as conn:
+        insp = inspect(conn)
+        if not insp.has_table("tasks"):
+            return  # 全新库,create_all 会建好新列
+        cols = {c["name"] for c in insp.get_columns("tasks")}
+        if "review_status" in cols:
+            return  # 已迁过
+        conn.execute(
+            text("ALTER TABLE tasks ADD COLUMN review_status VARCHAR(16)")
+        )
+        conn.commit()
+    log.info("tasks.review_status 列迁移完成")
+
+
+def migrate_stale_review_status() -> None:
+    """启动时清理遗留的 running 审查状态 → failed
+
+    背景:后台审查在 daemon 线程中执行,后端重启/崩溃后线程即死,
+    review_status=running 的任务会永远卡在"检查中"(前端角标不消失)。
+    启动时把所有 running 置为 failed(审查中断),前端侧栏显示"检查未完成"。
+    幂等:无 running 记录时 UPDATE 0 行。
+    """
+    import logging
+
+    from sqlalchemy import text
+
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    with engine.connect() as conn:
+        result = conn.execute(
+            text(
+                "UPDATE tasks SET review_status = 'failed' "
+                "WHERE review_status = 'running'"
+            )
+        )
+        conn.commit()
+    if result.rowcount:
+        log.warning(
+            f"启动清理: {result.rowcount} 个任务的遗留 running 审查状态已置为 failed"
+        )
 
 
 class Result(Base):

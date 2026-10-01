@@ -27,7 +27,6 @@ from pydantic import BaseModel
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from app.agent_policy import MAX_MAX_ROUNDS
 from app.agents.orchestrator import (
     _err_detail,
     resume_audit_with_message,
@@ -495,14 +494,14 @@ def update_task_runtime_config(
     db: Session = Depends(get_db),
     current_user: User | None = Depends(get_optional_user),
 ) -> Task:
-    """更新任务运行时配置(模型 + 协作策略)
+    """更新任务运行时配置(模型选择)
 
     生效时机:running/paused 的当前执行线程使用启动时加载的配置,
     修改在下一轮执行(completed 后追加消息重启 / failed 重试)时生效。
 
     - 模型 id 需存在于任务归属用户的 LLM 配置列表,否则 400
     - react_llm_config_id 仅 executor=builtin 时可改(CLI 执行器模型自管)
-    - agent_policy 增量合并到 task.params._agent_policy(resolve_agent_policy 识别)
+    - 协作策略(max_rounds)已随后台审查重构移除,此处只更新模型配置
     """
     task = db.get(Task, task_id)
     if not task:
@@ -539,23 +538,11 @@ def update_task_runtime_config(
             _validate_config_id(req.react_llm_config_id, "react_agent 模型配置")
         task.react_llm_config_id = req.react_llm_config_id or None
 
-    if req.agent_policy is not None:
-        updates = req.agent_policy.model_dump(exclude_none=True)
-        if updates:
-            # 钳制 max_rounds 到 [1, MAX_MAX_ROUNDS](与用户级保存逻辑一致)
-            if "max_rounds" in updates:
-                updates["max_rounds"] = max(1, min(int(updates["max_rounds"]), MAX_MAX_ROUNDS))
-            params = dict(task.params or {})
-            policy = dict(params.get("_agent_policy") or {})
-            policy.update(updates)
-            params["_agent_policy"] = policy
-            task.params = params
-
     db.commit()
     db.refresh(task)
     logger.info(
         f"[task={task.id}] 运行时配置已更新: llm={task.llm_config_id}, "
-        f"react_llm={task.react_llm_config_id}, policy={req.agent_policy}"
+        f"react_llm={task.react_llm_config_id}"
     )
     return task
 
@@ -607,6 +594,18 @@ def submit_task_message(
             accepted=False,
             message=f"任务状态为 {task.status.value},无法接收消息",
         )
+
+    # 后台审查互斥(agent1 结束即任务完成,但 agent2 审查可能仍在后台执行):
+    # resume 前先等待审查结束 —— 审查会写对话/结果并操作事件总线,与 resume
+    # 线程并发会产生竞态。超时友好拒绝(此时消息尚未落库,不留孤儿记录)。
+    if task.status == TaskStatus.COMPLETED:
+        from app.agents.orchestrator import wait_for_review
+        if not wait_for_review(task.id, timeout=120.0):
+            logger.warning(f"[task={task_id}] 审查仍在进行,拒绝本次消息")
+            return SendMessageResponse(
+                accepted=False,
+                message="检查助手仍在核查中,请稍后再试",
+            )
 
     # 用户消息归 round:
     # - 运行中/暂停中:归当前 round(react_agent 迭代边界注入,即时介入)
@@ -665,6 +664,7 @@ def submit_task_message(
         )
 
     if task.status == TaskStatus.COMPLETED:
+        # (后台审查已在上方 wait_for_review 等待结束)
         # 同步将状态改为 RUNNING 落库后再启动后台线程:
         # 消除 SSE 端点快照读到 COMPLETED 的竞态窗口 —— 否则前端重连 SSE 时,
         # stream_task_events 会按旧快照直接推 done 关闭连接,后续

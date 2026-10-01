@@ -38,7 +38,6 @@ from app.models.user_llm_config import UserLLMConfig
 from app.models.user_memory import UserMemory
 from app.models.user_preference import UserPreference
 from app.schemas.memory import (
-    PolicyLimitsOut,
     ProjectListResponse,
     ProjectOut,
     SaveAgentPolicyRequest,
@@ -49,7 +48,6 @@ from app.schemas.memory import (
     UserMemoryOut,
     UserPreferenceOut,
 )
-from app.agent_policy import MAX_MAX_ROUNDS
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/memory", tags=["memory"])
@@ -163,16 +161,13 @@ def save_agent_policy(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> UserPreferenceOut:
-    """保存/更新 agent 策略配置(agent2 启停、协作轮次、验证权限等)
+    """保存/更新 agent 策略配置(agent2 启停、验证权限等)
 
     作为用户级默认值(存 agent_policies 独立表),
     任务级可通过 task.params["_agent_policy"] 覆盖。
     get_or_create:若用户无策略记录,自动创建。
     """
     policy_dict = req.model_dump()
-    # 钳制 max_rounds 到 [1, MAX_MAX_ROUNDS](防御前端送超界值;
-    # fallback 与 SaveAgentPolicyRequest/DEFAULT_AGENT_POLICY 默认一致)
-    policy_dict["max_rounds"] = max(1, min(int(policy_dict.get("max_rounds", 2)), MAX_MAX_ROUNDS))
     row = (
         db.query(AgentPolicy)
         .filter(AgentPolicy.user_id == current_user.id)
@@ -193,17 +188,6 @@ def save_agent_policy(
 # ============================================================
 # 全局长期记忆(1:1)
 # ============================================================
-
-
-@router.get("/policy-limits", response_model=PolicyLimitsOut)
-def get_policy_limits(
-    current_user: User = Depends(get_current_user),
-) -> PolicyLimitsOut:
-    """系统级策略限制(前端据此动态渲染输入上限,不硬编码)
-
-    返回当前后端 MAX_MAX_ROUNDS(可通过环境变量 SECONDLOOK_MAX_ROUNDS_LIMIT 调整)。
-    """
-    return PolicyLimitsOut(max_rounds=MAX_MAX_ROUNDS)
 
 
 @router.get("/global", response_model=UserMemoryOut)

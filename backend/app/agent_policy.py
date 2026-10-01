@@ -5,14 +5,16 @@ agent2(质检智能体)的协作策略入口:
 - resolve_agent_policy:合并 用户级默认(agent_policies 表)+ 任务级覆盖
   (task.params["_agent_policy"]),返回最终生效的策略
 
-策略项覆盖:agent2 开关、协作总轮次、验证权限(allow_verify /
+策略项覆盖:agent2 开关、验证权限(allow_verify /
 verifier_auth_mode_default)、引用复核(allow_reference_check)、
 执行智能体命令确认默认模式等。
+
+历史:曾有 max_rounds(协作总轮次)设置,agent2 审查移到后台执行后
+初始运行只有 1 轮 agent1、多轮由用户驱动(resume),该设置已移除。
 """
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -27,16 +29,8 @@ logger = logging.getLogger(__name__)
 # 默认策略 + 配置解析
 # ============================================================
 
-# 协作总轮次上限(可通过环境变量 SECONDLOOK_MAX_ROUNDS_LIMIT 调整,默认 10)
-# 前端展示的"最大 10"与此对齐;改环境变量后前端需同步(或未来通过 API 下发)
-MAX_MAX_ROUNDS = int(os.environ.get("SECONDLOOK_MAX_ROUNDS_LIMIT", "10"))
-
-# max_rounds 兜底默认(与 DEFAULT_AGENT_POLICY 保持一致)
-_DEFAULT_MAX_ROUNDS = 2
-
 DEFAULT_AGENT_POLICY: dict[str, Any] = {
     "agent2_enabled": True,  # 是否启用 agent2(关闭=单 agent 模式,跳过评估/验证)
-    "max_rounds": _DEFAULT_MAX_ROUNDS,  # agent2 协作总轮次(默认 2:核查优先,追问兜底)
     "allow_verify": False,  # agent2 是否能调用 verifier_agent(需任务配了 test_env_url)
     "verifier_auth_mode_default": "per_action",  # 验证授权默认模式(任务级可覆盖)
     "executor_command_confirm_default": "always_approve",  # 执行智能体命令确认默认模式(任务级 _executor_command_confirm 可覆盖)
@@ -94,15 +88,11 @@ def resolve_agent_policy(task: Task, db: Session) -> dict[str, Any]:
                 f"[task={task.id}] 加载用户级 agent_policy 失败(用默认): {e}"
             )
 
-    # 合并任务级覆盖
+    # 合并任务级覆盖(老任务 params 里可能残留 max_rounds,忽略该键)
     overrides = (task.params or {}).get("_agent_policy") or {}
-    merged = {**defaults, **overrides}
-    # 钳制 max_rounds 到 [1, MAX_MAX_ROUNDS](防御:前端/老数据可能送超界值)
-    try:
-        mr = int(merged.get("max_rounds", _DEFAULT_MAX_ROUNDS))
-        merged["max_rounds"] = max(1, min(mr, MAX_MAX_ROUNDS))
-    except (TypeError, ValueError):
-        merged["max_rounds"] = _DEFAULT_MAX_ROUNDS
+    merged = {**defaults, **{
+        k: v for k, v in overrides.items() if k != "max_rounds"
+    }}
 
     # 把 executor_command_confirm_default 映射到 task.params._executor_command_confirm
     # (若任务级未显式设置 _executor_command_confirm),让 4 个 CLI agent wrapper 能读到

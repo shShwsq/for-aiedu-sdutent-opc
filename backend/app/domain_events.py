@@ -36,16 +36,17 @@ logger = logging.getLogger(__name__)
 
 # 任务生命周期
 TASK_STARTED = "task.started"            # 任务进入 RUNNING(orchestrator 启动)
-TASK_COMPLETED = "task.completed"        # 任务正常完成(单/双 agent、resume 完成路径)
+TASK_COMPLETED = "task.completed"        # agent1 执行完成即任务完成(单/双 agent、resume 路径)
 TASK_FAILED = "task.failed"              # 任务失败(主流程与 resume 的 except 路径)
 
 # 协作流程边界
 AGENT1_ROUND_COMPLETED = "agent1.round_completed"  # agent1(执行器)完成一轮执行
 VERIFIER_COMPLETED = "verifier.completed"        # verifier_agent 完成一次动态验证(含失败)
+REVIEW_COMPLETED = "review.completed"            # agent2 后台审查完成(含失败;payload.review_status)
 
 ALL_EVENT_TYPES = frozenset({
     TASK_STARTED, TASK_COMPLETED, TASK_FAILED,
-    AGENT1_ROUND_COMPLETED, VERIFIER_COMPLETED,
+    AGENT1_ROUND_COMPLETED, VERIFIER_COMPLETED, REVIEW_COMPLETED,
 })
 
 

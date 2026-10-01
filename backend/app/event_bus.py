@@ -52,6 +52,8 @@ logger = logging.getLogger(__name__)
 EventType = Literal[
     "conversation", "status", "thinking_delta", "plan",
     "question",  # agent2 请求用户澄清(选择题/填空题弹窗)
+    "agent1_done",  # agent1 执行完成(任务标记 COMPLETED,后台审查开始;非终止事件)
+    "review_done",  # 后台审查完成/失败(非终止事件,随后推 done)
     "done", "error",
     "clone_progress",  # 仓库克隆进度(local 模式 Popen 流式解析 git stderr)
 ]

@@ -139,6 +139,9 @@ class TaskResponse(BaseModel):
     verifier_auth_mode: str = "per_action"
     verifier_auth_tokens: list[VerifierAuthToken] = []
     status: str
+    # 后台审查状态(agent2 审查移到后台后的子状态):
+    # running(审查中)/done(完成)/failed(失败)/None(单 agent 模式或老任务)
+    review_status: str | None = None
     current_stage: str | None
     error_message: str | None
     created_at: datetime
@@ -157,6 +160,8 @@ class TaskListItem(BaseModel):
     title: str | None = None
     user_input: str
     status: str
+    # 后台审查状态(任务列表"检查中"角标用)
+    review_status: str | None = None
     current_stage: str | None
     error_message: str | None
     created_at: datetime
@@ -259,26 +264,19 @@ class VerifyConfigUpdateRequest(BaseModel):
     verifier_auth_tokens: list[VerifierAuthToken] | None = None
 
 
-class RuntimePolicyUpdate(BaseModel):
-    """运行时可调整的协作策略字段(任务级覆盖,合并写入 task.params._agent_policy)
-
-    仅暴露高频字段;None=不修改该字段。
-    """
-
-    max_rounds: int | None = Field(default=None, ge=1)
-
-
 class RuntimeConfigUpdateRequest(BaseModel):
     """更新任务运行时配置请求(PATCH /tasks/{id}/runtime_config)
 
-    任务进行中修改 react_agent / agent2 模型与协作策略。
+    任务进行中修改 react_agent / agent2 模型。
     生效时机:running/paused 的当前执行线程仍用启动时加载的配置,
     修改在下一轮执行(completed 后追加消息 / failed 重试)时生效。
 
     所有字段可选,只更新传入的字段;模型字段传空字符串表示清除
     (llm_config_id 清除后回退 env 默认,react_llm_config_id 清除后回退 llm_config_id)。
+
+    历史:曾有 agent_policy.max_rounds(协作总轮次)子对象,
+    已随后台审查重构移除(初始运行单轮,多轮由用户 resume 驱动)。
     """
 
     llm_config_id: str | None = Field(default=None, max_length=128)
     react_llm_config_id: str | None = Field(default=None, max_length=128)
-    agent_policy: RuntimePolicyUpdate | None = None
