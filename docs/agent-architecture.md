@@ -69,7 +69,8 @@
 - **无"协作总轮次"设置**:初始运行单轮,多轮协作由用户驱动(resume)。原 `AgentPolicy.max_rounds` 已移除(启动迁移 `migrate_agent_policy_drop_max_rounds_column` 幂等 DROP 老库列)
 - **单 agent 退化**:协作策略页关闭 Agent 2(`agent2_enabled=false`)后退化为单 agent 模式——agent1 跑 1 轮直接产出结果,无后台审查,`review_status` 保持 `NULL`
 - **resume(用户驱动多轮)**:用户追加消息 / 点击建议「深挖」触发。**追问直达 agent1,不等老审查**:端点同步置 `RUNNING` 落库(消除 SSE 快照竞态 + 并发第二条消息按运行中语义入队,防双跑)后启动 resume;老审查(若仍在跑)与新轮 agent1 **并行**——各自落库自己轮次的知识点,`done`/`finish` 仅由最后活跃流推送(事件活跃期 scope 机制,`_begin_event_scope`/`_end_event_scope`,世代号单调递增,下游链仅最新流执行);总线:老审查在跑(打开)→ 不重置(SSE 不断线),上一轮已收尾 → 重置后启动。用户消息**原文直接交给 agent1** 跑一轮(不经 agent2 转述,agent1 跨轮历史由 `_build_history_messages` 以结构化 messages 注入,用户追问原文作为独立 user 消息;plan 状态从 `task.params["_plan"]` 跨轮续接),结束后按轮次类型分流:纯对话轮直接收尾,分析轮再次后台审查。每次 resume = agent1 一轮 + (分析轮)后台审查
-- **并行已知限制**(接受的设计取舍):① 老审查的只读核查/PoC 与新轮 agent1 共享同一任务沙箱——新轮改文件时老审查读到的可能是"移动靶",PoC 与 agent1 命令可能争抢端口/进程,老审查结论可信度下降;② `review_status` 单字段在并行窗口内可能被老审查的收尾值(`done`/`failed`)短暂覆盖新轮的 `running`(侧栏 badge 短暂抖动,新轮审查结束自愈);③ `task.params["_grouping"]` 每轮覆盖,历史轮知识点的分组声明以最新轮为准
+- **并行世代门控**(消除并行抖动):老审查被新流取代(用户追问/遗留续轮已启动新一轮)时——① verify/PoC 动态验证降级跳过(`run_agent2(superseded_check=...)`,与新轮共享沙箱不再执行 verifier,防端口/进程争抢);② 任务级字段(`review_status`/`current_stage`)与 `review_done` 事件归最新流所有,老审查跳过写入(防侧栏 badge 被收尾值短暂覆盖);知识点落库与审查结论卡不受影响(按轮追加,历史完整)
+- **并行已知限制**(接受的设计取舍):① 老审查的**只读核查**仍与新轮 agent1 共享同一任务沙箱——新轮改文件时老审查读到的可能是"移动靶"(执行类 PoC 已由世代门控降级跳过);② `task.params["_grouping"]` 每轮覆盖,历史轮知识点的分组声明以最新轮为准
 - **review_status 状态模型**:`NULL`(未审查:单 agent / 老任务)/ `running`(审查中)/ `done`(完成)/ `failed`(失败,任务仍 COMPLETED)。启动迁移 `migrate_stale_review_status` 把遗留 `running` 置 `failed`(后端重启后审查线程已死)
 
 ### 1.3 交付物来源与上传链路(uploads → orchestrator)
@@ -719,7 +720,7 @@ list of `{label, header_name, header_value}`：
 
 | 交互类型 | 触发条件 | 传递方式 |
 |---------|---------|---------|
-| **运行中追加消息** | 用户在对话界面输入框发消息 | API 端点落库 `Conversation(role=user, type=message)` + 推 SSE；react_agent 每个迭代开头 `drain_user_messages` 注入 `messages`。**遗留兜底**(消息不被静默丢弃):① 循环出口守卫——最终答案生成期间到达的消息,react_agent 不退出循环,下一迭代注入同轮继续处理;② `_auto_resume_leftover_messages`——轮结束后仍遗留的消息(收尾窗口到达 / CLI 执行器无 drain 机制),挪到新轮(`round_idx=max+1`,避免与本轮知识点撞轮号)并自动启动新一轮,合并文本(`\n\n`)+ 去重附件 + 累积进 `params.followup_upload_ids`;调用点在终止 `_end_event_scope` 之前,新流注册 scope 后本流不推 done,SSE 不断线 |
+| **运行中追加消息** | 用户在对话界面输入框发消息 | API 端点落库 `Conversation(role=user, type=message)` + 推 `user_message_pending`(输入框上方"待处理"条目,TRAE 式,可撤回:`DELETE /tasks/{id}/messages/{message_id}` 队列移除+删记录+推 `user_message_withdrawn`);react_agent 每个迭代开头 `drain_user_messages` 注入 `messages` 并补推 `conversation`(消费时刻入流)。**遗留兜底**(消息不被静默丢弃):① 循环出口守卫——最终答案生成期间到达的消息,react_agent 不退出循环,下一迭代注入同轮继续处理;② `_auto_resume_leftover_messages`——轮结束后仍遗留的消息(收尾窗口到达 / CLI 执行器无 drain 机制),挪到新轮(`round_idx=max+1`,避免与本轮知识点撞轮号)并自动启动新一轮,合并文本(`\n\n`)+ 去重附件 + 累积进 `params.followup_upload_ids`;调用点在终止 `_end_event_scope` 之前,新流注册 scope 后本流不推 done,SSE 不断线 |
 | **完成后重启(resume)** | 任务 COMPLETED 后用户追加消息 / 点击建议「深挖」 | 端点同步置 `RUNNING` 落库 + 启动 `resume_audit_with_message`(**追问直达 agent1,不等老审查**:老审查与新轮并行,done/finish 由最后活跃流收尾;总线:老审查在跑 → 不重置 SSE 不断线,上一轮已收尾 → 重置后启动;并发第二条消息按运行中语义入队,防双跑)。用户消息原文直传 agent1 跑一轮(不经 agent2 转述) → 按轮次类型分流(纯对话轮直接收尾,分析轮再次后台审查)。多轮由用户驱动 |
 
 ### 7.4 事件流（event_bus）
@@ -731,6 +732,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 | `status` | orchestrator | 任务状态变更（status + current_stage） |
 | `conversation` | orchestrator / react_agent / CLI agent / verifier_agent | 新对话记录（thinking / tool_call / tool_result / evaluation / question / summary / error；verifier 落库带 `verify=true`）。用户补充消息在**被 agent1 消费(drain)的时刻**由 react_agent 补推（遗留接管时由 `_auto_resume_leftover_messages` 补推），在 agent 实际处理的位置入流 |
 | `user_message_pending` | tasks API 端点 | 运行中/暂停中发送的用户补充消息（已落库入队、未被消费）：前端以"待处理"条目展示在输入框上方（TRAE 式），消费时经同 id 的 `conversation` 事件转入对话流；事件入总线历史，刷新后经 SSE 补播重建待处理状态 |
+| `user_message_withdrawn` | tasks API 端点 | 待处理消息被用户撤回（`DELETE /tasks/{id}/messages/{message_id}`：队列移除 + 删 Conversation）：前端移除待处理条目（多端同步）；已被消费的消息拒绝撤回 |
 | `conversation_update` | CLI agent | 更新已有 conversation 的 content（节流推送，如工具调用参数增量） |
 | `thinking_delta` | agent2 / react_agent / CLI agent / verifier_agent | 流式思考增量（phase: start / reasoning / content / error / end；verifier 带 `role=agent2, verify=true`） |
 | `plan` | react_agent / CLI agent | plan 状态更新（round_idx + steps） |
