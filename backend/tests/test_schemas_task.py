@@ -242,6 +242,48 @@ def test_send_message_request_accepts_max_length():
 
 
 # ============================================================
+# 多文件上传字段:TaskCreateRequest.upload_ids / SendMessageRequest.upload_ids
+# ============================================================
+
+def test_task_create_upload_ids_default_none():
+    """默认不带上传(legacy upload_id 与 upload_ids 均为 None)。"""
+    req = TaskCreateRequest(user_input="x")
+    assert req.upload_id is None
+    assert req.upload_ids is None
+
+
+def test_task_create_accepts_upload_ids_list():
+    """upload_ids 接受字符串列表(创建多文件)。"""
+    req = TaskCreateRequest(user_input="x", upload_ids=["a-1", "b-2"])
+    assert req.upload_ids == ["a-1", "b-2"]
+
+
+def test_task_create_legacy_upload_id_coexists_with_upload_ids():
+    """legacy 单数 upload_id 与新 upload_ids 可共存(后端合并去重)。"""
+    req = TaskCreateRequest(user_input="x", upload_id="legacy-1", upload_ids=["a-1"])
+    assert req.upload_id == "legacy-1"
+    assert req.upload_ids == ["a-1"]
+
+
+def test_send_message_upload_ids_default_none():
+    """追问默认不带附件。"""
+    req = SendMessageRequest(content="hi")
+    assert req.upload_ids is None
+
+
+def test_send_message_accepts_upload_ids():
+    """追问可携带多个附件 id。"""
+    req = SendMessageRequest(content="看这些", upload_ids=["u1", "u2"])
+    assert req.upload_ids == ["u1", "u2"]
+
+
+def test_send_message_still_requires_nonempty_content():
+    """带附件也不能空 content(附件随非空文字消息发送)。"""
+    with pytest.raises(ValidationError):
+        SendMessageRequest(content="", upload_ids=["u1"])
+
+
+# ============================================================
 # VerifyActionRequest
 # ============================================================
 

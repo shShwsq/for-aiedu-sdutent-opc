@@ -111,3 +111,56 @@ def test_gc_orphan_without_created_at_kept(_retention, monkeypatch):
     stats = upload_gc.run_gc_once(db=_fake_db([]))
     assert backend.deleted == []
     assert stats["kept"] == 1
+
+
+# ============================================================
+# 多文件 / 追问上传:引用收集取并集(upload_id + upload_ids + followup_upload_ids)
+# ============================================================
+
+def test_gc_keeps_creation_multi_upload_ids(_retention, monkeypatch):
+    """创建多文件:upload_ids 全部视为被引用,任务未超期一律保留(不被当孤儿误删)"""
+    backend = FakeBackend(["c1", "c2"], {})
+    monkeypatch.setattr(upload_gc, "get_backend", lambda: backend)
+    rows = [
+        ({"upload_ids": ["c1", "c2"]}, TaskStatus.RUNNING, None, _NOW - timedelta(days=1)),
+    ]
+    upload_gc.run_gc_once(db=_fake_db(rows))
+    assert backend.deleted == []
+
+
+def test_gc_keeps_followup_upload_ids(_retention, monkeypatch):
+    """追问上传:followup_upload_ids 被收集为引用,即使任务终态但未超期也保留"""
+    backend = FakeBackend(["f1", "f2"], {})
+    monkeypatch.setattr(upload_gc, "get_backend", lambda: backend)
+    rows = [
+        ({"followup_upload_ids": ["f1", "f2"]}, TaskStatus.COMPLETED,
+         _NOW - timedelta(days=5), _NOW - timedelta(days=6)),
+    ]
+    upload_gc.run_gc_once(db=_fake_db(rows))
+    assert backend.deleted == []
+
+
+def test_gc_deletes_expired_followup_when_terminal(_retention, monkeypatch):
+    """追问上传同样受保留窗口约束:任务终态且超期 → 删(并集不改变超期判据)"""
+    backend = FakeBackend(["old-create", "old-followup"], {})
+    monkeypatch.setattr(upload_gc, "get_backend", lambda: backend)
+    rows = [
+        ({"upload_id": "old-create", "followup_upload_ids": ["old-followup"]},
+         TaskStatus.COMPLETED, _NOW - timedelta(days=40), _NOW - timedelta(days=45)),
+    ]
+    upload_gc.run_gc_once(db=_fake_db(rows))
+    assert set(backend.deleted) == {"old-create", "old-followup"}
+
+
+def test_gc_union_keeps_when_any_task_active(_retention, monkeypatch):
+    """并集里某 upload 同时被终态任务与进行中任务引用 → 保守保留"""
+    backend = FakeBackend(["shared-fu"], {})
+    monkeypatch.setattr(upload_gc, "get_backend", lambda: backend)
+    rows = [
+        ({"followup_upload_ids": ["shared-fu"]}, TaskStatus.COMPLETED,
+         _NOW - timedelta(days=40), _NOW - timedelta(days=41)),
+        ({"upload_ids": ["shared-fu"]}, TaskStatus.RUNNING,
+         None, _NOW - timedelta(days=1)),
+    ]
+    upload_gc.run_gc_once(db=_fake_db(rows))
+    assert backend.deleted == []

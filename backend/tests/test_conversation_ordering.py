@@ -38,3 +38,14 @@ def test_conversations_relationship_has_order_by():
     assert table_names == {Conversation.__tablename__}, (
         f"order_by 列应来自 {Conversation.__tablename__} 表,实际 {table_names}"
     )
+
+
+def test_conversation_has_nullable_attachments_column():
+    """Conversation 必须有可空 attachments 列(追问附件展示信息持久化)。
+
+    刷新后气泡仍需渲染附件 chip,故附件信息随消息落库;历史数据/无附件
+    消息为 None,列必须 nullable,且默认不写入(不破坏既有插入路径)。
+    """
+    col = Conversation.__table__.columns.get("attachments")
+    assert col is not None, "Conversation 缺少 attachments 列"
+    assert col.nullable is True, "attachments 列必须可空(历史数据/无附件消息为 None)"
