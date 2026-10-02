@@ -33,6 +33,7 @@ logs/
 # 运行时数据
 _repos/
 uploads_data/
+_repo_cache/
 
 # 沙箱镜像构建临时目录(--hermes-local-dir 复制宿主机源码到构建上下文用)
 hermes-local/
