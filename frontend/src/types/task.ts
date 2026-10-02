@@ -117,7 +117,7 @@ export interface Conversation {
   role: string
   /**
    * 消息类型:
-   * - evaluation: agent2 评估(resume 消息分析)
+   * - evaluation: agent2 评估(仅存量数据:旧版 resume 消息分析/协作循环,现已停产)
    * - review: agent2 后台审查结论(侧栏展示)
    * - suggestions: agent2 建议深挖方向(JSON,侧栏卡片+深挖按钮)
    * - question: agent2 向用户提问 / agent1 接收的 user 指令(原始意图)

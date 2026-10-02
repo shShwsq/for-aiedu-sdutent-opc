@@ -2230,7 +2230,11 @@ def _build_base_prompt(
         if not repo_context and repo_path:
             msg += f"\n仓库路径: {repo_path}"
     else:
-        msg = "基于之前的执行结果,现在请针对以下问题继续深入"
+        msg = (
+            "基于之前的执行进度,请处理以下新消息"
+            "(用户追问可直接回答,新需求/修正则执行对应工作,续跑则接着完成,"
+            "均不要重做已完成的部分)"
+        )
         # 只有工作区确实有文件才声称"已 clone":预 clone 可能失败降级为
         # 空目录,此时若断言已 clone 会误导 CLI 跳过 clone
         if repo_path and sandbox_tools.workspace_has_files(str(task.id)):
@@ -2547,11 +2551,24 @@ def run_acp_agent(
                 task, round_idx, followup_query, repo_context, repo_path, previous_plan,
             )
 
-            _add_conversation(
-                db, task, round_idx=round_idx,
-                role="user", type="question",
-                content=base_msg,
+            # 幂等落库:首轮提问已在任务创建时(create_task)落库,此处跳过避免
+            # 重复记录;追问轮/续跑轮首次进入时该轮尚无 question,正常落库。
+            _existing_question = (
+                db.query(Conversation.id)
+                .filter(
+                    Conversation.task_id == task.id,
+                    Conversation.round_idx == round_idx,
+                    Conversation.role == "user",
+                    Conversation.type == "question",
+                )
+                .first()
             )
+            if _existing_question is None:
+                _add_conversation(
+                    db, task, round_idx=round_idx,
+                    role="user", type="question",
+                    content=base_msg,
+                )
 
             user_msg = (
                 base_msg

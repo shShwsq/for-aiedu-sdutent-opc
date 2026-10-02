@@ -33,6 +33,7 @@ from app.agents.orchestrator import (
     retry_failed_task,
     run_dual_agent_audit,
 )
+from app.agents.react_agent import build_first_round_question
 from app.database import SessionLocal, get_db
 from app.deps import get_optional_user, get_optional_user_sse
 from app.event_bus import (
@@ -206,6 +207,21 @@ def create_task(
         db.refresh(task)
         task_id = task.id
         task_status = task.status
+
+        # 用户提问即时落库(role=user, type=question, round_idx=1):
+        # 保证前端首屏 getTask 快照即含用户提问,无需等后台线程完成预 clone、
+        # react_agent 启动后才显示(此前问题气泡会晚于助手回答出现)。
+        # react_agent / acp_base 首轮按 (task, round_idx, user, question) 幂等去重,
+        # 不会重复落库。此处不 publish SSE:前端 getTask 先于 connectSSE,提问已
+        # 在快照中;若再进总线历史会与快照重复(onConversation 无按 id 去重)。
+        db.add(Conversation(
+            task_id=task_id,
+            round_idx=1,
+            role="user",
+            type="question",
+            content=build_first_round_question(user_input, params),
+        ))
+        db.commit()
     finally:
         db.close()
 

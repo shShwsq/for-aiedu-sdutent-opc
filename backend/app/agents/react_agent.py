@@ -51,6 +51,30 @@ LOOP_MIN_DISTINCT = 2
 FOLLOWUP_SECTION_LABEL = "[本轮补充要求]"
 
 
+def build_first_round_question(user_input: str, params: dict | None) -> str:
+    """构造首轮"用户提问"对话的落库内容(user_input + 仓库/分支/上传来源提示)
+
+    任务创建时(create_task)即以此内容落库 role=user / type=question 对话,
+    保证前端首屏 getTask 快照立即显示用户提问,无需等待后台线程完成预 clone、
+    react_agent 启动后才出现(此前问题气泡会晚于助手回答显示)。
+
+    react_agent 首轮复用同一函数构造 user_msg,保证展示内容与创建时落库完全
+    一致 —— 这是 (task, round_idx, user, question) 幂等去重成立的前提。
+
+    注意:不含"预 clone 上下文段"与"跨轮历史记忆块",两者属系统编排信息,
+    只进发送给 LLM 的内容,不落库展示。
+    """
+    params = params or {}
+    content = user_input
+    if params.get("repo_url"):
+        content += f"\n仓库地址: {params['repo_url']}"
+    if params.get("branch"):
+        content += f"\n分支: {params['branch']}"
+    if params.get("upload_id"):
+        content += "\n交付物来源:用户上传的文件(已就绪在任务工作区,无需 clone)"
+    return content
+
+
 # ============================================================
 # 通用 system prompt(场景降级后,不再从场景读取)
 # ============================================================
@@ -213,15 +237,11 @@ def run_react_agent(
     repo_ctx_section = ""
     history_prefix = ""  # 追问轮的历史记忆块,同样只进发送内容不落库
     if followup_query is None:
-        # 第一轮:用 task.user_input
-        user_msg = task.user_input
+        # 第一轮:用 task.user_input(+ 仓库/分支/上传来源提示)
+        # 内容构造复用 build_first_round_question,与 create_task 落库的首轮
+        # question 完全一致(幂等去重的前提)
         params = task.params or {}
-        if params.get("repo_url"):
-            user_msg += f"\n仓库地址: {params['repo_url']}"
-        if params.get("branch"):
-            user_msg += f"\n分支: {params['branch']}"
-        if params.get("upload_id"):
-            user_msg += "\n交付物来源:用户上传的文件(已就绪在任务工作区,无需 clone)"
+        user_msg = build_first_round_question(task.user_input, params)
 
         # orchestrator 已准备好交付物(clone 或上传)时,注入上下文提示跳过 clone_repo
         if repo_context:
@@ -286,11 +306,25 @@ def run_react_agent(
         user_msg.replace(f"{history_prefix}\n\n", "", 1)
         if history_prefix else user_msg
     )
-    _add_conversation(
-        db, task, round_idx=round_idx,
-        role="user", type="question",
-        content=stored_msg,
+    # 幂等落库:首轮提问已在任务创建时(create_task)落库,此处跳过避免重复记录;
+    # 追问轮/续跑轮首次进入时该轮尚无 question,正常落库。
+    # 按 (task_id, round_idx, role=user, type=question) 定位,与创建时一致。
+    _existing_question = (
+        db.query(Conversation.id)
+        .filter(
+            Conversation.task_id == task.id,
+            Conversation.round_idx == round_idx,
+            Conversation.role == "user",
+            Conversation.type == "question",
+        )
+        .first()
     )
+    if _existing_question is None:
+        _add_conversation(
+            db, task, round_idx=round_idx,
+            role="user", type="question",
+            content=stored_msg,
+        )
 
     # 实际发送给 LLM 时拼上预 clone 上下文段
     if repo_ctx_section:
