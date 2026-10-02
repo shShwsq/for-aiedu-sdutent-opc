@@ -40,6 +40,9 @@ from sqlalchemy.orm import Session
 
 from app.agents.executor_agent import get_executor
 from app.agents.agent2 import run_agent2
+# 对话落库 + SSE 推送:runtime 统一实现(与 react_agent / agent2 / acp_base
+# 同源;别名保持 _add_conversation 模块名,存量 monkeypatch 兼容面不变)
+from app.agents.runtime.conversation import record_conversation as _add_conversation
 from app.clone_skip import clear_skip_state
 from app.config import settings
 from app.domain_events import (
@@ -1087,38 +1090,6 @@ def _run_background_review(
             _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
         except Exception:
             _end_event_scope(task.id, flow_gen)
-
-
-def _add_conversation(
-    db: Session, task: Task, *, round_idx: int, role: str, type: str, content: str,
-    reasoning: str | None = None,
-) -> None:
-    """落库一条对话,同时推送事件给前端 SSE
-
-    reasoning:可选,完整评估/思考链(如 agent2 evaluation 的覆盖情况+判断),
-        前端默认折叠,点击展开回看。None 时不落库该字段。
-    """
-    conv = Conversation(
-        task_id=task.id,
-        round_idx=round_idx,
-        role=role,
-        type=type,
-        content=content,
-        reasoning=reasoning,
-    )
-    db.add(conv)
-    db.commit()
-    db.refresh(conv)
-    # 推送给事件总线(前端 SSE 实时接收)
-    publish(task.id, "conversation", {
-        "id": str(conv.id),
-        "round_idx": conv.round_idx,
-        "role": conv.role,
-        "type": conv.type,
-        "content": conv.content,
-        "reasoning": conv.reasoning,
-        "created_at": conv.created_at.isoformat() if conv.created_at else None,
-    })
 
 
 def _publish_status(task: Task) -> None:

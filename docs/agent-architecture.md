@@ -49,6 +49,7 @@
 
 > verifier_agent 是实验性功能,仅在用户开启「允许 agent2(检查助手)自行验证」时启用。详见本文第 5 节。
 > 交付物来源二选一:Git 仓库(orchestrator 预 clone)或上传 ZIP / 单文件(`upload_id`,orchestrator 传输进沙箱工作区),详见 §1.4。
+> 三个内置智能体(react_agent / agent2 / verifier_agent)的无业务语义原语——流式 LLM 调用 + 跨 chunk 工具累积 + 文本 tool_call 兜底、对话落库 + SSE 推送、工具意图生成、共享常量——收敛在 `agents/runtime/` 共享运行时层(详见 §8.6);各智能体的循环策略与 prompt 保持独立。
 
 ### 1.1 角色分工
 
@@ -97,7 +98,7 @@
 - **重点与知识点产出(审查完成时 results)**:从全程提炼 **3-8 条精选知识点**,不是全量发现清单;每条 metadata 含 `learning_note`(必有,学习价值说明)、`practice_worthy: true`(默认)、可选 severity/file_path/line/verified/ref_* 系列。grouping 默认 null(平铺),仅安全审计类按严重度分组对用户有帮助时才声明
 - **题目与知识点生成**:任务完成后由 orchestrator 调用 practice 服务(实现位于 `app/services/practice/`)生成练习题与知识点,选题优先覆盖 practice_worthy 标记的知识点
 - **审查维度自定**：无预定义覆盖度清单，agent2 每次评估时根据用户意图自行确定应覆盖的审查维度（3-8 个为宜），跨轮保持维度 id 稳定
-- **流式输出**：`_stream_agent2_llm` 通过 `client.chat_stream` 收 token，实时推送 `thinking_delta` 事件给前端（Agent2Panel 侧栏渲染）
+- **流式输出**：`_stream_agent2_llm`（runtime.stream_llm 薄包装）收 token，实时推送 `thinking_delta` 事件给前端（Agent2Panel 侧栏渲染）；content 为最终评估 JSON 不进流式卡片，只展示思考链
 - **跨轮记忆**：第 2 轮起注入自己之前各轮的审查记录(type=review;兼容旧版 type=evaluation),避免 covered/missing 反复摇摆
 
 ### 2.2 输入参数（`run_agent2`）
@@ -182,6 +183,7 @@ def run_agent2(
 ### 2.6 后置约束
 
 - JSON 解析失败 → 兜底 `parse_failed=true, results=[]`（调用方标记审查失败,保留 agent1 临时结果）
+- 文本 tool_call 兜底(runtime 共享)：GLM/Qwen 思考模式把工具调用写在正文(Hermes 风格)时,经 runtime 的文本解析提取工具调用并回灌执行——此前 agent2 缺失该兜底,这类模型下审查必然 `parse_failed`
 
 > 历史说明:任务开始时的「初始评估 + 澄清提问(ask_user)+ 覆盖度清单确认」机制已整体移除,
 > agent1 第 1 轮直接按用户意图执行,agent2 从第 1 轮执行完成后开始质检。
@@ -226,7 +228,7 @@ agent1 结论引用外部依据(URL / CVE / 安全公告 / 官方文档)时,agen
 ### 3.1 核心特征
 
 - **ReAct 循环**：思考 → 工具调用 → 观察 → 再思考，最多 `MAX_ITERATIONS=30` 次
-- **流式 LLM 调用**：`_stream_llm_response` 累积 `reasoning_delta / content_delta / tool_call_deltas`，实时推送 `thinking_delta`
+- **流式 LLM 调用**：`_stream_llm_response`（runtime.stream_llm 薄包装）累积 `reasoning_delta / content_delta / tool_call_deltas`，实时推送 `thinking_delta`
 - **跨轮记忆**：三级压缩策略（Level 0 完整 → Level 1 丢工具摘要 → Level 2 LLM 压缩早期轮次）
 - **plan 状态机**：代码维护权威 `current_plan`，工具调用前推断 step 标 `in_progress`，LLM 在 thinking 里输出 `<plan>` 时合并（信任 LLM 的 `done` 标注）
 - **循环检测**：连续相同调用 + 滑动窗口低多样性检测，强制转入总结
@@ -568,7 +570,7 @@ agent2 在评估覆盖度后,若用户开启了「允许自行验证」(`allow_v
 
 ### 5.2 核心特征
 
-- **独立 ReAct 循环**：自己的 messages + 迭代（最大 10 次），不复用 agent1 的 messages
+- **独立 ReAct 循环**：自己的 messages + 迭代（最大 10 次），不复用 agent1 的 messages；流式调用与文本 tool_call 兜底复用 runtime（此前 verifier 缺兜底时，GLM/Qwen 思考模式的工具调用文本会被当"验证总结"提前返回，PoC 根本没执行）
 - **复用沙箱会话**：`run_python_code` 在 agent1 的同一沙箱执行，可 `read_file` 仓库代码辅助构造 PoC
 - **独立 LLM 调用**：用 agent2 的 `LLMClient`（`task.llm_config_id`），与 agent1 模型解耦
 - **工具集**（不复用 agent1 工具表，独立 `backend/app/tools/verifier_tools.py`）：
@@ -601,7 +603,7 @@ list of `{label, header_name, header_value}`：
 |------|---------------|-------------------|
 | 思考增量 | `thinking_delta(role=agent2, verify=true, phase=reasoning/content)` | （累积到 reasoning_buf） |
 | 工具调用 | `conversation(role=agent2, type=tool_call, verify=true)` | 是（人类可读描述如「验证请求: GET /api/users [http_request]」） |
-| 工具结果 | `conversation(role=agent2, type=tool_result, verify=true)` | 是（超 5000 字符截断） |
+| 工具结果 | `conversation(role=agent2, type=tool_result, verify=true)` | 是（超 5000 字符截断；runtime 统一落库，tool_call_id 与 tool_call 配对） |
 | 思考完成 | （隐含 phase=end） | `role=agent2, type=thinking, content="[验证结果] ..."` |
 
 ### 5.6 输出
@@ -753,6 +755,7 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 - **结构化结果由 agent2 整理**：react_agent 只输出自然语言 summary，`results + grouping` 由 agent2 审查完成时输出
 - **执行器抽象**：orchestrator 通过 `get_executor(task)` 拿 provider，无需关心底层是内置 LLM 循环还是外部 CLI 协议
 - **verifier_agent 独立工具集**：不复用 react_agent 工具表（避免 `http_request` 暴露给代码执行阶段），独立 `verifier_tools.py`
+- **共享运行时层**：无业务语义的底层原语收敛 `agents/runtime/`（§8.6）；循环策略（迭代上限/工具配额/授权拦截/降级语义）不入 runtime，保持各智能体独立
 
 ### 8.2 防止 LLM 反复摇摆
 
@@ -783,6 +786,19 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 - 推送 `done` / `error` 终止事件
 - `finish_task`（通知事件总线任务结束）
 
+### 8.6 共享运行时层（agents/runtime/）
+
+三个内置智能体原本各自手抄的底层实现收敛为单一事实源，让修复自动传播（react_agent 为 GLM/Qwen 思考模式做的文本 tool_call 兜底，此前未覆盖 agent2 / verifier：这类模型把工具调用写在正文而非结构化通道，导致 agent2 审查 JSON 解析失败、verifier 把工具调用文本当"验证总结"提前返回）：
+
+| 模块 | 职责 | 接入方式 |
+|------|------|---------|
+| [runtime/llm_stream.py](../backend/app/agents/runtime/llm_stream.py) | `stream_llm()` 统一流式调用（thinking_delta 事件序列 + llm_ttft/llm_stream_total perf 打点；参数化 role / max_tokens / publish_content / iteration / extra / phase_start）+ `ToolCallAccumulator` 跨 chunk 工具累积 + `extract_text_tool_calls` / `strip_tool_call_blocks` 文本 tool_call 兜底（正则与实现仅此一份） | react_agent（`_stream_llm_response`）、agent2（`_stream_agent2_llm`）、verifier（`_stream_verifier_llm`）均为保留原签名的薄包装，存量测试按模块属性替换的兼容面不变 |
+| [runtime/conversation.py](../backend/app/agents/runtime/conversation.py) | `record_conversation()` 统一落库 + SSE 推送（payload 超集形状：id / reasoning / tool_call_id / created_at + extra_payload 如 verify=true；`publish_event=False` 供 thinking 防重复推送） | react_agent / orchestrator / acp_base 以 `_add_conversation` 别名导入（monkeypatch 兼容）；agent2 / verifier 工具落库直接调用。顺带修复：verifier 此前落库不带 id / tool_call_id，前端无法把 result 与 call 配对展示 |
+| [runtime/tool_intent.py](../backend/app/agents/runtime/tool_intent.py) | `build_tool_intent(fn, args, prefix=...)` 单一注册表（react_agent 全量工具 + agent2 `check_reference` + verifier `http_request`），末尾 `[tool_name]` 标签与前端提取逻辑不变 | 三方共用；agent2 传 `prefix="[agent2 质检]"` 保留质检语境 |
+| [runtime/constants.py](../backend/app/agents/runtime/constants.py) | `MAX_HISTORY_MSG_CHARS` / `MAX_HISTORY_TOTAL_CHARS` 单一事实源 | react_agent 与 agent2 导入使用，消除"注释里约定两边保持一致"的手工同步 |
+
+**不在 runtime 的（职责边界）**：三个智能体的循环策略——react_agent 的 ReAct 迭代 / plan 状态机 / 循环检测 / 三级历史压缩（token 预算）、agent2 的工具配额（只读 12 / verify 3 / 引用 3）/ `superseded_check` 并行门控 / 重试降级、verifier 的 `per_action` 授权拦截；以及各自的 prompt、工具定义与门控、历史注入策略（react_agent 结构化 messages vs agent2 文本前缀）。这些保持各模块独立演进，不抽基类（避免模板方法钩子地狱）。
+
 ---
 
 ## 9. 文件索引
@@ -790,6 +806,10 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 | 文件 | 职责 |
 |------|------|
 | [orchestrator.py](../backend/app/agents/orchestrator.py) | 双智能体协作编排（agent1 单轮 + 后台审查 + resume） |
+| [runtime/llm_stream.py](../backend/app/agents/runtime/llm_stream.py) | 共享运行时：统一流式 LLM 调用 + 跨 chunk 工具累积 + 文本 tool_call 兜底解析（§8.6） |
+| [runtime/conversation.py](../backend/app/agents/runtime/conversation.py) | 共享运行时：统一对话落库 + SSE 推送（tool_call_id 配对 + extra_payload） |
+| [runtime/tool_intent.py](../backend/app/agents/runtime/tool_intent.py) | 共享运行时：工具意图生成单一注册表（prefix 支持） |
+| [runtime/constants.py](../backend/app/agents/runtime/constants.py) | 共享运行时：跨智能体截断常量单一事实源 |
 | [agent2.py](../backend/app/agents/agent2.py) | agent2 实现（质检评估 / 审查维度自定 / 跨轮自记忆） |
 | [react_agent.py](../backend/app/agents/react_agent.py) | 内置 react_agent（流式 LLM / 工具调用 / plan 状态机 / 三级压缩跨轮记忆 / 循环检测） |
 | [verifier_agent.py](../backend/app/agents/verifier_agent.py) | 验证智能体（独立 ReAct 循环 + http_request / run_python_code 工具 + per_action 授权） |

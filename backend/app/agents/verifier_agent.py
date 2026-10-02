@@ -31,6 +31,15 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+# 共享运行时原语(runtime 层):与 react_agent / agent2 同源,
+# 含此前 verifier 缺失的 Hermes 风格文本 tool_call 兜底解析
+from app.agents.runtime.conversation import record_conversation
+from app.agents.runtime.llm_stream import (
+    extract_text_tool_calls,
+    stream_llm,
+    strip_tool_call_blocks,
+)
+from app.agents.runtime.tool_intent import build_tool_intent as _build_tool_intent
 from app.event_bus import publish
 from app.llm.client import LLMClient
 from app.models.task import Task
@@ -141,10 +150,24 @@ def run_verifier_agent(
     ]
 
     for iteration in range(1, MAX_VERIFIER_ITERATIONS + 1):
-        # 流式调 LLM(复用 react_agent 的流式模式,但 role 标为 agent2 + verify)
+        # 流式调 LLM(runtime 统一流式实现,role 标为 agent2 + verify)
         reasoning_full, content_full, tool_calls_full, finish_reason = _stream_verifier_llm(
             client, messages, task_id=task_id, round_idx=round_idx, iteration=iteration
         )
+
+        # 兜底:结构化 tool_calls 为空但 content 里有 Hermes 风格文本
+        # 工具调用块(GLM/Qwen 思考模式把工具调用写在正文)。
+        # verifier 此前缺失该兜底 → 工具调用文本被当成"验证总结"直接
+        # 返回,PoC 根本没执行。与 react_agent 共用 runtime 的同一解析。
+        if not tool_calls_full and content_full:
+            text_tool_calls = extract_text_tool_calls(content_full)
+            if text_tool_calls:
+                logger.info(
+                    f"[task={task_id}] verifier_agent 从 content 解析出 "
+                    f"{len(text_tool_calls)} 个文本 tool_call(兜底)"
+                )
+                tool_calls_full = text_tool_calls
+                content_full = strip_tool_call_blocks(content_full)
 
         # 无工具调用 → 验证完成,content 是总结
         if not tool_calls_full:
@@ -231,99 +254,33 @@ def _stream_verifier_llm(
     round_idx: int,
     iteration: int,
 ) -> tuple[str, str, list[dict[str, Any]], str | None]:
-    """流式调用 verifier_agent 的 LLM,实时推送 thinking_delta
+    """流式调用 verifier_agent 的 LLM(runtime.stream_llm 的薄包装)
+
+    保留模块级包装:签名与返回值保持不变。收 chunk / 推 thinking_delta /
+    工具调用跨 chunk 累积 / perf 打点由 runtime.stream_llm 统一实现。
+
+    verifier 特有行为经参数表达:
+    - role="agent2" + extra={"verify": True}:对用户透明,前端显示
+      "正在验证"而非"正在评估"
+    - phase_start=False:流开始事件由 run_verifier_agent 自行发布
+      (整个验证过程一张 start 卡,迭代间不重复推 start)
 
     返回 (reasoning_full, content_full, tool_calls_full, finish_reason)
     """
-    conv_id = str(uuid.uuid4())
-    reasoning_full = ""
-    content_full = ""
-    tool_calls_acc: dict[int, dict[str, Any]] = {}
-    finish_reason: str | None = None
-
-    publish(task_id, "thinking_delta", {
-        "conv_id": conv_id,
-        "round_idx": round_idx,
-        "role": "agent2",
-        "phase": "reasoning",
-        "delta": "",
-        "iteration": iteration,
-        "verify": True,
-    })
-
-    try:
-        for chunk in client.chat_stream(
-            messages, tools=VERIFIER_TOOL_DEFINITIONS, tool_choice="auto", max_tokens=4096
-        ):
-            if chunk.reasoning_delta:
-                reasoning_full += chunk.reasoning_delta
-                publish(task_id, "thinking_delta", {
-                    "conv_id": conv_id,
-                    "round_idx": round_idx,
-                    "role": "agent2",
-                    "phase": "reasoning",
-                    "delta": chunk.reasoning_delta,
-                    "iteration": iteration,
-                    "verify": True,
-                })
-
-            if chunk.content_delta:
-                content_full += chunk.content_delta
-                publish(task_id, "thinking_delta", {
-                    "conv_id": conv_id,
-                    "round_idx": round_idx,
-                    "role": "agent2",
-                    "phase": "content",
-                    "delta": chunk.content_delta,
-                    "iteration": iteration,
-                    "verify": True,
-                })
-
-            if chunk.tool_call_deltas:
-                for tc_delta in chunk.tool_call_deltas:
-                    idx = tc_delta.index
-                    if idx not in tool_calls_acc:
-                        tool_calls_acc[idx] = {
-                            "id": tc_delta.id or "",
-                            "name": tc_delta.name or "",
-                            "arguments_str": "",
-                            "index": idx,
-                        }
-                    else:
-                        if tc_delta.id and not tool_calls_acc[idx]["id"]:
-                            tool_calls_acc[idx]["id"] = tc_delta.id
-                        if tc_delta.name and not tool_calls_acc[idx]["name"]:
-                            tool_calls_acc[idx]["name"] = tc_delta.name
-                    if tc_delta.arguments_fragment:
-                        tool_calls_acc[idx]["arguments_str"] += tc_delta.arguments_fragment
-
-            if chunk.finish_reason:
-                finish_reason = chunk.finish_reason
-    except Exception as e:
-        logger.exception(f"[task={task_id}] verifier_agent 流式调用失败")
-        publish(task_id, "thinking_delta", {
-            "conv_id": conv_id,
-            "round_idx": round_idx,
-            "role": "agent2",
-            "phase": "error",
-            "delta": f"[验证流式调用失败: {e}]",
-            "iteration": iteration,
-            "verify": True,
-        })
-        raise
-
-    publish(task_id, "thinking_delta", {
-        "conv_id": conv_id,
-        "round_idx": round_idx,
-        "role": "agent2",
-        "phase": "end",
-        "delta": "",
-        "iteration": iteration,
-        "verify": True,
-    })
-
-    tool_calls_full = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
-    return reasoning_full, content_full, tool_calls_full, finish_reason
+    result = stream_llm(
+        client, messages,
+        task_id=task_id, round_idx=round_idx, role="agent2",
+        tools=VERIFIER_TOOL_DEFINITIONS, max_tokens=4096,
+        iteration=iteration,
+        extra={"verify": True},
+        phase_start=False,
+    )
+    return (
+        result.reasoning,
+        result.content,
+        result.tool_calls,
+        result.finish_reason,
+    )
 
 
 # ============================================================
@@ -424,18 +381,21 @@ def _record_verifier_thinking(
     content: str,
     reasoning: str,
 ) -> None:
-    """落库 verifier_agent 的思考/总结(对用户透明,role=agent2, type=thinking)"""
-    from app.models.task import Conversation
-    conv = Conversation(
-        task_id=task.id,
-        round_idx=round_idx,
-        role="agent2",
-        type="thinking",
-        content=f"[验证结果] {content}" if not content.startswith("[验证") else content,
+    """落库 verifier_agent 的思考/总结(runtime.record_conversation 统一实现)
+
+    对用户透明(role=agent2, type=thinking);不推 SSE——流式卡片已展示
+    验证过程,推送会重复(与 react_agent 的 thinking 同策略)。
+    """
+    record_conversation(
+        db, task, round_idx=round_idx,
+        role="agent2", type="thinking",
+        content=(
+            f"[验证结果] {content}"
+            if not content.startswith("[验证") else content
+        ),
         reasoning=reasoning or None,
+        publish_event=False,
     )
-    db.add(conv)
-    db.commit()
 
 
 def _record_verifier_tool_call(
@@ -446,60 +406,31 @@ def _record_verifier_tool_call(
     args: dict[str, Any],
     result: dict[str, Any],
 ) -> None:
-    """落库 verifier_agent 的工具调用 + 结果(对用户透明,role=agent2)"""
-    from app.models.task import Conversation
+    """落库 verifier_agent 的工具调用 + 结果(runtime.record_conversation 统一实现)
 
-    # 工具调用记录
+    对用户透明(role=agent2,事件附 verify=True)。修复:此前落库+推送
+    不带 id / tool_call_id,前端无法把 result 与 call 配对展示;
+    统一后与其他智能体的配对行为一致。
+    """
     intent = _build_tool_intent(tool_name, args)
-    db.add(Conversation(
-        task_id=task.id,
-        round_idx=round_idx,
-        role="agent2",
-        type="tool_call",
+    call_conv = record_conversation(
+        db, task, round_idx=round_idx,
+        role="agent2", type="tool_call",
         content=intent,
-    ))
+        extra_payload={"verify": True},
+    )
 
-    # 工具结果记录(截断防过长)
+    # 工具结果记录(截断防过长),tool_call_id 配对 call
     result_str = json.dumps(result, ensure_ascii=False, default=str)
     if len(result_str) > 5000:
         result_str = result_str[:5000] + "...(已截断)"
-    db.add(Conversation(
-        task_id=task.id,
-        round_idx=round_idx,
-        role="agent2",
-        type="tool_result",
+    record_conversation(
+        db, task, round_idx=round_idx,
+        role="agent2", type="tool_result",
         content=result_str,
-    ))
-    db.commit()
-
-    # 推送 conversation 事件(前端展示工具调用)
-    publish(task.id, "conversation", {
-        "round_idx": round_idx,
-        "role": "agent2",
-        "type": "tool_call",
-        "content": intent,
-        "verify": True,
-    })
-    publish(task.id, "conversation", {
-        "round_idx": round_idx,
-        "role": "agent2",
-        "type": "tool_result",
-        "content": result_str,
-        "verify": True,
-    })
-
-
-def _build_tool_intent(tool_name: str, args: dict[str, Any]) -> str:
-    """生成人类可读的工具调用描述"""
-    if tool_name == "http_request":
-        method = args.get("method", "GET")
-        path = args.get("path", "/")
-        return f"验证请求: {method} {path} [http_request]"
-    elif tool_name == "run_python_code":
-        code = args.get("code", "")
-        first_line = code.split("\n")[0][:100] if code else ""
-        return f"运行 PoC 脚本: {first_line} [run_python_code]"
-    return f"{tool_name}({args})"
+        tool_call_id=str(call_conv.id),
+        extra_payload={"verify": True},
+    )
 
 
 def _publish_verify_end(task_id: Any, round_idx: int) -> None:

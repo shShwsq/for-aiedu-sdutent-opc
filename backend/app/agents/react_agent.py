@@ -32,6 +32,22 @@ from app.perf import perf_log
 from app.tools.schema import execute_tool, get_all_tools, set_current_task
 from app.user_messages import drain_user_messages, has_pending_messages
 
+# 共享运行时原语(runtime 层,agent1 / agent2 / verifier_agent 复用):
+# - _add_conversation:统一落库 + SSE 推送(含 tool_call_id 配对)
+# - _build_tool_intent / _extract_text_tool_calls / _strip_tool_call_blocks:
+#   工具意图生成 + Hermes 风格文本 tool_call 兜底(别名保持原模块名,
+#   存量测试按模块属性导入/替换的兼容面不变)
+# - MAX_HISTORY_MSG_CHARS:与 agent2 同源的截断常量
+# - stream_llm:流式调用本体(下方 _stream_llm_response 是它的薄包装)
+from app.agents.runtime.conversation import record_conversation as _add_conversation
+from app.agents.runtime.constants import MAX_HISTORY_MSG_CHARS
+from app.agents.runtime.llm_stream import (
+    extract_text_tool_calls as _extract_text_tool_calls,
+    strip_tool_call_blocks as _strip_tool_call_blocks,
+    stream_llm,
+)
+from app.agents.runtime.tool_intent import build_tool_intent as _build_tool_intent
+
 logger = logging.getLogger(__name__)
 
 
@@ -155,7 +171,7 @@ status 可选:pending / in_progress / done。后端会解析并推送前端展�
 # 注入当前轮(保留 user/assistant/system 角色边界),用户追问原文作为
 # 最后一条独立 user 消息 —— 对齐 Codex 的"历史 append-only + 用户消息零包装"。
 # 单条历史消息(用户原话 / 执行总结 / 评审反馈)最大字符数,超出截断
-MAX_HISTORY_MSG_CHARS = 3000
+# (常量本体已从 runtime/constants 导入,与 agent2 同源,消除手工同步)
 # 历史记忆 token 预算(CJK 感知粗估,见 _estimate_tokens;
 # 可用环境变量 HISTORY_TOKEN_BUDGET 覆盖,默认 8000)
 MAX_HISTORY_TOKEN_BUDGET = int(os.getenv("HISTORY_TOKEN_BUDGET", "8000"))
@@ -816,265 +832,37 @@ def _stream_llm_response(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
 ) -> tuple[str, str, list[dict[str, Any]], str, str]:
-    """流式调用 LLM,实时推送 thinking_delta 事件
+    """流式调用 LLM(runtime.stream_llm 的薄包装)
+
+    保留模块级包装(而非主循环直连 runtime):签名与返回值保持不变,
+    测试与扩展点仍可按模块属性替换。实际收 chunk / 推 thinking_delta /
+    工具调用跨 chunk 累积 / perf 打点均由 runtime.stream_llm 统一实现。
 
     返回 (reasoning_full, content_full, tool_calls_full, conv_id, finish_reason)
-        - reasoning_full: 完整思考链(供日志/调试,不入 Conversation 表)
-        - content_full: 完整回答内容(落库但不再推 conversation 事件,避免和流式卡片重复)
+        - reasoning_full: 完整思考链(落库供回看)
+        - content_full: 完整回答内容
         - tool_calls_full: 完整工具调用列表
             [{"id": str, "name": str, "arguments_str": str, "index": int}]
         - conv_id: 这次 LLM 调用的标识(供调试/日志,前端不再用于去重)
         - finish_reason: 流结束原因('stop' / 'tool_calls' / 'length' 等),
             供调用方判断"模型是否主动结束"。None 表示异常中断。
     """
-    # 这次 LLM 调用的临时 conv_id(前端按此 key 累积 thinking_delta)
-    conv_id = str(uuid.uuid4())
-    task_id = task.id
-
-    reasoning_full = ""
-    content_full = ""
-    # 工具调用累积:index → {id, name, arguments_str}
-    tool_calls_acc: dict[int, dict[str, Any]] = {}
-    finish_reason: str | None = None
-
-    # 推送流开始事件(前端可以创建占位项,显示"正在生成...")
-    publish(task_id, "thinking_delta", {
-        "conv_id": conv_id,
-        "round_idx": round_idx,
-        "role": "agent1",
-        "phase": "start",
-        "delta": "",
-        "iteration": iteration,
-    })
-
-    try:
-        # [perf] 首 token 延迟(TTFT):从发起流式调用到收到第一个 chunk)
-        _perf_t0 = time.perf_counter()
-        _perf_first_chunk = True
-        for chunk in client.chat_stream(messages, tools=tools, tool_choice="auto", max_tokens=4096):
-            if _perf_first_chunk:
-                _perf_first_chunk = False
-                perf_log(
-                    task_id, "llm_ttft", time.perf_counter() - _perf_t0,
-                    round_idx=round_idx, iteration=iteration,
-                    prompt_chars=sum(len(str(m.get("content") or "")) for m in messages),
-                    tools=len(tools) if tools else 0,
-                )
-            # 思考链增量
-            if chunk.reasoning_delta:
-                reasoning_full += chunk.reasoning_delta
-                publish(task_id, "thinking_delta", {
-                    "conv_id": conv_id,
-                    "round_idx": round_idx,
-                    "role": "agent1",
-                    "phase": "reasoning",
-                    "delta": chunk.reasoning_delta,
-                    "iteration": iteration,
-                })
-
-            # 正式回答增量
-            if chunk.content_delta:
-                content_full += chunk.content_delta
-                publish(task_id, "thinking_delta", {
-                    "conv_id": conv_id,
-                    "round_idx": round_idx,
-                    "role": "agent1",
-                    "phase": "content",
-                    "delta": chunk.content_delta,
-                    "iteration": iteration,
-                })
-
-            # 工具调用增量(跨 chunk 累积)
-            if chunk.tool_call_deltas:
-                for tc_delta in chunk.tool_call_deltas:
-                    idx = tc_delta.index
-                    if idx not in tool_calls_acc:
-                        tool_calls_acc[idx] = {
-                            "id": tc_delta.id or "",
-                            "name": tc_delta.name or "",
-                            "arguments_str": "",
-                            "index": idx,
-                        }
-                    else:
-                        # 后续 chunk 可能补 id / name(理论上第一个 chunk 就有,但保险)
-                        if tc_delta.id and not tool_calls_acc[idx]["id"]:
-                            tool_calls_acc[idx]["id"] = tc_delta.id
-                        if tc_delta.name and not tool_calls_acc[idx]["name"]:
-                            tool_calls_acc[idx]["name"] = tc_delta.name
-                    # 累积 arguments 片段
-                    if tc_delta.arguments_fragment:
-                        tool_calls_acc[idx]["arguments_str"] += tc_delta.arguments_fragment
-
-            # finish_reason 出现,流结束
-            if chunk.finish_reason:
-                finish_reason = chunk.finish_reason
-                logger.info(
-                    f"[task={task.id}] react_agent 流式结束,finish={finish_reason}, "
-                    f"reasoning={len(reasoning_full)}字符, content={len(content_full)}字符, "
-                    f"tool_calls={len(tool_calls_acc)}"
-                )
-        # [perf] 单次流式调用总耗时(含全部 token 生成)
-        perf_log(
-            task_id, "llm_stream_total", time.perf_counter() - _perf_t0,
-            round_idx=round_idx, iteration=iteration,
-            finish=finish_reason or "unknown",
-        )
-    except Exception as e:
-        logger.exception(f"[task={task.id}] react_agent 流式调用失败")
-        # 推送错误 delta
-        publish(task_id, "thinking_delta", {
-            "conv_id": conv_id,
-            "round_idx": round_idx,
-            "role": "agent1",
-            "phase": "error",
-            "delta": f"[流式调用失败: {e}]",
-            "iteration": iteration,
-        })
-        raise
-
-    # 推送流结束事件
-    publish(task_id, "thinking_delta", {
-        "conv_id": conv_id,
-        "round_idx": round_idx,
-        "role": "agent1",
-        "phase": "end",
-        "delta": "",
-        "iteration": iteration,
-    })
-
-    # 按 index 排序输出
-    tool_calls_full = [tool_calls_acc[i] for i in sorted(tool_calls_acc.keys())]
-    return reasoning_full, content_full, tool_calls_full, conv_id, finish_reason
+    result = stream_llm(
+        client, messages,
+        task_id=task.id, round_idx=round_idx, role="agent1",
+        tools=tools, iteration=iteration,
+    )
+    return (
+        result.reasoning,
+        result.content,
+        result.tool_calls,
+        result.conv_id,
+        result.finish_reason,
+    )
 
 
-# ============================================================
-# 辅助函数
-# ============================================================
 
 
-def _build_tool_intent(fn_name: str, fn_args: dict) -> str:
-    """根据工具名+参数生成人类可读的意图说明
-
-    用于工具调用卡片标题,让用户一眼看出"这个工具调用打算做什么"。
-    纯模板映射,不调 LLM。未知工具回退到工具名。
-    末尾追加 [tool_name] 标签:前端用正则提取工具名,用于 plan step 归属推断。
-    (向 qoder CLI agent 看齐:intent 人类可读 + 附带工具分类信息)
-    """
-    if fn_name == "clone_repo":
-        intent = f"克隆仓库 {fn_args.get('repo_url', '?')}"
-    elif fn_name == "list_files":
-        subdir = fn_args.get("subdir", "")
-        intent = f"查看目录结构: {subdir or '根目录'}"
-    elif fn_name == "find_files":
-        intent = f"查找文件: {fn_args.get('pattern', '?')}"
-    elif fn_name == "read_file":
-        intent = f"读取文件 {fn_args.get('file_path', '?')}"
-    elif fn_name == "search_code":
-        intent = f"搜索代码: {fn_args.get('pattern', '?')}"
-    elif fn_name == "query_cve":
-        intent = (
-            f"查询 {fn_args.get('package_name', '?')}@"
-            f"{fn_args.get('version', '?')} 的已知漏洞"
-        )
-    elif fn_name == "list_dependencies":
-        intent = "解析依赖清单"
-    elif fn_name == "run_lint":
-        intent = "运行 lint 静态检查"
-    elif fn_name == "run_coverage":
-        intent = "运行测试并解析覆盖率"
-    elif fn_name == "write_file":
-        mode = fn_args.get("mode", "write")
-        intent = f"{mode == 'append' and '追加' or '写入'}文件 {fn_args.get('file_path', '?')}"
-    elif fn_name == "run_python_code":
-        intent = "执行 Python 代码"
-    elif fn_name == "run_semgrep":
-        intent = "运行 Semgrep 静态分析"
-    elif fn_name == "git_log":
-        fp = fn_args.get("file_path")
-        intent = f"查看提交历史{f': {fp}' if fp else ''}"
-    elif fn_name == "git_blame":
-        fp = fn_args.get("file_path", "?")
-        intent = f"追溯文件来源: {fp}"
-    elif fn_name == "git_diff":
-        base = fn_args.get("base", "HEAD~1")
-        head = fn_args.get("head", "HEAD")
-        intent = f"查看变更 diff: {base}..{head}"
-    elif fn_name == "run_command":
-        cmd = (fn_args.get("command", "") or "")[:40]
-        intent = f"执行命令: {cmd}" if cmd else "执行 shell 命令"
-    elif fn_name == "str_replace_editor":
-        sub = fn_args.get("command", "?")
-        fp = fn_args.get("file_path", "?")
-        intent = {"create": "创建文件", "str_replace": "编辑文件", "insert": "插入内容"}.get(sub, "编辑文件")
-        intent = f"{intent}: {fp}"
-    elif fn_name == "list_skills":
-        intent = "查看可用技能列表"
-    elif fn_name == "skill":
-        intent = f"获取技能指令: {fn_args.get('skill_name', '?')}"
-    else:
-        intent = f"调用 {fn_name}"
-    return f"{intent} [{fn_name}]"
-
-
-# ============================================================
-# 文本 tool_call 兜底解析(GLM/Qwen 等 Hermes 风格)
-# ============================================================
-
-# Hermes 风格文本工具调用:<tool_call>\n{...}\n</tool_call>
-# GLM/Qwen 等在思考模式下可能把工具调用写在正文(而非走结构化 tool_calls 通道)
-# 正则靠 </tool_call> 锚定结束,非贪婪 .*? 可正确处理嵌套 JSON 对象
-_TEXT_TOOL_CALL_RE = re.compile(
-    r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
-    re.DOTALL,
-)
-_TEXT_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*.*?\s*</tool_call>", re.DOTALL)
-
-
-def _extract_text_tool_calls(content: str) -> list[dict[str, Any]]:
-    """从 content 文本解析 Hermes 风格 <tool_call> 块,作为结构化 tool_calls 的兜底
-
-    适配 GLM/Qwen 等模型在思考模式下把工具调用写在正文(而非走 OpenAI
-    function calling 通道)的情况。每个 <tool_call>{...}</tool_call> 块解析为
-    一个工具调用,JSON 不合法的块跳过。
-
-    返回 [{"id": str, "name": str, "arguments_str": str, "index": int}]
-    无匹配返回空列表。
-    """
-    matches = _TEXT_TOOL_CALL_RE.findall(content)
-    if not matches:
-        return []
-
-    result: list[dict[str, Any]] = []
-    for i, json_str in enumerate(matches):
-        try:
-            parsed = json.loads(json_str)
-        except json.JSONDecodeError:
-            continue
-        name = parsed.get("name")
-        if not name:
-            continue
-        # arguments 字段(部分模型用 parameters)可能是 dict 或 str,统一成 str
-        args = parsed.get("arguments", parsed.get("parameters", {}))
-        if isinstance(args, dict):
-            args_str = json.dumps(args, ensure_ascii=False)
-        else:
-            args_str = str(args)
-        result.append({
-            "id": f"text_tc_{i}_{uuid.uuid4().hex[:8]}",
-            "name": name,
-            "arguments_str": args_str,
-            "index": i,
-        })
-    return result
-
-
-def _strip_tool_call_blocks(content: str) -> str:
-    """从 content 剥离 <tool_call>...</tool_call> 文本块
-
-    兜底解析后用于清理 messages 上下文里的 content,避免下一轮 LLM 重复看到
-    工具调用文本。落库的 thinking 保留原文(便于排查)。
-    """
-    return _TEXT_TOOL_CALL_BLOCK_RE.sub("", content).strip()
 
 
 # 计划清单提取:<plan>...</plan> 块,支持两种格式:
@@ -1875,47 +1663,3 @@ def precompress_history_for_next_round(
         logger.warning(f"[task={task_id}] 预压缩历史失败(忽略,追问时兜底压缩): {e}")
 
 
-def _add_conversation(
-    db: Session, task: Task, *, round_idx: int, role: str, type: str, content: str,
-    reasoning: str | None = None,
-    tool_call_id: str | None = None,
-    publish_event: bool = True,
-) -> Conversation:
-    """记录一条对话(带 round_idx),可选推送事件给前端 SSE
-
-    参数:
-        reasoning: 思考链(仅 type=thinking 有,模型 reasoning_content 输出)
-        tool_call_id: 仅 type=tool_result 用,对应 tool_call 会话记录的 id,
-            前端据此配对展示(并行调用时 result 不再紧跟 call 落库)
-        publish_event: 是否推送 conversation 事件给前端。
-            - True(默认):工具调用/结果/提交/用户指令/agent2 评估等,
-              前端通过 SSE 实时追加到对话列表
-            - False:react_agent 的 type=thinking 不推 SSE,
-              因为流式卡片已经完整展示了 content + reasoning,
-              再推会重复。迟到订阅者通过 GET /tasks/{id} 快照拿完整对话。
-
-    返回创建的 Conversation 对象(供调用方拿 id,如 tool_result 关联 tool_call)。
-    """
-    conv = Conversation(
-        task_id=task.id,
-        round_idx=round_idx,
-        role=role,
-        type=type,
-        content=content,
-        reasoning=reasoning,
-        tool_call_id=tool_call_id,
-    )
-    db.add(conv)
-    db.commit()
-    db.refresh(conv)
-    if publish_event:
-        publish(task.id, "conversation", {
-            "id": str(conv.id),
-            "round_idx": conv.round_idx,
-            "role": conv.role,
-            "type": conv.type,
-            "content": conv.content,
-            "tool_call_id": conv.tool_call_id,
-            "created_at": conv.created_at.isoformat() if conv.created_at else None,
-        })
-    return conv

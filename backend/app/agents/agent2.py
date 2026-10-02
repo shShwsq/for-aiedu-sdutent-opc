@@ -39,7 +39,6 @@
 """
 import json
 import logging
-import uuid
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -47,8 +46,17 @@ from uuid import UUID
 from json_repair import repair_json
 from sqlalchemy.orm import Session
 
+# 共享运行时原语(runtime 层):与 react_agent / verifier_agent 同源的
+# 流式调用、落库推送、工具意图、截断常量——消除三处手抄实现
+from app.agents.runtime.conversation import record_conversation
+from app.agents.runtime.constants import MAX_HISTORY_MSG_CHARS, MAX_HISTORY_TOTAL_CHARS
+from app.agents.runtime.llm_stream import (
+    extract_text_tool_calls,
+    stream_llm,
+    strip_tool_call_blocks,
+)
+from app.agents.runtime.tool_intent import build_tool_intent
 from app.domain_events import VERIFIER_COMPLETED, emit
-from app.event_bus import publish
 from app.llm.client import LLMClient
 from app.models.task import Conversation, Task
 
@@ -60,10 +68,8 @@ logger = logging.getLogger(__name__)
 # 保留仅为兼容外部导入(如有),新代码勿用
 MAX_ROUNDS = 2
 
-# 跨轮记忆传递:agent2 之前各轮评估的单条最大字符数与总字符数上限
-# 与 agent1 的对应常量保持一致,避免两边不一致
-MAX_HISTORY_MSG_CHARS = 3000
-MAX_HISTORY_TOTAL_CHARS = 12000
+# 跨轮记忆传递的截断上限:常量本体从 runtime/constants 导入
+# (与 react_agent 同源,消除两边"手工保持一致"的负担)
 
 # 解析失败兜底时,展示在最终总结里的 agent2 输出原文截断上限
 MAX_RAW_OUTPUT_CHARS = 3000
@@ -690,6 +696,23 @@ def run_agent2(
         if reasoning_chunk:
             reasoning_parts.append(reasoning_chunk)
 
+        # 兜底:结构化 tool_calls 为空但 content 里有 Hermes 风格文本
+        # 工具调用块(GLM/Qwen 思考模式把工具调用写在正文,而非走结构化
+        # 通道)。react_agent 早已处理,agent2 此前缺失 → 这类模型下工具
+        # 调用被当成最终 JSON 解析,审查必然 parse_failed。
+        # 与 react_agent 共用 runtime 的同一解析,兜底后才判"无工具调用"。
+        if not tool_calls and content:
+            text_tool_calls = extract_text_tool_calls(content)
+            if text_tool_calls:
+                logger.info(
+                    f"[task={task_id}] agent2 从 content 解析出 "
+                    f"{len(text_tool_calls)} 个文本 tool_call(兜底)"
+                )
+                tool_calls = text_tool_calls
+                # 从 content 剥离工具调用文本块(与 react_agent 同策略:
+                # 避免下一轮 LLM 重复看到;落库的思考链保留原文)
+                content = strip_tool_call_blocks(content)
+
         # 无工具调用 → content 是 JSON 评估结果,跳出循环
         if not tool_calls:
             break
@@ -942,26 +965,6 @@ def run_agent2(
 # ============================================================
 
 
-def _publish_conversation(task: Task, conv: Conversation) -> None:
-    """把 agent2 落库的对话记录实时推给前端 SSE
-
-    与 orchestrator._add_conversation 的推送格式一致(额外带 tool_call_id,
-    供侧栏把 tool_result 与 tool_call 配对)。此前 agent2 的只读/引用核查工具
-    仅落库不推事件,导致运行中侧栏只见思考、工具步骤要等审查结束 refetch 才出现;
-    实时推送后"过程中"与"结束后"展示一致。
-    """
-    publish(task.id, "conversation", {
-        "id": str(conv.id),
-        "round_idx": conv.round_idx,
-        "role": conv.role,
-        "type": conv.type,
-        "content": conv.content,
-        "reasoning": conv.reasoning,
-        "tool_call_id": conv.tool_call_id,
-        "created_at": conv.created_at.isoformat() if conv.created_at else None,
-    })
-
-
 def _execute_read_tool(
     fn_name: str,
     args: dict[str, Any],
@@ -978,29 +981,17 @@ def _execute_read_tool(
     """
     from app.tools import sandbox_tools
 
-    # 工具意图(前端卡片首行)
-    intent_map = {
-        "read_file": f"核对文件 {args.get('file_path', '?')}",
-        "list_files": f"查看目录结构: {args.get('subdir') or '根目录'}",
-        "find_files": f"查找文件: {args.get('pattern', '?')}",
-        "search_code": f"搜索代码: {args.get('pattern', '?')}",
-    }
-    intent = f"[agent2 质检] {intent_map.get(fn_name, fn_name)} [{fn_name}]"
+    # 工具意图(前端卡片首行):runtime 统一注册表 + agent2 质检前缀
+    intent = build_tool_intent(fn_name, args, prefix="[agent2 质检]")
 
     call_conv = None
     if db is not None and task is not None:
         try:
-            call_conv = Conversation(
-                task_id=task.id,
-                round_idx=round_idx,
-                role="agent2",
-                type="tool_call",
+            call_conv = record_conversation(
+                db, task, round_idx=round_idx,
+                role="agent2", type="tool_call",
                 content=f"{intent}\n{json.dumps(args, ensure_ascii=False, indent=2)}",
             )
-            db.add(call_conv)
-            db.commit()
-            db.refresh(call_conv)
-            _publish_conversation(task, call_conv)
         except Exception as e:
             logger.warning(f"[task={task_id}] 落库 agent2 工具调用失败(忽略): {e}")
 
@@ -1048,18 +1039,12 @@ def _execute_read_tool(
 
     if db is not None and task is not None and call_conv is not None:
         try:
-            result_conv = Conversation(
-                task_id=task.id,
-                round_idx=round_idx,
-                role="agent2",
-                type="tool_result",
+            record_conversation(
+                db, task, round_idx=round_idx,
+                role="agent2", type="tool_result",
                 content=result_str,
                 tool_call_id=str(call_conv.id),
             )
-            db.add(result_conv)
-            db.commit()
-            db.refresh(result_conv)
-            _publish_conversation(task, result_conv)
         except Exception as e:
             logger.warning(f"[task={task_id}] 落库 agent2 工具结果失败(忽略): {e}")
 
@@ -1101,22 +1086,16 @@ def _execute_reference_tool(
 
     url = str(args.get("url", ""))
     claim = str(args.get("claim", ""))
-    intent = f"[agent2 质检] 复核引用: {url[:120]} [check_reference]"
+    intent = build_tool_intent("check_reference", args, prefix="[agent2 质检]")
 
     call_conv = None
     if db is not None and task is not None:
         try:
-            call_conv = Conversation(
-                task_id=task.id,
-                round_idx=round_idx,
-                role="agent2",
-                type="tool_call",
+            call_conv = record_conversation(
+                db, task, round_idx=round_idx,
+                role="agent2", type="tool_call",
                 content=f"{intent}\n{json.dumps(args, ensure_ascii=False, indent=2)}",
             )
-            db.add(call_conv)
-            db.commit()
-            db.refresh(call_conv)
-            _publish_conversation(task, call_conv)
         except Exception as e:
             logger.warning(f"[task={task_id}] 落库 agent2 引用复核调用失败(忽略): {e}")
 
@@ -1136,18 +1115,12 @@ def _execute_reference_tool(
 
     if db is not None and task is not None and call_conv is not None:
         try:
-            result_conv = Conversation(
-                task_id=task.id,
-                round_idx=round_idx,
-                role="agent2",
-                type="tool_result",
+            record_conversation(
+                db, task, round_idx=round_idx,
+                role="agent2", type="tool_result",
                 content=result_str,
                 tool_call_id=str(call_conv.id),
             )
-            db.add(result_conv)
-            db.commit()
-            db.refresh(result_conv)
-            _publish_conversation(task, result_conv)
         except Exception as e:
             logger.warning(f"[task={task_id}] 落库 agent2 引用复核结果失败(忽略): {e}")
 
@@ -1173,95 +1146,27 @@ def _stream_agent2_llm(
     round_idx: int = 0,
     tools: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[dict[str, Any]], str]:
-    """流式调用 agent2 的 LLM,实时推送 thinking_delta 事件
+    """流式调用 agent2 的 LLM(runtime.stream_llm 的薄包装)
 
-    支持工具调用(只读核查 / verify):tools 非空时传入 LLM,
-    返回的 tool_calls 供调用方处理。
-    无 tools 时行为与原来一致(只产出 reasoning + content)。
+    保留模块级包装(而非主循环直连 runtime):签名与返回值保持不变,
+    存量测试按模块属性替换的兼容面不变。收 chunk / 推 thinking_delta /
+    工具调用跨 chunk 累积 / perf 打点由 runtime.stream_llm 统一实现。
+
+    agent2 特有行为经参数表达:
+    - role="agent2"(侧栏按 role 分流到 Agent2Panel)
+    - max_tokens=UA_EVAL_MAX_TOKENS(done 时需输出 results+grouping 大 JSON)
+    - publish_content=False:content 是最终评估 JSON,不进流式卡片,
+      侧栏只展示思考链(reasoning)
 
     返回 (content_full, tool_calls_full, reasoning_full)
-        - content_full: 完整回答内容(JSON 格式的结构化评估结果)
-        - tool_calls_full: 工具调用列表 [{"id", "name", "arguments_str", "index"}]
-        - reasoning_full: 完整思考链(调用方落库,供前端刷新后还原思考卡片)
     """
-    conv_id = str(uuid.uuid4())
-    reasoning_full = ""
-    content_full = ""
-    tool_calls_acc: dict[int, dict[str, Any]] = {}
-
-    # 推送流开始事件
-    publish(task_id, "thinking_delta", {
-        "conv_id": conv_id,
-        "round_idx": round_idx,
-        "role": "agent2",
-        "phase": "start",
-        "delta": "",
-    })
-
-    try:
-        for chunk in client.chat_stream(messages, tools=tools, tool_choice="auto", max_tokens=UA_EVAL_MAX_TOKENS):
-            # 思考链增量(推给前端流式卡片显示)
-            if chunk.reasoning_delta:
-                reasoning_full += chunk.reasoning_delta
-                publish(task_id, "thinking_delta", {
-                    "conv_id": conv_id,
-                    "round_idx": round_idx,
-                    "role": "agent2",
-                    "phase": "reasoning",
-                    "delta": chunk.reasoning_delta,
-                })
-
-            # 正式回答增量(JSON 结构化评估结果)
-            if chunk.content_delta:
-                content_full += chunk.content_delta
-
-            # 工具调用增量(跨 chunk 累积)
-            if chunk.tool_call_deltas:
-                for tc_delta in chunk.tool_call_deltas:
-                    idx = tc_delta.index
-                    if idx not in tool_calls_acc:
-                        tool_calls_acc[idx] = {
-                            "id": tc_delta.id or "",
-                            "name": tc_delta.name or "",
-                            "arguments_str": "",
-                            "index": idx,
-                        }
-                    else:
-                        if tc_delta.id and not tool_calls_acc[idx]["id"]:
-                            tool_calls_acc[idx]["id"] = tc_delta.id
-                        if tc_delta.name and not tool_calls_acc[idx]["name"]:
-                            tool_calls_acc[idx]["name"] = tc_delta.name
-                    if tc_delta.arguments_fragment:
-                        tool_calls_acc[idx]["arguments_str"] += tc_delta.arguments_fragment
-
-            if chunk.finish_reason:
-                logger.debug(
-                    f"[task={task_id}] agent2 流式结束,finish={chunk.finish_reason}, "
-                    f"reasoning={len(reasoning_full)}字符, content={len(content_full)}字符, "
-                    f"tool_calls={len(tool_calls_acc)}"
-                )
-    except Exception as e:
-        logger.exception(f"[task={task_id}] agent2 流式调用失败")
-        publish(task_id, "thinking_delta", {
-            "conv_id": conv_id,
-            "round_idx": round_idx,
-            "role": "agent2",
-            "phase": "error",
-            "delta": f"[流式调用失败: {e}]",
-        })
-        raise
-
-    # 推送流结束事件
-    publish(task_id, "thinking_delta", {
-        "conv_id": conv_id,
-        "round_idx": round_idx,
-        "role": "agent2",
-        "phase": "end",
-        "delta": "",
-    })
-
-    tool_calls_full = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
-    return content_full, tool_calls_full, reasoning_full
+    result = stream_llm(
+        client, messages,
+        task_id=task_id, round_idx=round_idx, role="agent2",
+        tools=tools, max_tokens=UA_EVAL_MAX_TOKENS,
+        publish_content=False,
+    )
+    return result.content, result.tool_calls, result.reasoning
 
 
 # ============================================================
