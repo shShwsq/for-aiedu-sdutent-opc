@@ -30,6 +30,9 @@ from app.perf import perf_log, perf_timer
 from app.sandbox.client import SandboxSession, check_local_write_permission, create_sandbox
 from app.services.repo_cache import cache_key as repo_cache_key
 from app.services.repo_cache import ensure_bare_cache, sandbox_mount
+# 上传布局纯函数(单一来源:沙箱拷贝与工作区回退浏览共用,布局不一致则回退路径全错)
+from app.services.upload_layout import SKIP_DIRS_LIST as _SKIP_DIRS_LIST
+from app.services.upload_layout import safe_dirname as _safe_dirname
 from app.user_interaction import (
     request_command_confirm,
     wait_for_command_confirm,
@@ -494,18 +497,6 @@ def clone_repo(repo_url: str, branch: str | None = None, task_id: str = "", git_
     return clone_repo_with_fallback(repo_url, branch, task_id, git_tokens or {})
 
 
-def _safe_dirname(name: str, fallback: str = "upload") -> str:
-    """把任意文件名清洗为安全的单层目录名(追问多文件防碰撞用)
-
-    只保留字母数字与 . _ -,其余换为 _;剔除 .. / 前后缀 dot;限长 80。
-    """
-    base = (name or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
-    base = base.replace("..", "_")
-    cleaned = "".join(c if (c.isalnum() or c in "._-") else "_" for c in base)
-    cleaned = cleaned.strip("._")
-    return (cleaned or fallback)[:80]
-
-
 def _copy_local_dir_into_workspace(
     ctx: dict[str, Any], src_local: Path, dest_path: str, clear_dest: bool,
 ) -> str:
@@ -644,8 +635,13 @@ def add_uploads_to_workspace(
     - 不清空现有内容(每个上传落入 {repo_path}/{dest_subdir}/{i}-{name}/ 独立子目录);
     - git 工作区把 {dest_subdir}/ 写入 .git/info/exclude,不进 diff。
 
+    调用方按 params.followup_upload_ids 全量累积列表传入(全局下标),
+    与沙箱回收后的重放 / 工作区回退浏览共用同一布局约定。
     供运行中追问(react_agent drain)与完成后 resume 共用。
     工作区未就绪(repo_path 为空)时抛 RuntimeError,由调用方处置。
+
+    单个上传传输失败(如已被 GC 清理)仅跳过该上传并记 warning,不阻断
+    其余上传 —— 全量重放语义下,一个过期旧附件不应拖垮本轮新文件。
     """
     from app.services.uploads import load_upload_meta, materialize_upload_files
 
@@ -668,10 +664,15 @@ def add_uploads_to_workspace(
             dest_abs = str(Path(repo_path) / dest_rel)
         else:
             dest_abs = f"{repo_path.rstrip('/')}/{dest_rel}"
-        with materialize_upload_files(uid) as files_dir:
-            _copy_local_dir_into_workspace(ctx, files_dir, dest_abs, clear_dest=True)
-        added.append(dest_rel)
-        logger.info(f"[uploads] 追问文件已追加: task={task_id}, upload_id={uid}, dest={dest_abs}")
+        try:
+            with materialize_upload_files(uid) as files_dir:
+                _copy_local_dir_into_workspace(ctx, files_dir, dest_abs, clear_dest=True)
+            added.append(dest_rel)
+            logger.info(f"[uploads] 追问文件已追加: task={task_id}, upload_id={uid}, dest={dest_abs}")
+        except Exception as e:
+            logger.warning(
+                f"[uploads] 追问文件传输失败(跳过该上传): task={task_id}, upload_id={uid}, err={e}"
+            )
 
     _exclude_from_git(ctx, repo_path, dest_subdir)
     return added
@@ -1021,14 +1022,6 @@ def _clone_repo_sandbox(
     files_count = int(session.run_command(count_cmd).strip() or "0")
 
     return {"path": repo_dir, "files_count": files_count}
-
-
-# 噪声目录:列出仓库结构时跳过(参考 Claude Code LS 的 ignore 设计)
-_SKIP_DIRS_LIST = {
-    ".git", "node_modules", "__pycache__", ".venv", "venv",
-    ".idea", ".vscode", ".pytest_cache", ".mypy_cache", ".ruff_cache",
-    "dist", "build", ".next", ".nuxt", "target",
-}
 
 
 # ============================================================

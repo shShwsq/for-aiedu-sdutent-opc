@@ -5,6 +5,8 @@
  * - GET /tasks/{id}/workspace          工作区信息
  * - GET /tasks/{id}/workspace/files    列出目录
  * - GET /tasks/{id}/workspace/file     读取文件
+ * - GET /tasks/{id}/workspace/uploads/tree 沙箱过期后回退浏览用户上传文件树
+ * - GET /tasks/{id}/workspace/uploads/file 回退读取上传文件内容
  * - POST /tasks/{id}/workspace/restore 过期工作区重新 clone
  */
 import client from './client'
@@ -14,6 +16,7 @@ import type {
   WorkspaceInfo,
   WorkspaceRestoreResponse,
   WorkspaceTreeResponse,
+  WorkspaceUploadsTreeResponse,
 } from '@/types/workspace'
 
 /** 获取工作区信息(是否可浏览) */
@@ -50,6 +53,30 @@ export function readWorkspaceFile(
 ): Promise<WorkspaceFileResponse> {
   return client
     .get(`/tasks/${taskId}/workspace/file`, {
+      params: { path, offset, max_lines: maxLines },
+    })
+    .then((r) => r.data)
+}
+
+/** 沙箱过期后回退浏览:拉用户上传文件树(不经过沙箱,保留期内内容可读) */
+export function getWorkspaceUploadsTree(
+  taskId: string,
+  refresh: boolean = false,
+): Promise<WorkspaceUploadsTreeResponse> {
+  return client
+    .get(`/tasks/${taskId}/workspace/uploads/tree`, { params: { refresh } })
+    .then((r) => r.data)
+}
+
+/** 沙箱过期后回退浏览:读用户上传文件内容(原始文本 + 分页) */
+export function readWorkspaceUploadsFile(
+  taskId: string,
+  path: string,
+  offset: number = 1,
+  maxLines: number = 500,
+): Promise<WorkspaceFileResponse> {
+  return client
+    .get(`/tasks/${taskId}/workspace/uploads/file`, {
       params: { path, offset, max_lines: maxLines },
     })
     .then((r) => r.data)

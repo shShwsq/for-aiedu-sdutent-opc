@@ -445,6 +445,10 @@ def run_react_agent(
                 )
             # 本批消息附带的上传文件:传输进工作区 followup_uploads/(不重定向
             # repo_path),并把目录级提示并入注入文本,让模型感知新文件。
+            # 布局约定:按 params.followup_upload_ids **全量累积列表**传输(全局
+            # 下标),与沙箱回收后的重放 / 工作区回退浏览同一布局 —— 本轮新 ids
+            # 先并入 params 再传,保证三处路径一致;单个上传失败由
+            # add_uploads_to_workspace 逐上传容错(旧附件被 GC 不阻断新文件)。
             # 传输失败 catch+log,不中断本轮(文字消息照常注入)。
             attachment_note = ""
             batch_upload_ids: list[str] = []
@@ -453,10 +457,24 @@ def run_react_agent(
                     if uid and uid not in batch_upload_ids:
                         batch_upload_ids.append(uid)
             if batch_upload_ids:
+                from app.services.upload_layout import extract_followup_ids
+
+                existing = extract_followup_ids(task.params)
+                merged = existing + [u for u in batch_upload_ids if u not in existing]
+                # 持久化累积(非 JSONB 突变):params 是重放与回退浏览的唯一真源,
+                # 先落库再传输(传输失败也不丢重放依据)
+                task.params = {**(task.params or {}), "followup_upload_ids": merged}
+                try:
+                    db.commit()
+                except Exception as e:
+                    logger.warning(
+                        f"[task={task.id}] 追问上传累积落库失败(忽略): {e}"
+                    )
+                    db.rollback()
                 try:
                     from app.tools import sandbox_tools
                     sandbox_tools.add_uploads_to_workspace(
-                        task_id_str, batch_upload_ids, "followup_uploads"
+                        task_id_str, merged, "followup_uploads"
                     )
                     attachment_note = (
                         "\n\n[用户本轮附带了新文件,已放入工作区 followup_uploads/ 目录,"

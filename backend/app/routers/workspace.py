@@ -3,18 +3,29 @@
 让前端在任务详情页浏览 react_agent clone 的工作区文件结构、查看文件内容。
 
 端点:
-- GET /tasks/{task_id}/workspace          工作区信息(是否可用、repo_path)
+- GET /tasks/{task_id}/workspace          工作区信息(是否可用、repo_path、has_uploads)
 - GET /tasks/{task_id}/workspace/files    列出目录(懒加载树,单层)
 - GET /tasks/{task_id}/workspace/tree     整树快照(首屏一次拉取,带短 TTL 缓存)
 - GET /tasks/{task_id}/workspace/file     读取文件内容(原始文本 + 分页,前端自行渲染行号)
+- GET /tasks/{task_id}/workspace/uploads/tree 沙箱过期后回退浏览用户上传文件树
+- GET /tasks/{task_id}/workspace/uploads/file 回退读取上传文件内容(同 workspace/file 形状)
 - POST /tasks/{task_id}/workspace/restore 过期工作区重新 clone(做题页代码栏一键恢复)
 
 session 生命周期:
 - 任务运行中:clone 完成后即可浏览
 - 任务完成后:session 保留 1 小时(TTL),供用户回看
 - 超时后惰性清理(下次访问任意 workspace 端点时触发)
+
+上传回退浏览(uploads/tree / uploads/file):
+- 沙箱 session 过期后,仓库代码可 restore 重 clone,但用户上传是不可再生的
+  用户资产 —— 回退端点直接从上传存储(local 目录 / S3)按 upload_layout
+  布局拼出与沙箱树同构的文件树,不经过沙箱
+- 内容可读期与上传保留策略一致(默认 30 天 GC,见 upload_gc.py);
+  已被 GC 的上传在树中以"已清理"占位展示
+- upload_id 只从 task.params 解析(不接受前端指定,防 IDOR)
 """
 import logging
+import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -24,10 +35,27 @@ from app.database import get_db
 from app.deps import get_optional_user
 from app.models.task import Task
 from app.models.user import User
+from app.services.upload_layout import (
+    UploadSlot,
+    compute_upload_layout,
+    extract_creation_ids,
+    extract_followup_ids,
+    resolve_path,
+)
+from app.services.upload_storage import get_backend
+from app.services.uploads import UploadError, load_upload_meta
 from app.tools import sandbox_tools
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["workspace"])
+
+# 上传回退树缓存:task_id -> (写入时间戳, payload),短 TTL 缓解 S3 多页 list 压力
+# (与 sandbox_tools._tree_cache 同模式;上传内容不可变,GC 后 30s 内可能读到陈旧树,可接受)
+_UPLOADS_TREE_CACHE_TTL = 30.0
+_uploads_tree_cache: dict[str, tuple[float, dict]] = {}
+
+# 回退读取单文件大小上限:S3 需整对象下载,超限文件不提供在线查看
+_UPLOADS_READ_MAX_BYTES = 5 * 1024 * 1024
 
 
 def _check_task_access(
@@ -46,6 +74,23 @@ def _check_task_access(
     return task
 
 
+def _task_upload_slots(task: Task) -> list[UploadSlot]:
+    """从 task.params 解析上传槽位布局(回退树/读文件共用)
+
+    meta 加载失败(被 GC)不影响布局:槽位名回退 uid 前缀,与传输侧
+    meta 加载失败时的命名一致;是否存在由调用方经 backend.exists 判断。
+    """
+    creation_ids = extract_creation_ids(task.params)
+    followup_ids = extract_followup_ids(task.params)
+    metas: dict[str, dict] = {}
+    for uid in creation_ids + followup_ids:
+        try:
+            metas[uid] = load_upload_meta(uid)
+        except UploadError:
+            metas[uid] = {}
+    return compute_upload_layout(creation_ids, followup_ids, metas)
+
+
 @router.get("/tasks/{task_id}/workspace")
 def get_workspace(
     task_id: uuid.UUID,
@@ -59,15 +104,27 @@ def get_workspace(
     - repo_path: 工作区路径
     - completed: 任务是否已完成
     - mode: sandbox/local
+    - has_uploads: 任务是否带用户上传(沙箱过期后前端回退浏览的依据;零存储访问)
     """
-    _check_task_access(task_id, db, current_user)
+    task = _check_task_access(task_id, db, current_user)
 
     # 惰性清理过期 session
     sandbox_tools.cleanup_expired_sessions_bg()
 
+    has_uploads = bool(
+        extract_creation_ids(task.params) or extract_followup_ids(task.params)
+    )
+
     info = sandbox_tools.get_workspace_info(str(task_id))
     if info is None:
-        return {"available": False, "reason": "工作区不可用(任务未 clone 仓库或会话已过期)"}
+        return {
+            "available": False,
+            "reason": "工作区不可用(任务未 clone 仓库或会话已过期)",
+            "repo_path": "",
+            "completed": False,
+            "mode": "",
+            "has_uploads": has_uploads,
+        }
 
     repo_path = info.get("repo_path", "")
     return {
@@ -76,6 +133,7 @@ def get_workspace(
         "repo_path": repo_path,
         "completed": info.get("completed", False),
         "mode": info.get("mode", ""),
+        "has_uploads": has_uploads,
     }
 
 
@@ -177,6 +235,153 @@ def read_workspace_file(
     except Exception as e:
         logger.exception(f"[task={task_id}] 读取工作区文件失败: path={path}")
         raise HTTPException(status_code=500, detail=f"读取文件失败: {e}")
+
+
+@router.get("/tasks/{task_id}/workspace/uploads/tree")
+def get_workspace_uploads_tree(
+    task_id: uuid.UUID,
+    max_entries: int = Query(default=3000, ge=100, le=10000, description="最大条目数"),
+    refresh: bool = Query(default=False, description="绕过缓存强制重建"),
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_optional_user),
+) -> dict:
+    """沙箱过期后回退浏览:用户上传文件树(不经过沙箱)
+
+    路径布局与沙箱树同构(相对工作根,见 upload_layout):
+    - 单创建上传 → 文件平铺根;多创建上传 → {i}-{name}/;追问 → followup_uploads/{i}-{name}/
+
+    返回:
+    {
+        "entries": [{"path": "0-报告.zip/doc.md", "type": "file"|"dir"}, ...],
+        "truncated": bool,
+        "max_depth": int,   # 快照实际覆盖深度(前端建树用)
+        "unavailable": ["1-旧附件.zip"],  # 已被 GC 清理的上传占位标签
+    }
+    """
+    task = _check_task_access(task_id, db, current_user)
+    sandbox_tools.cleanup_expired_sessions_bg()
+
+    cached = _uploads_tree_cache.get(str(task_id))
+    if not refresh and cached is not None and time.time() - cached[0] < _UPLOADS_TREE_CACHE_TTL:
+        return cached[1]
+
+    try:
+        payload = _build_uploads_tree(task, max_entries)
+    except Exception as e:
+        logger.exception(f"[task={task_id}] 获取上传文件树失败")
+        raise HTTPException(status_code=500, detail=f"获取上传文件树失败: {e}")
+
+    _uploads_tree_cache[str(task_id)] = (time.time(), payload)
+    return payload
+
+
+def _build_uploads_tree(task: Task, max_entries: int) -> dict:
+    """按槽位布局拼接各上传的文件树(available 判定 + unavailable 占位)"""
+    backend = get_backend()
+    slots = _task_upload_slots(task)
+    entries: list[dict] = []
+    unavailable: list[str] = []
+    truncated = False
+    max_depth = 1
+
+    for slot in slots:
+        try:
+            exists = backend.exists(slot.upload_id)
+        except UploadError as e:
+            logger.warning(f"[task={task.id}] 检查上传失败(按已清理处理): {e}")
+            exists = False
+        if not exists:
+            # 平铺根槽位(单创建上传)无前缀,占位标签用 uid 前缀
+            unavailable.append(slot.prefix or f"上传文件({slot.upload_id[:12]})")
+            continue
+        try:
+            files = backend.list_files(slot.upload_id)
+        except UploadError as e:
+            logger.warning(f"[task={task.id}] 列出上传文件失败(按已清理处理): {e}")
+            unavailable.append(slot.prefix or f"上传文件({slot.upload_id[:12]})")
+            continue
+        for f in files:
+            path = f"{slot.prefix}/{f['path']}" if slot.prefix else f["path"]
+            entries.append({"path": path, "type": f["type"]})
+            max_depth = max(max_depth, path.count("/") + 1)
+            if len(entries) > max_entries:
+                truncated = True
+                break
+        if truncated:
+            break
+
+    entries.sort(key=lambda e: e["path"])
+    return {
+        "entries": entries[:max_entries],
+        "truncated": truncated,
+        "max_depth": max_depth,
+        "unavailable": unavailable,
+    }
+
+
+@router.get("/tasks/{task_id}/workspace/uploads/file")
+def read_workspace_uploads_file(
+    task_id: uuid.UUID,
+    path: str = Query(..., description="工作根内上传文件相对路径"),
+    offset: int = Query(default=1, ge=1, description="起始行号(1-based)"),
+    max_lines: int = Query(default=500, ge=1, le=2000, description="最多返回行数"),
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_optional_user),
+) -> dict:
+    """沙箱过期后回退读取上传文件内容(原始文本 + 分页)
+
+    响应形状与 /workspace/file 一致(content 无行号,前端自行渲染行号列);
+    二进制文件返回占位文案;超过 5MB 的文件不提供在线查看(400)。
+    """
+    task = _check_task_access(task_id, db, current_user)
+    sandbox_tools.cleanup_expired_sessions_bg()
+
+    resolved = resolve_path(_task_upload_slots(task), path)
+    if resolved is None:
+        raise HTTPException(status_code=404, detail=f"文件不存在: {path}")
+    upload_id, relpath = resolved
+
+    backend = get_backend()
+    try:
+        size = backend.stat_file(upload_id, relpath)
+        if size > _UPLOADS_READ_MAX_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"文件过大({size // (1024 * 1024)}MB),仅支持在线查看不超过 5MB 的文件",
+            )
+        data = backend.read_file(upload_id, relpath)
+    except UploadError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    # 解码 + 分页语义与 sandbox_tools._read_file_local 一致
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return {
+            "path": path,
+            "content": "(二进制文件,无法显示)",
+            "start_line": 0,
+            "end_line": 0,
+            "total_lines": 0,
+            "truncated": False,
+        }
+
+    all_lines = text.splitlines()
+    total_lines = len(all_lines)
+    start_idx = max(0, min(offset - 1, total_lines))
+    end_idx = min(start_idx + max_lines, total_lines)
+    selected = all_lines[start_idx:end_idx]
+    start_line = start_idx + 1
+    end_line = start_idx + len(selected)
+
+    return {
+        "path": path,
+        "content": "\n".join(selected),
+        "start_line": start_line,
+        "end_line": end_line,
+        "total_lines": total_lines,
+        "truncated": end_line < total_lines,
+    }
 
 
 @router.post("/tasks/{task_id}/workspace/restore")

@@ -26,6 +26,8 @@ export interface WorkspaceInfo {
   repo_path: string
   completed: boolean
   mode: string
+  /** 任务是否带用户上传(沙箱过期后前端回退浏览的依据;旧后端无此字段) */
+  has_uploads?: boolean
 }
 
 /** 工作区恢复(POST /tasks/{id}/workspace/restore)的响应 */
@@ -48,6 +50,12 @@ export interface WorkspaceTreeResponse {
   truncated: boolean
   /** 快照实际覆盖深度(降级时可能小于请求值) */
   max_depth: number
+}
+
+/** 沙箱过期后回退浏览的用户上传文件树响应(GET .../workspace/uploads/tree) */
+export interface WorkspaceUploadsTreeResponse extends WorkspaceTreeResponse {
+  /** 已被 GC 清理的上传占位标签(展示"已清理"标记) */
+  unavailable: string[]
 }
 
 /** 读取文件的响应 */

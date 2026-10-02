@@ -1366,35 +1366,26 @@ def _prepare_repo_context(
 
 
 def _creation_upload_ids(params: dict | None) -> list[str]:
-    """创建时上传的 upload_id 列表(合并 legacy 单数 upload_id + upload_ids,去重保序)
+    """创建时上传的 upload_id 列表(委托 upload_layout,单一来源)
 
-    旧任务只写单数 upload_id;新任务写 upload_ids 列表。本 helper 统一读取,
-    供 user_intent 提示 / _prepare_repo_context 分发 / _restore_workspace_if_needed
-    判空与传输复用。
+    旧任务只写单数 upload_id;新任务写 upload_ids 列表。沙箱拷贝侧与
+    工作区回退浏览侧共用同一解析,保证布局一致。
     """
-    p = params or {}
-    ids: list[str] = []
-    if p.get("upload_id"):
-        ids.append(p["upload_id"])
-    for x in (p.get("upload_ids") or []):
-        if x:
-            ids.append(x)
-    seen: set[str] = set()
-    out: list[str] = []
-    for x in ids:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+    from app.services.upload_layout import extract_creation_ids
+
+    return extract_creation_ids(params)
 
 
 def _followup_upload_ids(params: dict | None) -> list[str]:
-    """追问累积上传的 upload_id 列表(读 params.followup_upload_ids)
+    """追问累积上传的 upload_id 列表(委托 upload_layout,单一来源)
 
     沙箱回收后 _restore_workspace_if_needed 需重放这些文件到 followup_uploads/,
-    保证追问上传与创建上传一样可在恢复后重现。
+    保证追问上传与创建上传一样可在恢复后重现;工作区回退浏览也按此列表
+    重建 followup_uploads/{i}-{name} 布局(i 为列表下标,顺序即追加顺序)。
     """
-    return [x for x in ((params or {}).get("followup_upload_ids") or []) if x]
+    from app.services.upload_layout import extract_followup_ids
+
+    return extract_followup_ids(params)
 
 
 def _prepare_upload_context(
@@ -1759,13 +1750,20 @@ def resume_audit_with_message(
     # 本轮追问附带的文件:传输进工作区 followup_uploads/(不重定向 repo_path)。
     # restored=True 时 _restore_workspace_if_needed 已按 params.followup_upload_ids
     # 重放(API 端点在调用前已把本轮新 ids 写入 params),此处跳过避免重复传输;
-    # restored=False(会话存活)时才需显式传输本轮新文件。
+    # restored=False(会话存活)时传**全量累积列表**而非仅本轮新 ids ——
+    # 全局下标与重放/工作区回退浏览一致,避免每轮下标从 0 重启导致的路径
+    # 漂移与同名清洗目录被 clear_dest 覆盖丢文件(旧附件已被 GC 时由
+    # add_uploads_to_workspace 逐上传容错跳过)。
     attachment_note = ""
     if upload_ids:
         if not restored:
+            merged_ids = _followup_upload_ids(task.params)
+            for uid in upload_ids:
+                if uid and uid not in merged_ids:
+                    merged_ids.append(uid)  # 防御:params 未含本轮 ids 的边缘情况
             try:
                 sandbox_tools.add_uploads_to_workspace(
-                    task_id_str, upload_ids, "followup_uploads"
+                    task_id_str, merged_ids, "followup_uploads"
                 )
             except Exception as e:
                 logger.warning(

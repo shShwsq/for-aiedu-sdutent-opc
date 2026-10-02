@@ -15,8 +15,10 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   getWorkspaceInfo,
   getWorkspaceTree,
+  getWorkspaceUploadsTree,
   listWorkspaceFiles,
   readWorkspaceFile,
+  readWorkspaceUploadsFile,
 } from '@/api/workspace'
 import {
   deleteTask,
@@ -25,7 +27,11 @@ import {
 } from '@/api/task'
 import { extractErrorMessage } from '@/utils/error'
 import type { TaskListItem, TaskStatus } from '@/types/task'
-import type { WorkspaceEntry, WorkspaceTreeResponse } from '@/types/workspace'
+import type {
+  WorkspaceEntry,
+  WorkspaceTreeResponse,
+  WorkspaceUploadsTreeResponse,
+} from '@/types/workspace'
 
 const router = useRouter()
 const route = useRoute()
@@ -492,6 +498,41 @@ const unavailableReason = ref('')
 const checkingAvailable = ref(false)
 
 // ============================================================
+// 用户上传回退浏览(沙箱过期后仍可浏览,独立于沙箱 TTL)
+// ============================================================
+
+/** 任务带用户上传(工作区信息返回;沙箱不可用时回退显示) */
+const hasUploads = ref(false)
+/** 上传回退树根节点(null = 未加载) */
+const uploadsTreeRoot = ref<TreeNode | null>(null)
+/** 已被 GC 清理的上传占位标签 */
+const uploadsUnavailable = ref<string[]>([])
+/** 上传树加载中 */
+const loadingUploads = ref(false)
+/** 上传树条目超上限截断 */
+const uploadsTruncated = ref(false)
+/** 上传树是否已拉取(每次进入工作区只拉一次) */
+let uploadsTreeLoaded = false
+
+/** 上传回退树已就绪 */
+const uploadsTreeReady = computed(() => uploadsTreeRoot.value !== null)
+
+/** 扁平化上传树(仅展开的目录),复用文件树样式渲染 */
+const flatUploadsTree = computed<FlatNode[]>(() => {
+  const root = uploadsTreeRoot.value
+  if (!root) return []
+  const out: FlatNode[] = []
+  const walk = (n: TreeNode, depth: number) => {
+    if (depth >= 0) out.push({ node: n, depth })
+    if (n.type === 'dir' && n.expanded) {
+      for (const child of n.children) walk(child, depth + 1)
+    }
+  }
+  walk(root, -1)
+  return out
+})
+
+// ============================================================
 // 文件树
 // ============================================================
 
@@ -556,6 +597,13 @@ function resetFileTree(): void {
   treeTruncated.value = false
   initialized = false
   filePanelHidden.value = false
+  // 上传回退状态一并重置(切换任务时不残留上个任务的上传树)
+  hasUploads.value = false
+  uploadsTreeRoot.value = null
+  uploadsUnavailable.value = []
+  uploadsTruncated.value = false
+  loadingUploads.value = false
+  uploadsTreeLoaded = false
 }
 
 // ============================================================
@@ -592,8 +640,12 @@ async function checkAvailable(): Promise<void> {
     const info = await getWorkspaceInfo(selectedTaskId.value)
     available.value = info.available
     unavailableReason.value = info.reason ?? ''
+    hasUploads.value = info.has_uploads ?? false
     if (info.available && !treeRoot.loaded) {
       await loadTreeSnapshot()
+    } else if (!info.available && hasUploads.value && !selectedTaskRunning.value) {
+      // 沙箱不可用且有上传:回退拉上传树(运行中不显示,与其它兜底一致)
+      await loadUploadsTree()
     }
   } catch (e) {
     errorMsg.value = extractErrorMessage(e)
@@ -673,6 +725,78 @@ function sortTreeChildren(node: TreeNode): void {
   for (const c of node.children) {
     if (c.type === 'dir') sortTreeChildren(c)
   }
+}
+
+/**
+ * 沙箱不可用且有上传:拉上传文件树(独立于沙箱,保留期内内容可读)
+ * 每次进入工作区只拉一次;失败提示错误但不影响其它兜底分区
+ */
+async function loadUploadsTree(): Promise<void> {
+  if (!selectedTaskId.value || uploadsTreeLoaded) return
+  loadingUploads.value = true
+  try {
+    const res = await getWorkspaceUploadsTree(selectedTaskId.value)
+    uploadsTreeRoot.value = buildUploadsTree(res)
+    uploadsUnavailable.value = res.unavailable
+    uploadsTruncated.value = res.truncated
+    uploadsTreeLoaded = true
+  } catch (e) {
+    errorMsg.value = extractErrorMessage(e)
+  } finally {
+    loadingUploads.value = false
+  }
+}
+
+/** 从上传树快照构建嵌套树(整树一次拉全,目录均视为已加载,无懒加载) */
+function buildUploadsTree(res: WorkspaceUploadsTreeResponse): TreeNode {
+  const root: TreeNode = {
+    name: '',
+    path: '',
+    type: 'dir',
+    expanded: true,
+    loaded: true,
+    loading: false,
+    children: [],
+  }
+  const byPath = new Map<string, TreeNode>()
+  byPath.set('', root)
+  for (const e of res.entries) {
+    const parts = e.path.split('/').filter(Boolean)
+    if (parts.length === 0) continue
+    const parent = byPath.get(parts.slice(0, -1).join('/'))
+    if (!parent) continue
+    const node: TreeNode = {
+      name: parts[parts.length - 1],
+      path: e.path,
+      type: e.type === 'dir' ? 'dir' : 'file',
+      expanded: false,
+      loaded: true,
+      loading: false,
+      children: [],
+    }
+    parent.children.push(node)
+    byPath.set(e.path, node)
+  }
+  sortTreeChildren(root)
+  return root
+}
+
+/** 上传树目录展开/收起(整树已拉全,无需懒加载) */
+function toggleUploadDir(node: TreeNode): void {
+  if (node.type !== 'dir') return
+  node.expanded = !node.expanded
+}
+
+/** 在上传回退树中逐层查找节点(整树已加载,顺带展开途经目录) */
+function findInUploadsTree(filePath: string): TreeNode | null {
+  const parts = filePath.split('/').filter(Boolean)
+  let current: TreeNode | undefined = uploadsTreeRoot.value ?? undefined
+  for (const part of parts) {
+    if (!current) return null
+    if (current.type === 'dir' && !current.expanded) current.expanded = true
+    current = current.children.find((c) => c.name === part)
+  }
+  return current ?? null
 }
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
@@ -779,12 +903,20 @@ async function loadFileContent(): Promise<void> {
   loadingFile.value = true
   errorMsg.value = ''
   try {
-    const res = await readWorkspaceFile(
-      selectedTaskId.value,
-      selectedFilePath.value,
-      fileOffset.value,
-      500,
-    )
+    // 沙箱可用走沙箱文件;不可用时选中的是上传回退树文件,走上传读取端点
+    const res = available.value
+      ? await readWorkspaceFile(
+          selectedTaskId.value,
+          selectedFilePath.value,
+          fileOffset.value,
+          500,
+        )
+      : await readWorkspaceUploadsFile(
+          selectedTaskId.value,
+          selectedFilePath.value,
+          fileOffset.value,
+          500,
+        )
     fileContent.value = res.content
     fileStartLine.value = res.start_line
     fileEndLine.value = res.end_line
@@ -953,7 +1085,17 @@ async function openTaskFile(taskId: string, filePath: string, line?: number): Pr
     view.value = 'workspace'
     if (!initialized) await ensureInitialized()
   }
-  if (!available.value) return
+  if (!available.value) {
+    // 沙箱不可用:回退上传树(上传任务过期后结果清单仍可跳转)
+    if (!uploadsTreeReady.value) return
+    const node = findInUploadsTree(filePath)
+    if (!node) return
+    await selectFile(node)
+    if (line && line > 0) {
+      await jumpToLine(line)
+    }
+    return
+  }
 
   // 展开到目标文件
   const node = await expandToPath(filePath)
@@ -1226,6 +1368,114 @@ defineExpose({ openTaskFile })
         <div v-else-if="!available" class="sidebar-status sidebar-status-muted">
           <p>{{ unavailableReason || '工作区不可用' }}</p>
           <p v-if="selectedTaskRunning" class="status-hint">等待 AI助手 clone 仓库...</p>
+          <!-- 用户上传兜底:沙箱过期后仍可浏览上传文件(保留期内内容可读) -->
+          <div
+            v-if="!selectedTaskRunning && (hasUploads || loadingUploads)"
+            class="changed-files-fallback"
+          >
+            <div class="changed-files-title">
+              用户上传{{ uploadsUnavailable.length > 0 ? '（部分已过期清理）' : '' }}
+            </div>
+            <div class="changed-files-list">
+              <div v-if="loadingUploads" class="tree-loading">加载上传文件...</div>
+              <template v-else-if="uploadsTreeReady">
+                <div v-if="uploadsTruncated" class="tree-truncated-hint">
+                  文件过多,列表已截断
+                </div>
+                <!-- 已被 GC 清理的上传:占位展示,不可点击 -->
+                <div
+                  v-for="label in uploadsUnavailable"
+                  :key="`gone-${label}`"
+                  class="tree-node tree-file uploads-gone"
+                  :title="`${label}（已过期清理）`"
+                >
+                  <span class="tree-icon">
+                    <svg
+                      viewBox="0 0 24 24"
+                      width="13"
+                      height="13"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M14 3v4a1 1 0 0 0 1 1h4" />
+                      <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
+                    </svg>
+                  </span>
+                  <span class="tree-name">{{ label }}</span>
+                  <span class="uploads-gone-tag">已清理</span>
+                </div>
+                <!-- 上传文件树(整树已拉全,目录仅展开/收起;文件点击可读内容) -->
+                <div
+                  v-for="item in flatUploadsTree"
+                  :key="`up-${item.node.path}`"
+                  class="tree-node"
+                  :class="[
+                    `tree-${item.node.type}`,
+                    { 'tree-selected': selectedFilePath === item.node.path },
+                  ]"
+                  :style="{ paddingLeft: `${item.depth * 14 + 8}px` }"
+                  :title="item.node.path"
+                  @click="item.node.type === 'dir' ? toggleUploadDir(item.node) : selectFile(item.node)"
+                >
+                  <span class="tree-icon">
+                    <template v-if="item.node.type === 'dir'">
+                      <svg
+                        class="tree-chevron"
+                        :class="{ expanded: item.node.expanded }"
+                        viewBox="0 0 24 24"
+                        width="10"
+                        height="10"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2.5"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                      >
+                        <polyline points="9 18 15 12 9 6" />
+                      </svg>
+                      <svg
+                        viewBox="0 0 24 24"
+                        width="13"
+                        height="13"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                      >
+                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                      </svg>
+                    </template>
+                    <svg
+                      v-else
+                      viewBox="0 0 24 24"
+                      width="13"
+                      height="13"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                    >
+                      <path d="M14 3v4a1 1 0 0 0 1 1h4" />
+                      <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
+                    </svg>
+                  </span>
+                  <span class="tree-name">{{ item.node.name }}</span>
+                </div>
+                <div
+                  v-if="flatUploadsTree.length === 0 && uploadsUnavailable.length === 0"
+                  class="empty-tree"
+                >
+                  (空目录)
+                </div>
+              </template>
+            </div>
+          </div>
           <!-- 会话过期但有 diff 产物:展示变更文件列表(点击跳主区 diff,内容不可浏览) -->
           <div
             v-if="!selectedTaskRunning && changedFileList.length > 0"
@@ -1854,6 +2104,27 @@ defineExpose({ openTaskFile })
 
 .changed-file-row {
   padding-left: var(--space-2);
+}
+
+/* ---- 用户上传兜底:已被 GC 清理的上传占位行 ---- */
+.uploads-gone {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.uploads-gone:hover {
+  background: transparent;
+}
+
+.uploads-gone-tag {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: var(--fs-xs, 10px);
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border, currentColor);
+  border-radius: var(--radius-sm);
+  padding: 0 4px;
+  line-height: 1.4;
 }
 
 /* ---- 侧栏轻提示(工作区不可用时点击仓库文件行) ---- */

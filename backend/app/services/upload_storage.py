@@ -20,6 +20,7 @@ boto3 仅在 s3 后端惰性 import:local-only 部署即使未安装 boto3 也�
 """
 import json
 import logging
+import os
 import shutil
 import tempfile
 from abc import ABC, abstractmethod
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Iterator
 
 from app.config import settings
+from app.services.upload_layout import SKIP_DIRS_LIST
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +106,29 @@ class UploadStorageBackend(ABC):
     def exists(self, upload_id: str) -> bool:
         """upload_id 是否存在于后端"""
 
+    @abstractmethod
+    def list_files(self, upload_id: str) -> list[dict]:
+        """列出 files/ 树的全部条目(工作区回退浏览用)
+
+        返回 [{path: 相对 files/ 的 posix 路径, type: "file"|"dir"}, ...],
+        含中间目录条目;剪枝噪声目录(与沙箱树同一口径 SKIP_DIRS_LIST)。
+        抛出 UploadError:上传不存在。
+        """
+
+    @abstractmethod
+    def stat_file(self, upload_id: str, relpath: str) -> int:
+        """返回 files/ 内单个文件的大小(字节;读取前限流检查用)
+
+        抛出 UploadError:上传不存在 / 路径非法 / 文件不存在。
+        """
+
+    @abstractmethod
+    def read_file(self, upload_id: str, relpath: str) -> bytes:
+        """读取 files/ 内单个文件内容(工作区回退浏览用)
+
+        抛出 UploadError:上传不存在 / 路径非法 / 文件不存在。
+        """
+
 
 class LocalUploadStorage(UploadStorageBackend):
     """本地磁盘后端:UPLOADS_DIR/{upload_id}/{files/,meta.json}
@@ -156,6 +181,41 @@ class LocalUploadStorage(UploadStorageBackend):
 
     def exists(self, upload_id: str) -> bool:
         return self._upload_dir(upload_id).is_dir()
+
+    def list_files(self, upload_id: str) -> list[dict]:
+        files_dir = self._upload_dir(upload_id) / FILES_DIR
+        if not files_dir.is_dir():
+            raise UploadError(f"上传不存在或已被清理: {upload_id}")
+        entries: list[dict] = []
+        # os.walk 剪枝噪声目录,口径与沙箱树(_browse_tree_local)一致
+        for dirpath, dirnames, filenames in os.walk(files_dir):
+            rel = os.path.relpath(dirpath, files_dir)
+            parts = [] if rel == "." else rel.replace("\\", "/").split("/")
+            dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS_LIST)
+            for name in dirnames:
+                entries.append({"path": "/".join(parts + [name]), "type": "dir"})
+            for name in sorted(filenames):
+                entries.append({"path": "/".join(parts + [name]), "type": "file"})
+        return entries
+
+    def _resolve_file(self, upload_id: str, relpath: str) -> Path:
+        """把 files/ 相对路径解析为受控绝对路径(防穿越;须为已存在文件)"""
+        rel = _safe_relpath(relpath)
+        if not rel:
+            raise UploadError("文件路径不合法")
+        files_dir = self._upload_dir(upload_id) / FILES_DIR
+        target = (files_dir / rel).resolve()
+        if not target.is_relative_to(files_dir.resolve()):
+            raise UploadError("文件路径不合法")
+        if not target.is_file():
+            raise UploadError(f"文件不存在: {relpath}")
+        return target
+
+    def stat_file(self, upload_id: str, relpath: str) -> int:
+        return self._resolve_file(upload_id, relpath).stat().st_size
+
+    def read_file(self, upload_id: str, relpath: str) -> bytes:
+        return self._resolve_file(upload_id, relpath).read_bytes()
 
 
 class S3UploadStorage(UploadStorageBackend):
@@ -319,6 +379,60 @@ class S3UploadStorage(UploadStorageBackend):
             if _is_not_found(e):
                 return False
             raise UploadError(f"检查上传是否存在失败: {upload_id}") from e
+
+    def list_files(self, upload_id: str) -> list[dict]:
+        client = self._client()
+        bucket = self._bucket()
+        files_prefix = f"{self._upload_prefix(upload_id)}{FILES_DIR}/"
+        objs = self._list_objects(files_prefix)
+        if not objs:
+            raise UploadError(f"上传不存在或已被清理: {upload_id}")
+        files: list[str] = []
+        dirs: set[str] = set()
+        for o in objs:
+            rel = _safe_relpath(o["Key"][len(files_prefix):])
+            if not rel or rel.endswith("/"):
+                continue
+            parts = rel.split("/")
+            # 剪噪声目录(与 local os.walk 剪枝同口径):只看中间目录
+            if any(p in SKIP_DIRS_LIST for p in parts[:-1]):
+                continue
+            files.append(rel)
+            for i in range(1, len(parts)):
+                dirs.add("/".join(parts[:i]))
+        entries = [{"path": d, "type": "dir"} for d in sorted(dirs)]
+        entries.extend({"path": f, "type": "file"} for f in sorted(files))
+        return entries
+
+    def _file_key(self, upload_id: str, relpath: str) -> str:
+        """校验并组装文件对象 key(防穿越)"""
+        rel = _safe_relpath(relpath)
+        if not rel:
+            raise UploadError("文件路径不合法")
+        return f"{self._upload_prefix(upload_id)}{FILES_DIR}/{rel}"
+
+    def stat_file(self, upload_id: str, relpath: str) -> int:
+        key = self._file_key(upload_id, relpath)
+        try:
+            resp = self._client().head_object(Bucket=self._bucket(), Key=key)
+        except Exception as e:
+            if _is_not_found(e):
+                raise UploadError(f"文件不存在: {relpath}") from None
+            raise UploadError(f"读取文件信息失败: {relpath}") from e
+        return int(resp.get("ContentLength") or 0)
+
+    def read_file(self, upload_id: str, relpath: str) -> bytes:
+        key = self._file_key(upload_id, relpath)
+        try:
+            resp = self._client().get_object(Bucket=self._bucket(), Key=key)
+        except Exception as e:
+            if _is_not_found(e):
+                raise UploadError(f"文件不存在: {relpath}") from None
+            raise UploadError(f"读取文件失败: {relpath}") from e
+        try:
+            return resp["Body"].read()
+        except Exception as e:
+            raise UploadError(f"读取文件失败: {relpath}") from e
 
 
 def _is_not_found(exc: Exception) -> bool:
