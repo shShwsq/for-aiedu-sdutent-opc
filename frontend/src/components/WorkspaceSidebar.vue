@@ -620,6 +620,7 @@ function resetFileTree(): void {
   treeRoot.children = []
   treeRoot.expanded = true
   selectedFilePath.value = null
+  selectedFileSource.value = 'workspace'
   fileContent.value = ''
   available.value = false
   unavailableReason.value = ''
@@ -677,8 +678,10 @@ async function checkAvailable(): Promise<void> {
     canRestore.value = info.can_restore ?? false
     if (info.available && !treeRoot.loaded) {
       await loadTreeSnapshot()
-    } else if (!info.available && hasUploads.value && !selectedTaskRunning.value) {
-      // 沙箱不可用且有上传:回退拉上传树(运行中不显示,与其它兜底一致)
+    }
+    // 上传树与工作区可用性无关:上传区独立展示,重新克隆后(仓库不含上传
+    // 文件)仍要可见。运行中不加载(与其它兜底一致,完成后会再检查)
+    if (hasUploads.value && !selectedTaskRunning.value) {
       await loadUploadsTree()
     }
   } catch (e) {
@@ -911,9 +914,17 @@ async function toggleDir(node: TreeNode): Promise<void> {
   node.expanded = !node.expanded
 }
 
-async function selectFile(node: TreeNode): Promise<void> {
+/** 选中文件来源:workspace=工作区树 / uploads=用户上传树(决定读文件走哪个端点)。
+ *  不能按 available 分流:重新克隆后工作区可用,但上传文件不在新克隆的仓库里 */
+const selectedFileSource = ref<'workspace' | 'uploads'>('workspace')
+
+async function selectFile(
+  node: TreeNode,
+  source: 'workspace' | 'uploads' = 'workspace',
+): Promise<void> {
   if (node.type !== 'file') return
   selectedFilePath.value = node.path
+  selectedFileSource.value = source
   fileOffset.value = 1
   highlightLine.value = null // 手动选文件时清除高亮
   filePanelHidden.value = false // 重新选文件时恢复面板显示
@@ -937,15 +948,16 @@ async function loadFileContent(): Promise<void> {
   loadingFile.value = true
   errorMsg.value = ''
   try {
-    // 沙箱可用走沙箱文件;不可用时选中的是上传回退树文件,走上传读取端点
-    const res = available.value
-      ? await readWorkspaceFile(
+    // 按选中来源分流:工作区树文件走沙箱端点,上传树文件走上传读取端点
+    // (上传区独立于工作区状态展示,重新克隆后仍可读上传文件)
+    const res = selectedFileSource.value === 'uploads'
+      ? await readWorkspaceUploadsFile(
           selectedTaskId.value,
           selectedFilePath.value,
           fileOffset.value,
           500,
         )
-      : await readWorkspaceUploadsFile(
+      : await readWorkspaceFile(
           selectedTaskId.value,
           selectedFilePath.value,
           fileOffset.value,
@@ -1124,7 +1136,7 @@ async function openTaskFile(taskId: string, filePath: string, line?: number): Pr
     if (!uploadsTreeReady.value) return
     const node = findInUploadsTree(filePath)
     if (!node) return
-    await selectFile(node)
+    await selectFile(node, 'uploads')
     if (line && line > 0) {
       await jumpToLine(line)
     }
@@ -1133,8 +1145,15 @@ async function openTaskFile(taskId: string, filePath: string, line?: number): Pr
 
   // 展开到目标文件
   const node = await expandToPath(filePath)
-  if (!node) return
-  await selectFile(node)
+  if (node) {
+    await selectFile(node)
+  } else {
+    // 工作区树无此文件(如重新克隆后追问上传文件不在新仓库里):回退上传树
+    if (!uploadsTreeReady.value) return
+    const upNode = findInUploadsTree(filePath)
+    if (!upNode) return
+    await selectFile(upNode, 'uploads')
+  }
 
   // 定位行号
   if (line && line > 0) {
@@ -1409,114 +1428,6 @@ defineExpose({ openTaskFile })
             </button>
             <p v-if="restoreError" class="restore-error">{{ restoreError }}</p>
           </div>
-          <!-- 用户上传兜底:沙箱过期后仍可浏览上传文件(保留期内内容可读) -->
-          <div
-            v-if="!selectedTaskRunning && (hasUploads || loadingUploads)"
-            class="changed-files-fallback"
-          >
-            <div class="changed-files-title">
-              用户上传{{ uploadsUnavailable.length > 0 ? '（部分已过期清理）' : '' }}
-            </div>
-            <div class="changed-files-list">
-              <div v-if="loadingUploads" class="tree-loading">加载上传文件...</div>
-              <template v-else-if="uploadsTreeReady">
-                <div v-if="uploadsTruncated" class="tree-truncated-hint">
-                  文件过多,列表已截断
-                </div>
-                <!-- 已被 GC 清理的上传:占位展示,不可点击 -->
-                <div
-                  v-for="label in uploadsUnavailable"
-                  :key="`gone-${label}`"
-                  class="tree-node tree-file uploads-gone"
-                  :title="`${label}（已过期清理）`"
-                >
-                  <span class="tree-icon">
-                    <svg
-                      viewBox="0 0 24 24"
-                      width="13"
-                      height="13"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      aria-hidden="true"
-                    >
-                      <path d="M14 3v4a1 1 0 0 0 1 1h4" />
-                      <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
-                    </svg>
-                  </span>
-                  <span class="tree-name">{{ label }}</span>
-                  <span class="uploads-gone-tag">已清理</span>
-                </div>
-                <!-- 上传文件树(整树已拉全,目录仅展开/收起;文件点击可读内容) -->
-                <div
-                  v-for="item in flatUploadsTree"
-                  :key="`up-${item.node.path}`"
-                  class="tree-node"
-                  :class="[
-                    `tree-${item.node.type}`,
-                    { 'tree-selected': selectedFilePath === item.node.path },
-                  ]"
-                  :style="{ paddingLeft: `${item.depth * 14 + 8}px` }"
-                  :title="item.node.path"
-                  @click="item.node.type === 'dir' ? toggleUploadDir(item.node) : selectFile(item.node)"
-                >
-                  <span class="tree-icon">
-                    <template v-if="item.node.type === 'dir'">
-                      <svg
-                        class="tree-chevron"
-                        :class="{ expanded: item.node.expanded }"
-                        viewBox="0 0 24 24"
-                        width="10"
-                        height="10"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="2.5"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                      >
-                        <polyline points="9 18 15 12 9 6" />
-                      </svg>
-                      <svg
-                        viewBox="0 0 24 24"
-                        width="13"
-                        height="13"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="2"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                      >
-                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-                      </svg>
-                    </template>
-                    <svg
-                      v-else
-                      viewBox="0 0 24 24"
-                      width="13"
-                      height="13"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                    >
-                      <path d="M14 3v4a1 1 0 0 0 1 1h4" />
-                      <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
-                    </svg>
-                  </span>
-                  <span class="tree-name">{{ item.node.name }}</span>
-                </div>
-                <div
-                  v-if="flatUploadsTree.length === 0 && uploadsUnavailable.length === 0"
-                  class="empty-tree"
-                >
-                  (空目录)
-                </div>
-              </template>
-            </div>
-          </div>
           <!-- 会话过期但有 diff 产物:展示变更文件列表(点击跳主区 diff,内容不可浏览) -->
           <div
             v-if="!selectedTaskRunning && changedFileList.length > 0"
@@ -1711,6 +1622,116 @@ defineExpose({ openTaskFile })
           </div>
           <div v-if="treeRoot.loaded && treeRoot.children.length === 0" class="empty-tree">
             (空目录)
+          </div>
+        </div>
+
+        <!-- 用户上传(独立兜底区:与工作区可用性无关,重新克隆后的仓库不含
+             上传文件,仍在此常驻展示;保留期内内容可读) -->
+        <div
+          v-if="!selectedTaskRunning && (hasUploads || loadingUploads)"
+          class="uploads-panel"
+        >
+          <div class="changed-files-title">
+            用户上传{{ uploadsUnavailable.length > 0 ? '（部分已过期清理）' : '' }}
+          </div>
+          <div class="changed-files-list">
+            <div v-if="loadingUploads" class="tree-loading">加载上传文件...</div>
+            <template v-else-if="uploadsTreeReady">
+              <div v-if="uploadsTruncated" class="tree-truncated-hint">
+                文件过多,列表已截断
+              </div>
+              <!-- 已被 GC 清理的上传:占位展示,不可点击 -->
+              <div
+                v-for="label in uploadsUnavailable"
+                :key="`gone-${label}`"
+                class="tree-node tree-file uploads-gone"
+                :title="`${label}（已过期清理）`"
+              >
+                <span class="tree-icon">
+                  <svg
+                    viewBox="0 0 24 24"
+                    width="13"
+                    height="13"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M14 3v4a1 1 0 0 0 1 1h4" />
+                    <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
+                  </svg>
+                </span>
+                <span class="tree-name">{{ label }}</span>
+                <span class="uploads-gone-tag">已清理</span>
+              </div>
+              <!-- 上传文件树(整树已拉全,目录仅展开/收起;文件点击走上传读取端点) -->
+              <div
+                v-for="item in flatUploadsTree"
+                :key="`up-${item.node.path}`"
+                class="tree-node"
+                :class="[
+                  `tree-${item.node.type}`,
+                  { 'tree-selected': selectedFilePath === item.node.path },
+                ]"
+                :style="{ paddingLeft: `${item.depth * 14 + 8}px` }"
+                :title="item.node.path"
+                @click="item.node.type === 'dir' ? toggleUploadDir(item.node) : selectFile(item.node, 'uploads')"
+              >
+                <span class="tree-icon">
+                  <template v-if="item.node.type === 'dir'">
+                    <svg
+                      class="tree-chevron"
+                      :class="{ expanded: item.node.expanded }"
+                      viewBox="0 0 24 24"
+                      width="10"
+                      height="10"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2.5"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                    >
+                      <polyline points="9 18 15 12 9 6" />
+                    </svg>
+                    <svg
+                      viewBox="0 0 24 24"
+                      width="13"
+                      height="13"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                    >
+                      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                    </svg>
+                  </template>
+                  <svg
+                    v-else
+                    viewBox="0 0 24 24"
+                    width="13"
+                    height="13"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <path d="M14 3v4a1 1 0 0 0 1 1h4" />
+                    <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
+                  </svg>
+                </span>
+                <span class="tree-name">{{ item.node.name }}</span>
+              </div>
+              <div
+                v-if="flatUploadsTree.length === 0 && uploadsUnavailable.length === 0"
+                class="empty-tree"
+              >
+                (空目录)
+              </div>
+            </template>
           </div>
         </div>
 
@@ -2167,6 +2188,24 @@ defineExpose({ openTaskFile })
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+
+/* ---- 用户上传独立兜底区(与工作区可用性无关,重新克隆后仍常驻显示) ---- */
+.uploads-panel {
+  flex-shrink: 0;
+  max-height: 45%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-top: var(--space-1);
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--color-border);
+}
+
+.uploads-panel .changed-files-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 var(--space-1);
 }
 
 .changed-files-title {
