@@ -18,8 +18,9 @@ def _eval_dict(**overrides):
         "covered": ["a"],
         "missing": [],
         "reasoning": "评估理由",
-        "followup_query": "",
-        "done": True,
+        "suggestions": [],
+        "results": [],
+        "grouping": None,
     }
     result.update(overrides)
     return result
@@ -75,7 +76,7 @@ def test_parse_json_after_decoy_object():
     content = '先给个例子 {"x": 1}\n真正结果:' + _eval_json()
     result = _parse_json_response(content)
     assert result["covered"] == ["a"]
-    assert result["done"] is True
+    assert result["reasoning"] == "评估理由"
 
 
 def test_parse_fenced_truncated_no_closing_fence():
@@ -100,7 +101,7 @@ def test_parse_truncated_inside_string():
     cut = full.find("跨站") + 1
     result = _parse_json_response(full[:cut])
     assert result["covered"] == ["a"]
-    assert result["done"] is True
+    assert result["reasoning"] == "评估理由"
     assert result["results"][0]["title"] == "SSRF 漏洞"
 
 
@@ -121,8 +122,8 @@ def test_parse_truncated_dangling_colon():
 
 
 def test_parse_truncated_literal_fragment():
-    """值只写了一半(tru 等字面量碎片)→ 已生成的关键字段仍保留。"""
-    result = _parse_json_response('{"covered": ["a"], "done": tru')
+    """值只写了一半(nul/tru 等字面量碎片)→ 已生成的关键字段仍保留。"""
+    result = _parse_json_response('{"covered": ["a"], "grouping": nul')
     assert result["covered"] == ["a"]
 
 

@@ -15,7 +15,7 @@ import app.agents.agent2 as agent2
 
 _EVAL_JSON = (
     '{"covered": [], "missing": [], "reasoning": "核查完成", '
-    '"followup_query": "", "done": false}'
+    '"suggestions": [], "results": [], "grouping": null}'
 )
 
 

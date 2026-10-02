@@ -10,9 +10,9 @@
 4. 审查完成推 review_done + done;练习题生成/记忆归纳在审查后链式触发
 
 resume(用户追加消息/点击建议深挖):
-- agent2 先分析消息(analyze 模式,无工具):需要执行则输出 followup_query
-  给 agent1 跑一轮,再走后台审查;无需执行则直接收尾
-- 多轮完全由用户驱动(每次 resume = 分析 + agent1 一轮 + 后台审查)
+- 用户消息直接交给 agent1 跑一轮(不经 agent2 转述;agent1 跨轮历史
+  由 react_agent._build_history_context 自行注入),随后走后台审查
+- 多轮完全由用户驱动(每次 resume = agent1 一轮 + 后台审查)
 
 单 agent 模式(agent2_enabled=false):react_agent 单轮 + summary 结果,
 无审查,行为与旧版一致。
@@ -456,52 +456,6 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
 # ============================================================
 
 
-def _record_agent2_analyze(
-    db: Session, task: Task, round_idx: int, ua_result: dict,
-) -> None:
-    """把 agent2 分析模式(resume 消息分析)的输出记录到 Conversation 表
-
-    - content:精简显示,只放追问内容(前端默认展示,真追问会进主界面)
-    - reasoning:完整评估(覆盖情况/判断/追问/done),用于刷新页面后回看
-    react_agent 接收追问是通过函数参数传递的,不依赖 Conversation 表。
-    """
-    # 标记已记录(供 orchestrator 兜底逻辑判断)
-    ua_result["_recorded"] = True
-
-    covered = ua_result.get("covered", [])
-    missing = ua_result.get("missing", [])
-    reasoning_text = ua_result.get("reasoning", "")
-    followup = ua_result.get("followup_query", "")
-    done = ua_result.get("done", False)
-
-    # 精简 content:只显示追问
-    if done:
-        content = "评估完成,无需追问"
-    elif followup:
-        content = followup
-    else:
-        content = "(未给出追问)"
-
-    # 完整评估 reasoning(可折叠回看)
-    full_eval = (
-        f"[agent2 第 {round_idx} 轮消息分析]\n"
-        f"已覆盖: {covered}\n"
-        f"未覆盖: {missing}\n"
-        f"判断: {reasoning_text}\n"
-    )
-    if followup:
-        full_eval += f"执行指令: {followup}\n"
-    if done:
-        full_eval += "→ 无需新执行\n"
-
-    _add_conversation(
-        db, task, round_idx=round_idx,
-        role="agent2", type="evaluation",
-        content=content,
-        reasoning=full_eval,
-    )
-
-
 def _record_agent2_review(
     db: Session, task: Task, round_idx: int, ua_result: dict,
 ) -> None:
@@ -615,7 +569,6 @@ def _run_background_review(
                 repo_url=(task.params or {}).get("repo_url"),
                 task=task, agent_policy=agent_policy,
                 repo_path=cur_repo_path,
-                mode="review",
             )
         except Exception as review_err:
             # run_agent2 内部已兜底降级,这里是最后防线(DB 异常等)
@@ -1202,14 +1155,13 @@ def resume_audit_with_message(
     retry=True 时表示失败任务重试(断点续跑),消息措辞与阶段文案
     改为重试语境,其余流程一致。
 
-    流程(每次 resume = 分析 + agent1 一轮 + 后台审查,多轮由用户驱动):
+    流程(每次 resume = agent1 一轮 + 后台审查,多轮由用户驱动):
     1. task.status: COMPLETED/FAILED → RUNNING
     2. 加载历史上下文(react_summaries / LLM 配置),恢复工作区
     3. 起始 round_idx:用户追加消息时复用消息所在轮(消息与首轮 react 执行
        同轮,不隔轮);失败重试时从 max+1 续接新轮
-    4. agent2 分析用户消息(analyze 模式,无工具):
-       - done(无需新执行)→ 直接收尾,保留已有结果
-       - followup_query → agent1 执行一轮
+    4. agent1 直接执行用户消息(原文直传,不经 agent2 转述;
+       跨轮历史由 react_agent._build_history_context 注入)
     5. agent1 轮结束:summary 落临时结果,任务 COMPLETED(推 agent1_done)
     6. 后台审查(同初始运行):整理重点与知识点替换临时结果,推 review_done + done
 
@@ -1258,8 +1210,8 @@ def resume_audit_with_message(
     current_plan: list[dict] = []
 
     # 起始轮:用户追加消息时复用消息所在轮(消息已由 API 端点落库为最新轮,
-    # 分析评估与首轮 react 执行与该消息同轮——用户消息 → 分析 → 执行 → 审查
-    # 构成一轮完整闭环,不隔轮);失败重试时无新消息,从 max+1 续接新轮。
+    # react 执行与该消息同轮——用户消息 → 执行 → 审查构成一轮完整闭环,
+    # 不隔轮);失败重试时无新消息,从 max+1 续接新轮。
     start_round_idx = _get_next_round_idx(db, task.id, retry=retry)
     # [perf] resume 锚点(用户追加消息后重启;与 user_message 锚点配对算总延迟)
     perf_log(
@@ -1283,8 +1235,9 @@ def resume_audit_with_message(
         time.perf_counter() - _t0,
     )
 
-    # 把用户消息拼到 user_intent 后面,让 agent2 把它视为新的检查方向
-    # 重试场景用专门标记,避免 agent2 把续跑当成用户新增需求
+    # 把用户消息拼到 user_intent 后面,供 agent1 结束后的后台审查参考
+    # (审查需知道完整意图,含追问/重试语境);重试场景用专门标记,
+    # 避免审查把续跑当成用户新增需求
     msg_label = "[重试续跑]" if retry else "[用户追加消息]"
     effective_intent = task.user_input + f"\n\n{msg_label}\n{user_message}"
 
@@ -1295,79 +1248,19 @@ def resume_audit_with_message(
     normal_completed = False
 
     try:
-        # ===== 单 agent 模式:agent2 已禁用,直接跑 react_agent =====
-        if not ua_enabled:
-            logger.info(f"[task={task.id}] resume 单 agent 模式(agent2 已禁用)")
-            task.current_stage = "AI助手执行(单 agent)"
-            db.commit()
-            _publish_status(task)
-
-            _t0 = time.perf_counter()
-            _results, summary, current_plan = executor.run(
-                task, db,
-                round_idx=start_round_idx,
-                followup_query=user_message,
-                client=react_client,
-                repo_context=None,
-                previous_plan=None,
-            )
-            perf_log(task.id, "executor_run", time.perf_counter() - _t0, round_idx=start_round_idx, executor=executor.name)
-            react_summaries.append({"round": start_round_idx, "summary": summary})
-
-            # 用 summary 作为唯一结构化结果(单 agent 无审查,直接是最终结果)
-            _replace_interim_results(db, task, start_round_idx, summary)
-
-            ua_result = None  # 单 agent 模式无 agent2 评估,_finish_resume 据此写简洁总结
-            _finish_resume(task, db, react_summaries, ua_result)
-            normal_completed = True  # 正常完成:finally 不再兑底推 error(见 finally 注释)
-            return  # finally 块仍会执行清理
-
-        # ===== 先调 agent2 分析用户消息(analyze 模式,round_idx = start_round_idx)=====
-        task.current_stage = "检查助手分析补充消息"
-        db.commit()
-        _publish_status(task)
-
-        _t0 = time.perf_counter()
-        ua_result = run_agent2(
-            effective_intent, react_summaries,
-            task_id=task.id, db=db, round_idx=start_round_idx,
-            scenario_id=task.scenario, client=llm_client,
-            user_id=task.user_id,
-            repo_url=(task.params or {}).get("repo_url"),
-            task=task,
-            agent_policy=agent_policy,
-            repo_path=None,  # 分析模式无工具,无需工作区
-            mode="analyze",
-        )
-        perf_log(task.id, "ua_eval", time.perf_counter() - _t0, round_idx=start_round_idx, phase="analyze_message")
-
-        # 流式调用降级标记(agent2 重试仍失败时返回 degraded=true):
-        # 直接把用户输入内容交给 react_agent 执行
-        degraded = bool(ua_result.get("degraded"))
-
-        _record_agent2_analyze(db, task, start_round_idx, ua_result)
-
-        # agent2 认为用户消息无需新执行,直接收尾(保留已有结果与审查状态)
-        if ua_result.get("done"):
-            _finish_resume(task, db, react_summaries, ua_result)
-            normal_completed = True  # 正常完成
-            return
-
-        # ===== agent1 执行一轮(降级时直接用用户原始消息,不经 agent2 指令)=====
+        # ===== 用户消息直接交给 agent1(不经 agent2 转述) =====
+        # agent2 职责收敛为后台审查:追问/重试消息原文直传 agent1,
+        # 跨轮历史上下文由 react_agent._build_history_context 注入
         wait_if_paused(task.id)
-        task.current_stage = "AI助手执行"
+        task.current_stage = "AI助手执行" if ua_enabled else "AI助手执行(单 agent)"
         db.commit()
         _publish_status(task)
 
-        followup = (
-            user_message if degraded
-            else (ua_result.get("followup_query") or user_message)
-        )
         _t0 = time.perf_counter()
         _results, summary, current_plan = executor.run(
             task, db,
             round_idx=start_round_idx,
-            followup_query=followup,
+            followup_query=user_message,
             client=react_client,
             repo_context=None,  # 重启不传 repo_context(仓库已 clone,react_agent 自行从 sandbox 取)
             previous_plan=None,
@@ -1382,6 +1275,14 @@ def resume_audit_with_message(
 
         # 本轮 summary 落临时结果(替换上一次的临时/审查产出)
         _replace_interim_results(db, task, start_round_idx, summary)
+
+        # ===== 单 agent 模式:agent2 已禁用,执行完直接收尾(无审查) =====
+        if not ua_enabled:
+            logger.info(f"[task={task.id}] resume 单 agent 模式(agent2 已禁用)")
+            # ua_result=None:_finish_resume 据此写简洁总结(无 agent2 评估可展示)
+            _finish_resume(task, db, react_summaries, ua_result=None)
+            normal_completed = True  # 正常完成:finally 不再兑底推 error(见 finally 注释)
+            return  # finally 块仍会执行清理
 
         # ---------- agent1 结束即任务完成(同初始运行) ----------
         task.status = TaskStatus.COMPLETED
@@ -1506,7 +1407,7 @@ def retry_failed_task(task: Task, db: Session) -> None:
     - 无(预克隆/沙箱/LLM 配置等早期失败,执行未真正开始):
       没有可续内容,直接重跑 run_dual_agent_audit
     - 有(执行中途失败):复用 resume_audit_with_message 断点续跑,
-      以重试续跑消息驱动 agent2 分析现状、接续未完成工作
+      以重试续跑消息直接驱动 agent1 基于已有进度接续未完成工作
       (round_idx 由 _get_next_round_idx 自动续接,不产生重复轮次)
 
     续跑前的沙箱探测:失败 finally 已 mark_task_completed,session
@@ -1518,7 +1419,7 @@ def retry_failed_task(task: Task, db: Session) -> None:
     重试时原后台线程已因异常退出,互斥无竞态。
     """
     task_id_str = str(task.id)
-    # 先捕获失败原因(后续会清 error_message),拼进续跑消息供 agent2 参考
+    # 先捕获失败原因(后续会清 error_message),拼进续跑消息供 agent1 参考
     # (error_message 已由失败路径增强为非空,这里仅兜底旧数据)
     last_error = task.error_message or "未知错误(无异常详情)"
     perf_log(task.id, "retry_start", last_error_chars=len(last_error))
@@ -1576,12 +1477,12 @@ def _err_detail(e: Exception) -> str:
 def _finish_resume(
     task: Task, db: Session, react_summaries: list[dict], ua_result: dict | None,
 ) -> None:
-    """resume 收尾(analyze 判 done / 单 agent 模式):标记状态 + 终止事件
+    """resume 收尾(单 agent 模式):标记状态 + 终止事件
 
     ua_result=None 表示单 agent 模式(agent2 已禁用):
     无 agent2 评估可展示,不写总结对话。
-    该路径不产生新结果(已有结果保留),后续后台审查路径不走此函数
-    (由 _run_background_review 负责收尾)。
+    该路径结果已由调用方落库(_replace_interim_results),后续后台审查
+    路径不走此函数(由 _run_background_review 负责收尾)。
     """
     task.status = TaskStatus.COMPLETED
     task.current_stage = "重启执行完成"

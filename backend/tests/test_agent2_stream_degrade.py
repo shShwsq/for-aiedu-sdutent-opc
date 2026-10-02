@@ -3,10 +3,13 @@
 背景:用户发追问时,agent2 评估阶段的流式 LLM 调用失败会直接 raise,
 导致整个任务 FAILED,前端只显示"未知错误"。修复:
 1. agent2.py:流式调用失败重试一次,仍失败返回 degraded=true 降级结果
-   (不抛异常杀死任务);orchestrator 检测到降级后 resume 首次分析直接把
-   用户输入内容交给 react_agent,协作轮评估降级则收尾结束;
+   (不抛异常杀死任务);orchestrator 检测到降级后标记审查失败,
+   保留 agent1 临时结果;
 2. orchestrator.py / tasks.py:error_message 兜底增强——异常消息为空时
    补异常类型名(_err_detail),杜绝 UI 显示"未知错误"字面。
+
+另覆盖:resume 直传语义——用户追加消息不经 agent2 转述,原文直接
+交给 agent1 执行(followup_query 逐字等于用户消息)。
 """
 import uuid
 from unittest.mock import MagicMock
@@ -37,7 +40,7 @@ def test_stream_fail_once_retry_success(monkeypatch):
             raise RuntimeError("网络抖动")
         return (
             '{"covered": [], "missing": [], "reasoning": "重试成功", '
-            '"followup_query": "继续检查", "done": false}',
+            '"suggestions": [], "results": [], "grouping": null}',
             [], "思考链",
         )
 
@@ -49,11 +52,11 @@ def test_stream_fail_once_retry_success(monkeypatch):
 
     assert len(calls) == 2  # 失败后重试了一次
     assert result.get("degraded") is not True
-    assert result.get("followup_query") == "继续检查"
+    assert result.get("reasoning") == "重试成功"
 
 
 def test_stream_fail_twice_returns_degraded_review(monkeypatch):
-    """审查模式:两次流式调用都失败 → 降级结果(无轮次语义,审查失败标记)。"""
+    """审查:两次流式调用都失败 → 降级结果(无轮次语义,审查失败标记)。"""
     def _fake_stream(client, messages, *, task_id, round_idx, tools=None):
         raise RuntimeError("boom")
 
@@ -68,28 +71,9 @@ def test_stream_fail_twice_returns_degraded_review(monkeypatch):
     assert result["results"] == []          # 空 results → 调用方标记审查失败
     assert result["suggestions"] == []
     assert "降级" in result["reasoning"]
-    # 审查模式无 followup_query/done 轮次语义(一次性完整审查)
+    # 无 followup_query/done 轮次语义(一次性完整审查)
     assert "followup_query" not in result
     assert "done" not in result
-
-
-def test_stream_fail_twice_returns_degraded_analyze(monkeypatch):
-    """分析模式:两次流式调用都失败 → 降级结果,用户原始意图透传给 agent1。"""
-    def _fake_stream(client, messages, *, task_id, round_idx, tools=None):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(agent2, "_stream_agent2_llm", _fake_stream)
-
-    result = agent2.run_agent2(
-        "审计这个仓库", [], task_id="task-1", round_idx=1, client=MagicMock(),
-        mode="analyze",
-    )
-
-    assert result["degraded"] is True
-    assert result["done"] is False
-    assert result["followup_query"] == "审计这个仓库"  # 原始用户输入透传
-    assert result["degrade_reason"] == "boom"
-    assert "降级" in result["reasoning"]
 
 
 # ============================================================
@@ -155,26 +139,24 @@ def _patch_resume_env(monkeypatch, executor, ua_side_effect):
     monkeypatch.setattr(orchestrator, "publish", lambda *a, **k: None)
 
 
-def test_resume_analyze_degraded_passes_user_message(monkeypatch):
-    """resume 首次分析降级 → 直接把用户消息交给 react_agent。"""
+def test_resume_passes_user_message_directly(monkeypatch):
+    """resume:用户消息原文直传 agent1(不经 agent2 转述),
+    agent2 只在 agent1 结束后做一次后台审查。"""
     task = _mk_resume_task()
-    degraded = {
-        "covered": [], "missing": [], "reasoning": "流式失败已降级",
-        "followup_query": "被降级覆盖", "done": False,
-        "degraded": True, "degrade_reason": "boom",
-    }
-    done = {"covered": [], "missing": [], "reasoning": "完成",
-            "followup_query": "", "done": True,
-            "results": [], "grouping": None}
-    ua_calls = []
+    review = {"covered": [], "missing": [], "reasoning": "审查完成",
+              "suggestions": [], "results": [{"title": "发现", "content": "内容"}],
+              "grouping": None}
+    call_order = []  # 记录 agent1 执行与 agent2 审查的先后顺序
 
     def _ua(*args, **kwargs):
-        ua_calls.append(kwargs)
-        return degraded if len(ua_calls) == 1 else done
+        call_order.append("agent2")
+        return review
 
     executor = MagicMock()
     executor.name = "builtin"
-    executor.run = MagicMock(return_value=([], "总结", []))
+    executor.run = MagicMock(
+        side_effect=lambda *a, **k: call_order.append("agent1") or ([], "总结", []),
+    )
 
     _patch_resume_env(monkeypatch, executor, _ua)
 
@@ -182,17 +164,18 @@ def test_resume_analyze_degraded_passes_user_message(monkeypatch):
         task, MagicMock(), "再帮我查下依赖漏洞",
     )
 
-    # 直接把用户输入内容交给 react_agent
+    # 用户消息逐字直传 agent1,只跑一轮
     executor.run.assert_called_once()
     assert executor.run.call_args.kwargs["followup_query"] == "再帮我查下依赖漏洞"
     assert task.status == TaskStatus.COMPLETED
+    # agent2 仅一次调用,且发生在 agent1 执行之后(后台审查)
+    assert call_order == ["agent1", "agent2"]
+    assert task.review_status == "done"
 
 
 def test_resume_collab_degraded_ends_round(monkeypatch):
     """resume 后台审查降级 → review_status=failed,任务仍 COMPLETED(保留临时结果)。"""
     task = _mk_resume_task()
-    analyze = {"covered": [], "missing": [], "reasoning": "分析",
-               "followup_query": "查依赖", "done": False}
     degraded_review = {"covered": [], "missing": [], "reasoning": "审查失败降级",
                        "suggestions": [], "results": [], "grouping": None,
                        "degraded": True, "degrade_reason": "boom"}
@@ -200,7 +183,7 @@ def test_resume_collab_degraded_ends_round(monkeypatch):
 
     def _ua(*args, **kwargs):
         ua_calls.append(kwargs)
-        return analyze if len(ua_calls) == 1 else degraded_review
+        return degraded_review
 
     executor = MagicMock()
     executor.name = "builtin"
@@ -210,9 +193,9 @@ def test_resume_collab_degraded_ends_round(monkeypatch):
 
     orchestrator.resume_audit_with_message(task, MagicMock(), "再查依赖")
 
-    # agent1 只跑一轮(按分析指令);审查降级不触发再执行
+    # agent1 只跑一轮(用户消息直传);审查降级不触发再执行
     executor.run.assert_called_once()
-    assert executor.run.call_args.kwargs["followup_query"] == "查依赖"
+    assert executor.run.call_args.kwargs["followup_query"] == "再查依赖"
     assert task.status == TaskStatus.COMPLETED
     # 审查降级 → 子状态 failed(任务本身不失败)
     assert task.review_status == "failed"
@@ -222,12 +205,10 @@ def test_resume_except_typed_error_message(monkeypatch):
     """resume 链路异常消息为空 → error_message 补异常类型名,不再显示"未知错误"。"""
     task = _mk_resume_task()
 
-    def _boom(*args, **kwargs):
-        raise RuntimeError("")
-
     executor = MagicMock()
     executor.name = "builtin"
-    _patch_resume_env(monkeypatch, executor, _boom)
+    executor.run = MagicMock(side_effect=RuntimeError(""))
+    _patch_resume_env(monkeypatch, executor, lambda *a, **k: None)
 
     orchestrator.resume_audit_with_message(task, MagicMock(), "消息")
 
@@ -273,7 +254,6 @@ def _patch_dual_env(monkeypatch, executor, ua_side_effect):
                         lambda *a, **k: (None, ""))  # 无仓库:跳过 clone
     monkeypatch.setattr(orchestrator, "_publish_status", lambda *a, **k: None)
     monkeypatch.setattr(orchestrator, "_record_agent2_review", lambda *a, **k: None)
-    monkeypatch.setattr(orchestrator, "_record_agent2_analyze", lambda *a, **k: None)
     monkeypatch.setattr(orchestrator, "_replace_interim_results",
                         lambda *a, **k: 1)
     monkeypatch.setattr(orchestrator, "_add_conversation", lambda *a, **k: None)
@@ -320,9 +300,8 @@ def test_dual_starts_with_react_agent_no_initial_eval(monkeypatch):
     executor.run.assert_called_once()
     assert executor.run.call_args.kwargs["round_idx"] == 1
     assert executor.run.call_args.kwargs["followup_query"] is None
-    # agent2 审查发生在 agent1 执行之后,且为 review 模式(单次完整审查)
+    # agent2 审查仅一次,发生在 agent1 执行之后(单次完整审查)
     assert len(ua_calls) == 1
-    assert ua_calls[0]["mode"] == "review"
     assert task.status == TaskStatus.COMPLETED
     assert task.review_status == "done"
 

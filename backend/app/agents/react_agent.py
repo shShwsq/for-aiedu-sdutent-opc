@@ -272,7 +272,9 @@ def run_react_agent(
         )
 
         user_msg = (
-            f"基于之前的执行结果,现在请针对以下问题继续深入"
+            f"基于之前的执行进度,请处理以下新消息"
+            f"(用户追问可直接回答,新需求/修正则执行对应工作,续跑则接着完成,"
+            f"均不要重做已完成的部分)"
             f"{repo_path_hint}\n\n"
             f"{history_prefix}"
             f"\n\n{FOLLOWUP_SECTION_LABEL}\n{followup_query}"
@@ -1314,12 +1316,13 @@ def _build_round_segments(
     ]
     react_summary = react_thinkings[-1].content if react_thinkings else ""
 
-    # agent2 当轮评估(优先 reasoning,含 covered/missing/判断)
-    ua_eval = next(
-        (c for c in round_convs
-         if c.role == "agent2" and c.type == "evaluation"),
-        None,
-    )
+    # agent2 当轮评估/审查(优先 reasoning,含 covered/missing/判断)。
+    # type 兼容两代:evaluation=旧版协作评估(analyze 落库),review=后台审查
+    ua_evals = [
+        c for c in round_convs
+        if c.role == "agent2" and c.type in ("evaluation", "review")
+    ]
+    ua_eval = ua_evals[-1] if ua_evals else None
     ua_text = ""
     if ua_eval:
         ua_text = ua_eval.reasoning or ua_eval.content or ""
@@ -1382,7 +1385,7 @@ _HISTORY_COMPRESS_PROMPT = """你是审计历史压缩助手。以下是之前�
 请压缩成一段简洁的摘要,必须保留:
 - 每轮 react_agent 的关键发现(漏洞/问题/已确认的结论)
 - agent2 标记的已覆盖维度(covered)和未覆盖维度(missing)
-- agent2 的追问方向(followup_query 指向的检查项)
+- agent2 审查指出的待改进方向与建议深挖的检查项
 
 丢弃冗余的工具调用细节、重复信息和无关叙述。输出纯文本摘要(不要 JSON,不要 markdown 标题),
 按轮次顺序组织,每轮用"第 N 轮:"开头。

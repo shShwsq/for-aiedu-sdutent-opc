@@ -1,43 +1,41 @@
 """agent2:质检智能体(检查助手,SecondLook 双 agent 架构核心)
 
 角色:幕后质检者 + 学习点提炼者。agent1(执行智能体,"AI助手")是面向
-用户的台前回答者(其每轮总结即用户看到的回答);agent2 负责核查 agent1
-的产出,发现错误时发修正指令(追问),任务收尾时提炼重点与知识点。
+用户的台前回答者(其每轮总结即用户看到的回答);agent2 负责在 agent1
+完成后做单次后台审查,并提炼重点与知识点。
 核查过程与知识点经任务详情侧栏呈现,不直接出现在主对话流。
 
-按"核查优先、追问兜底"原则,agent2 承担以下职责(按优先级):
+按"核查优先"原则,agent2 承担以下职责(按优先级):
 1. 核实审查结果:核实 agent1 的发现是否有真实源码依据、严重度是否合理、
    有无误报或夸大(用只读工具读源码核对)
 2. 动态 PoC 验证(有测试环境时):对"疑似但不确定"的安全发现调 verify
    生成 PoC 发送到测试环境确认
 3. 引用复核:agent1 结论引用的外部依据(URL/CVE/公告/文档)用
    check_reference 核对存在性与来源可靠性
-4. 提炼重点与知识点:任务收尾时从全程提炼有学习价值的知识点(results),
+4. 提炼重点与知识点:从 agent1 全程产出提炼有学习价值的知识点(results),
    供侧栏展示与自动生成练习题
-5. 追问修正(兜底):仅当 agent1 结果确有错误/缺失且自己无法核查时,
-   才构造 followup_query 让 agent1 再跑一轮
+5. 建议深挖方向(suggestions,兜底):仅对"确属缺失且无法自查"的维度
+   给出 0-3 条建议,由用户决定是否让 agent1 继续深挖
 
 设计要点(继承自原项目 user_agent 的成熟机制):
 - agent2 不直接执行审查,只做核查与提炼;可用三类工具:
   **只读工具**(read_file / list_files / find_files / search_code)核对
   真实源码、**verify** 生成 PoC 动态验证安全问题(经 verifier_agent)、
   **check_reference** 复核 agent1 引用的外部网址(后端抓取,SSRF 防护)
-- 输出结构化 JSON:covered / missing / followup_query / done
-  + done=true 时输出 grouping(结果分组声明,默认 null)与
-  results(重点与知识点,3-8 条精选)
-- done=true 表示质检通过,agent2 认为任务可以结束
+- 输出结构化 JSON:covered / missing / reasoning / suggestions
+  / results(重点与知识点,3-8 条精选) / grouping(结果分组声明,默认 null)
+- 无 followup_query/done 轮次语义:审查一次性完成,多轮由用户驱动
+  (用户追加消息直接交给 agent1 跑一轮,再走后台审查)
 - 覆盖度清单(初始评估/用户确认)机制已移除:agent2 在每次评估时
   根据用户意图自行确定应覆盖的审查维度,在 covered/missing 中
   按维度 id 标注覆盖情况,跨轮记忆保证判断连续性
 
-流程(任务开始时不再有 agent2 初始评估,agent1 直接按用户意图执行):
-1. agent1 跑一轮,返回 summary
-2. agent2 核查 agent1 的总结(读码核对/PoC/引用复核):
+流程(任务开始时无 agent2 初始评估,agent1 直接按用户意图执行):
+1. agent1 跑一轮,返回 summary,任务即标记完成
+2. agent2 在同一后台线程内做单次完整审查(读码核对/PoC/引用复核):
    - 哪些维度核查通过(covered)/ 哪些维度不合格或缺失(missing)
-   - 仅对"确属缺失且无法自查"的维度构造 followup_query 追问补全
-3. 若 missing 为空或 done=true,任务结束(done 时输出 results + grouping)
-4. 否则把 followup_query 发给 agent1 再跑一轮
-5. 循环 1-4,最多 MAX_ROUNDS 轮
+   - 提炼 results 替换临时结果;确属缺失且无法自查的方向给 suggestions
+3. 审查完成推 review_done + done;练习题生成/记忆归纳链式触发
 """
 import json
 import logging
@@ -418,41 +416,6 @@ agent1 结论若引用了外部依据(URL / CVE 编号 / 安全公告 / 官方�
 """
 
 
-# 分析模式 system prompt(resume 消息分析用)
-# ============================================================
-
-AGENT2_ANALYZE_PROMPT = """你是 agent2(质检智能体),负责分析用户在任务完成后追加的消息。
-
-## 你的定位
-任务已完成(agent1 已执行过若干轮,结果已产出)。用户现在追加了一条消息:
-可能是补充信息、新的检查方向、修正要求,或只是感谢/闲聊。
-你需要快速判断:**这条消息是否需要 agent1 再执行一轮**,并把消息翻译成
-具体可执行的指令。
-
-## 输入
-你会看到:用户原始意图、agent1 历史轮总结、用户追加的消息。
-
-## 输出格式(严格 JSON)
-```json
-{
-  "covered": [],
-  "missing": [],
-  "reasoning": "对用户消息的分析:它想做什么、是否需要新执行、为什么",
-  "followup_query": "给 agent1 的执行指令(具体可执行,引用历史上下文;无需执行时为空字符串)",
-  "done": false
-}
-```
-
-## 判断原则
-- **需要新执行**(补充信息/新方向/修正要求)→ done=false,followup_query
-  写清 agent1 要做什么:延续历史进度,不要重做已完成的部分。
-- **无需新执行**(感谢/闲聊/消息内容已在历史中完成)→ done=true,
-  followup_query 为空字符串。
-- followup_query 是给 agent1 的指令,不是给用户的回复;措辞具体可执行。
-- 不确定时倾向执行(done=false):多跑一轮的代价小于忽略用户诉求。
-"""
-
-
 # 兼容别名:旧名 AGENT2_SYSTEM_PROMPT 指向审查模式 prompt
 # (测试/文档可能引用;新代码应显式使用 AGENT2_REVIEW_PROMPT)
 AGENT2_SYSTEM_PROMPT = AGENT2_REVIEW_PROMPT
@@ -543,9 +506,8 @@ def run_agent2(
     task: Task | None = None,
     agent_policy: dict[str, Any] | None = None,
     repo_path: str | None = None,
-    mode: str = "review",
 ) -> dict[str, Any]:
-    """执行一次 agent2 评估(双模式)
+    """执行一次 agent2 后台审查
 
     参数:
         user_intent: 用户原始意图(如"审查这个项目: ..."或含 [用户追加消息] 的合成意图)
@@ -561,16 +523,8 @@ def run_agent2(
         agent_policy: agent 策略(可选)。含 allow_verify 开关,控制是否启用 verify 工具。
         repo_path: 任务工作区路径(可选)。传入时启用只读核查工具,
             agent2 可读真实源码核对 agent1 的发现。
-        mode: 执行模式
-            - "review"(默认):后台审查。agent1 已完成,单次完整核查 +
-              提炼重点与知识点(results/grouping)+ 输出建议深挖方向(suggestions)。
-              无 followup_query/done 语义(审查一次性完成)。
-            - "analyze":resume 消息分析。判断用户追加消息是否需要 agent1
-              再执行一轮,输出 followup_query(执行指令)或 done=true(无需执行)。
-              无工具、无 results。
 
     返回:agent2 的结构化输出
-        review 模式:
         {
             "covered": [...],
             "missing": [...],
@@ -579,20 +533,9 @@ def run_agent2(
             "results": [...],          # 重点与知识点
             "grouping": {...} | null,
         }
-        analyze 模式:
-        {
-            "covered": [...],
-            "missing": [...],
-            "reasoning": str,
-            "followup_query": str,     # 给 agent1 的执行指令
-            "done": bool,              # true=无需新执行
-        }
-        两种模式失败降级时均附 degraded=true(degrade_reason 见日志)。
+        失败降级时附 degraded=true(degrade_reason 见日志)。
     """
-    if mode not in ("review", "analyze"):
-        raise ValueError(f"未知的 agent2 模式: {mode}")
-    is_review = mode == "review"
-    system_prompt = AGENT2_REVIEW_PROMPT if is_review else AGENT2_ANALYZE_PROMPT
+    system_prompt = AGENT2_REVIEW_PROMPT
 
     # 长期记忆注入:User Profile + 全局记忆 + 项目记忆精简版
     # (仅当有内容时,追加到 system prompt 末尾)
@@ -606,18 +549,11 @@ def run_agent2(
     # 构造 user 消息:包含用户意图 + agent1 之前的所有摘要
     if not agent1_summaries:
         # 兜底:agent1 尚无总结(异常/降级路径)。正常流程不会走到这里。
-        if is_review:
-            user_msg = (
-                f"用户原始意图:{user_intent}\n\n"
-                f"agent1 尚未产出总结(异常路径)。请基于意图给出审查结论,"
-                f"results 可为空、suggestions 建议补充执行。"
-            )
-        else:
-            user_msg = (
-                f"用户原始意图:{user_intent}\n\n"
-                f"这是任务开始,agent1 尚未执行。"
-                f"请输出 followup_query 给 agent1 的执行指令。done=false。"
-            )
+        user_msg = (
+            f"用户原始意图:{user_intent}\n\n"
+            f"agent1 尚未产出总结(异常路径)。请基于意图给出审查结论,"
+            f"results 可为空、suggestions 建议补充执行。"
+        )
     else:
         # 把 agent1 的自然语言总结给 agent2 质检
         # 注意:agent1 只输出自然语言 summary,不再有结构化 results 字段
@@ -644,9 +580,9 @@ def run_agent2(
             + "\n\n".join(rounds_text)
         )
 
-        # 本轮工具调用明细(截尾窗口注入,仅审查模式):给原始证据,
+        # 本轮工具调用明细(截尾窗口注入):给原始证据,
         # 供校验总结真实性、避免无据判断
-        if db is not None and is_review:
+        if db is not None:
             try:
                 tool_section = build_tool_window_section(
                     db, task_id, round_idx, None,
@@ -659,19 +595,12 @@ def run_agent2(
                     f"[task={task_id}] 加载工具窗口注入失败(跳过): {e}"
                 )
 
-        if is_review:
-            user_msg_parts.append(
-                "\n\n任务已完成,请对以上执行结果做完整审查:核查覆盖情况与结论质量,"
-                "提炼重点与知识点(results),并对确属缺失且无法自查的方向给出"
-                "建议深挖方向(suggestions)。"
-            )
-        else:
-            user_msg_parts.append(
-                "\n\n用户在任务完成后追加了消息(见上方意图末尾的"
-                "[用户追加消息]段落)。请分析该消息,判断是否需要 agent1 再执行一轮,"
-                "输出 followup_query(执行指令)或 done=true(无需执行)。"
-            )
-        if history_prefix and is_review:
+        user_msg_parts.append(
+            "\n\n任务已完成,请对以上执行结果做完整审查:核查覆盖情况与结论质量,"
+            "提炼重点与知识点(results),并对确属缺失且无法自查的方向给出"
+            "建议深挖方向(suggestions)。"
+        )
+        if history_prefix:
             user_msg_parts.append(
                 "\n[记忆提示] 上面已附上你之前各轮的评估记录,请保持审查判断的连续性:"
                 "之前已标 covered 的类别,若 agent1 未推翻结论,继续保持 covered。"
@@ -699,19 +628,17 @@ def run_agent2(
         "allow_reference_check", True
     )
     tools = []
-    if is_review:
-        # 分析模式无工具:消息理解是快速单次判断,不需要读码/验证
-        if repo_path:
-            tools.extend(_READ_ONLY_TOOL_DEFINITIONS)
-        if verify_enabled:
-            tools.append(_VERIFY_TOOL_DEFINITION)
-        if reference_check_enabled:
-            tools.append(_REFERENCE_TOOL_DEFINITION)
+    if repo_path:
+        tools.extend(_READ_ONLY_TOOL_DEFINITIONS)
+    if verify_enabled:
+        tools.append(_VERIFY_TOOL_DEFINITION)
+    if reference_check_enabled:
+        tools.append(_REFERENCE_TOOL_DEFINITION)
     tools = tools or None
 
     # LLM 调用循环:处理只读核查/verify/引用复核工具调用(结果回灌后再调 LLM 输出 JSON 评估)
     # 流式调用失败降级:首次失败重试一次;重试仍失败返回降级结果
-    # (orchestrator 据此直接把用户输入内容交给 agent1 执行,不杀死任务)
+    # (orchestrator 据此标记审查失败,保留 agent1 临时结果,不杀死任务)
     content = ""
     read_tool_count = 0
     verify_count = 0
@@ -885,39 +812,24 @@ def run_agent2(
         # 循环回去:LLM 看到工具结果后,要么再调工具,要么输出 JSON 评估
 
     # 流式调用降级:重试仍失败时返回降级结果(不抛异常杀死任务)。
-    # - review 模式:orchestrator 检测到 degraded=true 后标记审查失败
-    #   (review_status=failed),保留 agent1 summary 临时结果
-    # - analyze 模式:直接把用户输入内容交给 agent1 执行
+    # orchestrator 检测到 degraded=true 后标记审查失败
+    # (review_status=failed),保留 agent1 summary 临时结果
     if degraded_error is not None:
         degrade_reason = str(degraded_error) or type(degraded_error).__name__
         logger.info(
             f"[task={task_id}] agent2 流式调用失败已降级"
-            f"(round_idx={round_idx}, mode={mode}): {degrade_reason}"
+            f"(round_idx={round_idx}): {degrade_reason}"
         )
-        if is_review:
-            return {
-                "covered": [],
-                "missing": [],
-                "reasoning": (
-                    f"agent2 审查流式调用失败(重试仍失败),已降级:\n{degrade_reason}\n\n"
-                    f"[降级说明] 本次跳过 agent2 审查,保留 agent1 的执行结果。"
-                ),
-                "suggestions": [],
-                "results": [],
-                "grouping": None,
-                "degraded": True,
-                "degrade_reason": degrade_reason,
-            }
         return {
             "covered": [],
             "missing": [],
             "reasoning": (
-                f"agent2 流式调用失败(重试仍失败),已降级:\n{degrade_reason}\n\n"
-                f"[降级说明] 本次跳过 agent2 消息分析,直接把用户输入内容交给 "
-                f"agent1 执行。"
+                f"agent2 审查流式调用失败(重试仍失败),已降级:\n{degrade_reason}\n\n"
+                f"[降级说明] 本次跳过 agent2 审查,保留 agent1 的执行结果。"
             ),
-            "followup_query": user_intent,
-            "done": False,
+            "suggestions": [],
+            "results": [],
+            "grouping": None,
             "degraded": True,
             "degrade_reason": degrade_reason,
         }
@@ -934,32 +846,18 @@ def run_agent2(
                 raw_output[:MAX_RAW_OUTPUT_CHARS]
                 + f"\n...(原文过长已截断,共 {len(content)} 字符)"
             )
-        if is_review:
-            # 审查解析失败:交由调用方标记审查失败(保留临时结果),
-            # 不落空 results(宁保留 agent1 总结也不清空)
-            return {
-                "covered": [],
-                "missing": [],
-                "reasoning": (
-                    f"agent2 审查输出解析失败({e})。\n\n"
-                    f"[agent2 输出原文]\n{raw_output or '(空输出)'}"
-                ),
-                "suggestions": [],
-                "results": [],
-                "grouping": None,
-                "parse_failed": True,
-            }
-        # 分析解析失败:当作需要执行处理(直接把用户输入交给 agent1,
-        # 调用方对空 followup_query 回退到用户原始消息),比误判 done=true 跳过执行更安全
+        # 审查解析失败:交由调用方标记审查失败(保留临时结果),
+        # 不落空 results(宁保留 agent1 总结也不清空)
         return {
             "covered": [],
             "missing": [],
             "reasoning": (
-                f"agent2 消息分析输出解析失败({e}),直接把用户输入交给 agent1 执行。"
-                f"\n\n[agent2 输出原文]\n{raw_output or '(空输出)'}"
+                f"agent2 审查输出解析失败({e})。\n\n"
+                f"[agent2 输出原文]\n{raw_output or '(空输出)'}"
             ),
-            "followup_query": "",
-            "done": False,
+            "suggestions": [],
+            "results": [],
+            "grouping": None,
             "parse_failed": True,
         }
 
@@ -981,19 +879,18 @@ def run_agent2(
         except Exception as e:
             logger.warning(f"[task={task_id}] 落库 agent2 思考链失败(忽略): {e}")
 
-    # 审查模式:规整输出(suggestions/results/grouping 缺失时补默认值,
+    # 规整输出(suggestions/results/grouping 缺失时补默认值,
     # suggestions 非法类型时丢弃),保证调用方拿到结构一致的 dict
-    if is_review:
-        if not isinstance(result.get("suggestions"), list):
-            result["suggestions"] = []
-        else:
-            result["suggestions"] = [
-                s for s in result["suggestions"] if isinstance(s, str) and s.strip()
-            ]
-        if not isinstance(result.get("results"), list):
-            result["results"] = []
-        if "grouping" not in result:
-            result["grouping"] = None
+    if not isinstance(result.get("suggestions"), list):
+        result["suggestions"] = []
+    else:
+        result["suggestions"] = [
+            s for s in result["suggestions"] if isinstance(s, str) and s.strip()
+        ]
+    if not isinstance(result.get("results"), list):
+        result["results"] = []
+    if "grouping" not in result:
+        result["grouping"] = None
 
     return result
 
@@ -1340,8 +1237,9 @@ def _build_agent2_history(
     可能在 covered/missing 之间反复摇摆,或忘记之前已认定的覆盖情况。
 
     本函数从 Conversation 表加载 round_idx < current_round_idx 的
-    agent2 type=evaluation 记录,提取其 reasoning(完整评估含 covered/
-    missing/判断/追问),拼接成文本。单条截断到 MAX_HISTORY_MSG_CHARS,
+    agent2 type=review/evaluation 记录(review=后台审查,evaluation=
+    旧版协作评估,兼容存量数据),提取其 reasoning(完整评估含 covered/
+    missing/判断),拼接成文本。单条截断到 MAX_HISTORY_MSG_CHARS,
     整体超 MAX_HISTORY_TOTAL_CHARS 时按"重要性"保留:
       - 优先保留 missing 非空的轮次(还有未覆盖项,对决策更有参考价值)
       - 其次保留 done=false 的轮次
@@ -1359,7 +1257,7 @@ def _build_agent2_history(
             Conversation.task_id == task_id,
             Conversation.round_idx < current_round_idx,
             Conversation.role == "agent2",
-            Conversation.type == "evaluation",
+            Conversation.type.in_(("review", "evaluation")),
         )
         .order_by(Conversation.round_idx, Conversation.created_at)
         .all()

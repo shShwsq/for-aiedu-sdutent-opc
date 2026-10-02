@@ -1,11 +1,10 @@
-"""agent2 双 prompt(审查/分析)输出契约锚点测试
+"""agent2 审查 prompt 输出契约锚点测试
 
-后台审查重构后,agent2 拆成两个模式:
-- AGENT2_REVIEW_PROMPT(审查模式):agent1 结束后的单次完整后台审查,
+agent2 职责收敛为后台审查(单 prompt):
+- AGENT2_REVIEW_PROMPT:agent1 结束后的单次完整后台审查,
   输出 covered/missing/reasoning/suggestions/results/grouping,
-  无 followup_query/done 轮次语义;追问降级为"建议深挖方向"
-- AGENT2_ANALYZE_PROMPT(分析模式):resume 时分析用户追加消息,
-  输出 followup_query(执行指令)或 done=true(无需执行),无工具
+  无 followup_query/done 轮次语义;追问降级为"建议深挖方向"。
+  resume 时用户消息直接交给 agent1,不经 agent2 分析转述。
 
 AGENT2_SYSTEM_PROMPT 为审查模式的兼容别名。
 
@@ -14,7 +13,6 @@ AGENT2_SYSTEM_PROMPT 为审查模式的兼容别名。
 import pytest
 
 from app.agents.agent2 import (
-    AGENT2_ANALYZE_PROMPT,
     AGENT2_REVIEW_PROMPT,
     AGENT2_SYSTEM_PROMPT,
 )
@@ -79,22 +77,3 @@ def test_review_prompt_reference_and_verify_sections_kept():
     assert "引用复核" in AGENT2_REVIEW_PROMPT
     assert "动态验证" in AGENT2_REVIEW_PROMPT
     assert "check_reference" in AGENT2_REVIEW_PROMPT
-
-
-# ============================================================
-# 分析模式契约
-# ============================================================
-
-
-def test_analyze_prompt_output_contract():
-    """分析模式输出:followup_query(执行指令)或 done=true(无需执行)。"""
-    assert "followup_query" in AGENT2_ANALYZE_PROMPT
-    assert "done" in AGENT2_ANALYZE_PROMPT
-    # 分析模式无 results/suggestions(不产出知识点,只判断是否执行)
-    assert "results" not in AGENT2_ANALYZE_PROMPT
-    assert "suggestions" not in AGENT2_ANALYZE_PROMPT
-
-
-def test_analyze_prompt_lean_to_execute_when_uncertain():
-    """不确定时倾向执行(多跑一轮代价小于忽略用户诉求)。"""
-    assert "不确定时倾向执行" in AGENT2_ANALYZE_PROMPT

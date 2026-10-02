@@ -1,7 +1,7 @@
 """agent2 真实思考链落库测试(mock LLM 流式,不连真实服务)。
 
 核心约束:agent2 的 LLM reasoning_content 需以 type=thinking 落库,
-供前端刷新后还原思考卡片;结构化评估记录(evaluation)仍由 orchestrator
+供前端刷新后还原思考卡片;结构化审查记录(review)仍由 orchestrator
 另行落库,两边职责不混。
 """
 import json
@@ -39,13 +39,14 @@ def _mk_task():
 
 
 def _eval_json(**overrides):
-    """合法的 agent2 结构化输出 JSON"""
+    """合法的 agent2 结构化输出 JSON(审查模式)"""
     result = {
         "covered": [],
         "missing": ["d1"],
         "reasoning": "需要先查后端",
-        "followup_query": "请检查 backend 目录",
-        "done": False,
+        "suggestions": [],
+        "results": [{"title": "发现", "content": "后端存在未校验输入"}],
+        "grouping": None,
     }
     result.update(overrides)
     return json.dumps(result, ensure_ascii=False)
@@ -64,7 +65,7 @@ def test_thinking_persisted_as_conversation():
         task_id="task-1", db=db, round_idx=1,
         client=_mk_client(chunks), task=_mk_task(),
     )
-    assert result["followup_query"] == "请检查 backend 目录"
+    assert result["results"][0]["title"] == "发现"
 
     added = [c.args[0] for c in db.add.call_args_list]
     thinkings = [
@@ -108,11 +109,11 @@ def test_no_db_no_task_still_returns_result():
         task_id="task-1", db=None, round_idx=1,
         client=_mk_client(chunks), task=None,
     )
-    assert result["followup_query"] == "请检查 backend 目录"
+    assert result["results"][0]["title"] == "发现"
 
 
 def test_parse_failure_fallback_shows_raw_output():
-    """审查模式 JSON 解析失败 → parse_failed=True(审查失败,保留临时结果),
+    """审查 JSON 解析失败 → parse_failed=True(审查失败,保留临时结果),
     reasoning 含输出原文供回查。"""
     raw = "这段不是 JSON:审计发现三个高危问题……"
     chunks = [
@@ -128,23 +129,6 @@ def test_parse_failure_fallback_shows_raw_output():
     assert "agent2 审查输出解析失败" in result["reasoning"]
     assert "[agent2 输出原文]" in result["reasoning"]
     assert raw in result["reasoning"]
-
-
-def test_parse_failure_analyze_mode_defaults_to_execute():
-    """分析模式 JSON 解析失败 → 当作需要执行(followup_query 空 + done=False),
-    调用方回退把用户原始消息交给 agent1。"""
-    chunks = [
-        _MockChunk(content_delta="这不是 JSON", finish_reason="stop"),
-    ]
-    result = run_agent2(
-        "审查这个仓库", [{"round": 1, "summary": "总结"}],
-        task_id="task-1", db=None, round_idx=1,
-        client=_mk_client(chunks), task=None, mode="analyze",
-    )
-    assert result["parse_failed"] is True
-    assert result["done"] is False
-    assert result["followup_query"] == ""
-    assert "agent2 消息分析输出解析失败" in result["reasoning"]
 
 
 def test_parse_failure_raw_output_truncated():
