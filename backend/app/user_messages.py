@@ -37,6 +37,7 @@ class _UserMessageQueue:
             "content": str,           # 用户消息原文
             "created_at": str,         # ISO 时间(API 端点写入,用于排序)
             "message_id": str,         # 对应 Conversation.id(落库后的 UUID)
+            "upload_ids": list[str],   # 本条消息附带的上传文件 ID(可空)
         }
     """
 
@@ -89,6 +90,7 @@ def push_user_message(
     *,
     message_id: str,
     created_at: str,
+    upload_ids: list[str] | None = None,
 ) -> None:
     """追加用户消息到队列(运行中/暂停中场景使用)
 
@@ -97,12 +99,15 @@ def push_user_message(
         content: 用户消息原文
         message_id: 对应 Conversation.id(已落库的 UUID 字符串)
         created_at: ISO 格式时间戳(用于排序)
+        upload_ids: 本条消息附带的上传文件 ID 列表(可空;react_agent drain
+            时传输进工作区 followup_uploads/ 并把路径并入注入文本)
     """
     queue = _get_or_create(str(task_id))
     queue.push({
         "content": content,
         "message_id": message_id,
         "created_at": created_at,
+        "upload_ids": upload_ids or [],
     })
     logger.info(f"[task={task_id}] 用户补充消息入队(len={len(queue._messages)})")
 

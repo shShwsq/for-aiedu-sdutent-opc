@@ -136,6 +136,8 @@ class Settings(BaseSettings):
     UPLOAD_MAX_SINGLE_FILE_MB: int = 50
     # 解压后文件条目数上限(默认 2000)
     UPLOAD_MAX_FILES: int = 2000
+    # 单次提交(任务创建 / 一条追问)可关联的上传文件个数上限
+    UPLOAD_MAX_FILES_PER_MESSAGE: int = 10
 
     # ---- 交付物存储后端(Stage 1 永久层)----
     # 部署级选择(一套部署一个后端):local=本地磁盘 UPLOADS_DIR / s3=S3 兼容对象存储

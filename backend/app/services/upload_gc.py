@@ -62,17 +62,33 @@ def _collect_task_upload_map(db) -> dict[str, tuple[bool, datetime | None]]:
 
     result: dict[str, tuple[bool, datetime | None]] = {}
     for params, status, completed_at, created_at in rows:
-        uid = (params or {}).get("upload_id")
-        if not uid:
+        p = params or {}
+        # 收集该任务引用的全部 upload_id 并集:legacy 单数 upload_id +
+        # 创建多文件 upload_ids + 追问累积 followup_upload_ids。
+        # 追问上传若不被收集会被当孤儿误删。
+        uids: list[str] = []
+        if p.get("upload_id"):
+            uids.append(p["upload_id"])
+        for x in (p.get("upload_ids") or []):
+            if x:
+                uids.append(x)
+        for x in (p.get("followup_upload_ids") or []):
+            if x:
+                uids.append(x)
+        if not uids:
             continue
         terminal = status in _TERMINAL_STATUSES or status in ("completed", "failed")
         t = _as_utc(completed_at or created_at)
-        if uid in result:
-            prev_terminal, prev_t = result[uid]
-            terminal = prev_terminal and terminal
-            t = max(prev_t or datetime.min.replace(tzinfo=timezone.utc),
-                    t or datetime.min.replace(tzinfo=timezone.utc))
-        result[uid] = (terminal, t)
+        for uid in uids:
+            if uid in result:
+                prev_terminal, prev_t = result[uid]
+                terminal_uid = prev_terminal and terminal
+                t_uid = max(prev_t or datetime.min.replace(tzinfo=timezone.utc),
+                            t or datetime.min.replace(tzinfo=timezone.utc))
+            else:
+                terminal_uid = terminal
+                t_uid = t
+            result[uid] = (terminal_uid, t_uid)
     return result
 
 

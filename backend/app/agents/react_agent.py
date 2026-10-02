@@ -48,6 +48,16 @@ LOOP_WINDOW_SIZE = 6
 LOOP_MIN_DISTINCT = 2
 
 
+def _has_creation_upload(params: dict | None) -> bool:
+    """创建时是否带上传交付物(兼容 legacy 单数 upload_id 与多文件 upload_ids)
+
+    react_agent 用它判定"上传任务"语境(首轮提问提示 + repo_context 措辞),
+    与 orchestrator._creation_upload_ids 语义一致;此处内联避免跨模块循环导入。
+    """
+    p = params or {}
+    return bool(p.get("upload_id") or p.get("upload_ids"))
+
+
 def build_first_round_question(user_input: str, params: dict | None) -> str:
     """构造首轮"用户提问"对话的落库内容(user_input + 仓库/分支/上传来源提示)
 
@@ -67,7 +77,7 @@ def build_first_round_question(user_input: str, params: dict | None) -> str:
         content += f"\n仓库地址: {params['repo_url']}"
     if params.get("branch"):
         content += f"\n分支: {params['branch']}"
-    if params.get("upload_id"):
+    if _has_creation_upload(params):
         content += "\n交付物来源:用户上传的文件(已就绪在任务工作区,无需 clone)"
     return content
 
@@ -267,7 +277,7 @@ def run_react_agent(
         # orchestrator 已准备好交付物(clone 或上传)时,注入上下文提示跳过 clone_repo
         if repo_context:
             # 上传任务:工作区里是用户上传的文件,不是 clone 的仓库
-            if params.get("upload_id"):
+            if _has_creation_upload(params):
                 repo_ctx_section = (
                     "\n\n[交付物已就绪,无需调用 clone_repo]\n"
                     + repo_context
@@ -405,7 +415,32 @@ def run_react_agent(
         # 多条消息合并为一条 user 消息(按时间顺序),避免上下文碎片化。
         pending_user_msgs = drain_user_messages(task.id)
         if pending_user_msgs:
-            injected = _format_injected_user_messages(pending_user_msgs)
+            # 本批消息附带的上传文件:传输进工作区 followup_uploads/(不重定向
+            # repo_path),并把目录级提示并入注入文本,让模型感知新文件。
+            # 传输失败 catch+log,不中断本轮(文字消息照常注入)。
+            attachment_note = ""
+            batch_upload_ids: list[str] = []
+            for m in pending_user_msgs:
+                for uid in (m.get("upload_ids") or []):
+                    if uid and uid not in batch_upload_ids:
+                        batch_upload_ids.append(uid)
+            if batch_upload_ids:
+                try:
+                    from app.tools import sandbox_tools
+                    sandbox_tools.add_uploads_to_workspace(
+                        task_id_str, batch_upload_ids, "followup_uploads"
+                    )
+                    attachment_note = (
+                        "\n\n[用户本轮附带了新文件,已放入工作区 followup_uploads/ 目录,"
+                        "可用 list_files / read_file 查看]"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[task={task.id}] 追问上传文件传输失败(忽略,文字消息照常注入): {e}"
+                    )
+            injected = _format_injected_user_messages(
+                pending_user_msgs, attachment_note=attachment_note
+            )
             if injected:
                 messages.append({"role": "user", "content": injected})
                 logger.info(
@@ -675,11 +710,16 @@ def run_react_agent(
 # ============================================================
 
 
-def _format_injected_user_messages(messages: list[dict[str, Any]]) -> str:
+def _format_injected_user_messages(
+    messages: list[dict[str, Any]], attachment_note: str = "",
+) -> str:
     """把 drain 出的用户补充消息格式化为一条 LLM user 消息文本
 
     多条消息按时间顺序合并为一条,加前缀说明这是用户在审计过程中追加的指令,
     引导模型理解为新的检查方向/补充要求,而非替换原始任务。
+
+    attachment_note:本批消息附带文件已传输进工作区的目录级提示(可空),
+    拼在正文后,让模型知道去 followup_uploads/ 查看新文件。
 
     返回空字符串表示无可注入内容(消息 content 全为空)。
     """
@@ -703,6 +743,7 @@ def _format_injected_user_messages(messages: list[dict[str, Any]]) -> str:
         "请把以下内容作为新的检查方向或补充要求纳入当前任务,"
         "结合已掌握的仓库信息继续执行(无需重新 clone):\n\n"
         f"{body}"
+        f"{attachment_note}"
     )
 
 

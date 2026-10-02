@@ -73,7 +73,12 @@ from app.schemas.task import (
     RuntimeConfigUpdateRequest,
 )
 from app.schemas.task_artifact import TaskArtifactOut
-from app.services.uploads import UploadError, validate_upload_for_task
+from app.config import settings
+from app.services.uploads import (
+    UploadError,
+    load_upload_meta,
+    validate_upload_for_task,
+)
 from app.tools import sandbox_tools
 from app.user_interaction import (
     clear_pending_verify_action,
@@ -174,16 +179,23 @@ def create_task(
     """
     user_input, params = _normalize_request(req)
 
-    # 上传交付物:创建前校验存在 + 归属,快速失败(不落任务直接报错)
-    if req.upload_id:
-        try:
-            validate_upload_for_task(
-                req.upload_id, current_user.id if current_user else None
-            )
-        except UploadError as e:
+    # 上传交付物:创建前校验存在 + 归属 + 数量上限,快速失败(不落任务直接报错)
+    creation_upload_ids = _merged_creation_upload_ids(req)
+    if creation_upload_ids:
+        if len(creation_upload_ids) > settings.UPLOAD_MAX_FILES_PER_MESSAGE:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"单个任务最多关联 {settings.UPLOAD_MAX_FILES_PER_MESSAGE} 个上传文件",
             )
+        for uid in creation_upload_ids:
+            try:
+                validate_upload_for_task(
+                    uid, current_user.id if current_user else None
+                )
+            except UploadError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)
+                )
 
     # 用独立 session 创建 task(不依赖请求级 session,因为要立即返回)
     db = SessionLocal()
@@ -611,6 +623,33 @@ def submit_task_message(
             message=f"任务状态为 {task.status.value},无法接收消息",
         )
 
+    # 追问附件:校验归属 + 数量上限,并构造落库展示信息(失败即拒绝,不落库)。
+    # 复用 validate_upload_for_task 返回的 meta 构造 attachments,免二次读取。
+    followup_ids: list[str] = []
+    for uid in (req.upload_ids or []):
+        if uid and uid not in followup_ids:
+            followup_ids.append(uid)
+    attachments: list[dict] = []
+    if followup_ids:
+        if len(followup_ids) > settings.UPLOAD_MAX_FILES_PER_MESSAGE:
+            raise HTTPException(
+                status_code=422,
+                detail=f"单条消息最多附带 {settings.UPLOAD_MAX_FILES_PER_MESSAGE} 个文件",
+            )
+        for uid in followup_ids:
+            try:
+                meta = validate_upload_for_task(
+                    uid, current_user.id if current_user else None
+                )
+            except UploadError as e:
+                raise HTTPException(status_code=422, detail=str(e))
+            attachments.append({
+                "upload_id": uid,
+                "filename": meta.get("filename") or "上传文件",
+                "size": meta.get("size") or 0,
+                "kind": meta.get("kind") or "file",
+            })
+
     # 后台审查互斥(agent1 结束即任务完成,但 agent2 审查可能仍在后台执行):
     # resume 前先等待审查结束 —— 审查会写对话/结果并操作事件总线,与 resume
     # 线程并发会产生竞态。超时友好拒绝(此时消息尚未落库,不留孤儿记录)。
@@ -645,6 +684,7 @@ def submit_task_message(
         role="user",
         type="message",
         content=content,
+        attachments=attachments or None,
     )
     db.add(conv)
     db.commit()
@@ -663,6 +703,7 @@ def submit_task_message(
         "type": conv.type,
         "content": conv.content,
         "reasoning": conv.reasoning,
+        "attachments": conv.attachments,
         "created_at": conv.created_at.isoformat() if conv.created_at else None,
     })
 
@@ -673,6 +714,7 @@ def submit_task_message(
             task.id, content,
             message_id=str(conv.id),
             created_at=conv.created_at.isoformat() if conv.created_at else "",
+            upload_ids=followup_ids or None,
         )
         return SendMessageResponse(
             accepted=True,
@@ -688,13 +730,24 @@ def submit_task_message(
         # resume_audit_with_message 开头会再设置一次,幂等无冲突。
         task.status = TaskStatus.RUNNING
         task.current_stage = "用户追加消息,重启执行"
+        # 追问上传累积进 params.followup_upload_ids:沙箱回收后
+        # _restore_workspace_if_needed 据此重放追问文件(与创建上传一致可恢复)。
+        # JSONB 需整体重新赋值才能被 SQLAlchemy 追踪变更(不依赖 in-place 突变)
+        if followup_ids:
+            new_params = dict(task.params or {})
+            existing = list(new_params.get("followup_upload_ids") or [])
+            for uid in followup_ids:
+                if uid not in existing:
+                    existing.append(uid)
+            new_params["followup_upload_ids"] = existing
+            task.params = new_params
         db.commit()
 
         # 启动新的协作 round(后台线程)
         # resume_audit_with_message 会把 task.status 保持 RUNNING
         thread = threading.Thread(
             target=_run_resume_in_background,
-            args=(str(task_id), content),
+            args=(str(task_id), content, followup_ids or None),
             daemon=True,
             name=f"task-{task_id}-resume",
         )
@@ -711,7 +764,9 @@ def submit_task_message(
     )
 
 
-def _run_resume_in_background(task_id: str, user_message: str) -> None:
+def _run_resume_in_background(
+    task_id: str, user_message: str, upload_ids: list[str] | None = None,
+) -> None:
     """后台线程执行重启审计(与 _run_task_in_background 对齐)
 
     用独立的 DB session(线程安全),执行完毕后关闭。
@@ -722,7 +777,7 @@ def _run_resume_in_background(task_id: str, user_message: str) -> None:
         if not task:
             logger.error(f"重启任务:task {task_id} 不存在")
             return
-        resume_audit_with_message(task, db, user_message)
+        resume_audit_with_message(task, db, user_message, upload_ids=upload_ids)
     except Exception as e:
         logger.exception(f"[task={task_id}] 重启后台执行失败")
         # 兜底:确保 task 状态被标记为失败
@@ -1897,6 +1952,21 @@ def await_request_disconnect(request: Request) -> bool:
         return False
 
 
+def _merged_creation_upload_ids(req: TaskCreateRequest) -> list[str]:
+    """合并 legacy 单数 upload_id + 多文件 upload_ids,去重保序
+
+    旧客户端只传 upload_id;新客户端传 upload_ids;二者可共存(合并)。
+    供 create_task 校验与 _normalize_request 写 params 复用,保证两处一致。
+    """
+    ids: list[str] = []
+    if req.upload_id:
+        ids.append(req.upload_id)
+    for x in (req.upload_ids or []):
+        if x and x not in ids:
+            ids.append(x)
+    return ids
+
+
 def _normalize_request(req: TaskCreateRequest) -> tuple[str, dict | None]:
     """把请求归一化为 (user_input, params)
 
@@ -1908,7 +1978,9 @@ def _normalize_request(req: TaskCreateRequest) -> tuple[str, dict | None]:
     user_input = None
 
     # 交付物来源互斥:Git 仓库与上传文件不可同时指定
-    if req.upload_id and (req.repo_url or (req.params or {}).get("repo_url")):
+    if (req.upload_id or req.upload_ids) and (
+        req.repo_url or (req.params or {}).get("repo_url")
+    ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="交付物来源只能二选一:Git 仓库或上传文件",
@@ -1941,10 +2013,12 @@ def _normalize_request(req: TaskCreateRequest) -> tuple[str, dict | None]:
             detail="必须提供 user_input 或 repo_url",
         )
 
-    # 上传交付物:合并到 params,orchestrator 据此走上传分支(不 clone)
-    if req.upload_id:
+    # 上传交付物:合并 legacy upload_id + upload_ids 写入 params.upload_ids,
+    # orchestrator._creation_upload_ids 据此走上传分支(不 clone);旧任务读单数兼容
+    creation_upload_ids = _merged_creation_upload_ids(req)
+    if creation_upload_ids:
         params = dict(params or {})
-        params["upload_id"] = req.upload_id
+        params["upload_ids"] = creation_upload_ids
 
     # 验证器配置存入 params._verifier(免迁移;Task 模型通过 @property 读取)
     if req.verifier_enabled and req.test_env_url:

@@ -173,7 +173,7 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         user_intent += f"\n仓库地址: {params['repo_url']}"
     if params.get("branch"):
         user_intent += f"\n分支: {params['branch']}"
-    if params.get("upload_id"):
+    if _creation_upload_ids(params):
         user_intent += "\n交付物来源:用户上传的文件(已就绪在任务工作区,无需 clone)"
 
     # react_agent 历轮结果摘要(给 agent2 评估用)
@@ -975,7 +975,7 @@ def _prepare_repo_context(
     # 上传交付物分支(优先于 clone;创建时已保证与 repo_url 互斥):
     # 把上传内容传输进沙箱工作区。上传文件 agent 无法自行重新获取,
     # 服务端文件缺失/传输失败都直接失败,不降级
-    if params.get("upload_id"):
+    if _creation_upload_ids(params):
         return _prepare_upload_context(task, db, task_id_str)
 
     if not repo_url:
@@ -1068,6 +1068,38 @@ def _prepare_repo_context(
     return repo_path, repo_context
 
 
+def _creation_upload_ids(params: dict | None) -> list[str]:
+    """创建时上传的 upload_id 列表(合并 legacy 单数 upload_id + upload_ids,去重保序)
+
+    旧任务只写单数 upload_id;新任务写 upload_ids 列表。本 helper 统一读取,
+    供 user_intent 提示 / _prepare_repo_context 分发 / _restore_workspace_if_needed
+    判空与传输复用。
+    """
+    p = params or {}
+    ids: list[str] = []
+    if p.get("upload_id"):
+        ids.append(p["upload_id"])
+    for x in (p.get("upload_ids") or []):
+        if x:
+            ids.append(x)
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in ids:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _followup_upload_ids(params: dict | None) -> list[str]:
+    """追问累积上传的 upload_id 列表(读 params.followup_upload_ids)
+
+    沙箱回收后 _restore_workspace_if_needed 需重放这些文件到 followup_uploads/,
+    保证追问上传与创建上传一样可在恢复后重现。
+    """
+    return [x for x in ((params or {}).get("followup_upload_ids") or []) if x]
+
+
 def _prepare_upload_context(
     task: Task, db: Session, task_id_str: str,
 ) -> tuple[str, str]:
@@ -1079,6 +1111,10 @@ def _prepare_upload_context(
       抛异常让任务失败,不降级——降级只会让 agent 对着不存在的仓库盲跑
     - repo_context 的 header 明确"文件已就绪",提示 agent1 跳过 clone
       直接开始处理
+
+    支持创建时多文件(upload_ids):
+    - 单个上传:文件直接铺在工作根 uploaded_files/(保持既有布局)
+    - 多个上传:工作根 = uploaded_files/,各上传各占 {i}-{清洗文件名}/ 子目录防碰撞
     """
     from app.services.uploads import (
         UploadError,
@@ -1086,11 +1122,17 @@ def _prepare_upload_context(
         materialize_upload_files,
     )
 
-    upload_id = (task.params or {}).get("upload_id")
-    try:
-        meta = load_upload_meta(upload_id)
-    except UploadError as e:
-        raise RuntimeError(f"上传内容不可用: {e}") from e
+    creation_ids = _creation_upload_ids(task.params)
+    if not creation_ids:
+        raise RuntimeError("上传交付物不可用:缺少 upload_id")
+
+    # 预加载各上传 meta(供 header 文案;缺失即失败,不降级)
+    metas: list[dict] = []
+    for uid in creation_ids:
+        try:
+            metas.append(load_upload_meta(uid))
+        except UploadError as e:
+            raise RuntimeError(f"上传内容不可用: {e}") from e
 
     task.current_stage = "正在把上传文件传输进任务工作区..."
     db.commit()
@@ -1099,13 +1141,23 @@ def _prepare_upload_context(
     # materialize:local 后端直接给真源目录(退出不删);s3 后端下载到临时目录,
     # with 退出即清理——故传输进沙箱必须在 with 块内完成。
     try:
-        with materialize_upload_files(upload_id) as files_dir:
-            repo_path = sandbox_tools.transfer_upload_to_workspace(
-                task_id_str, str(files_dir)
+        if len(creation_ids) == 1:
+            # 单个上传:保持既有根布局(文件直接铺在 uploaded_files/)
+            with materialize_upload_files(creation_ids[0]) as files_dir:
+                repo_path = sandbox_tools.transfer_upload_to_workspace(
+                    task_id_str, str(files_dir)
+                )
+        else:
+            # 多个上传:工作根 = uploaded_files/,各上传进 {i}-{name}/ 子目录
+            repo_path = sandbox_tools.transfer_uploads_to_workspace_root(
+                task_id_str, creation_ids
             )
     except UploadError as e:
         raise RuntimeError(f"上传内容不可用: {e}") from e
-    logger.info(f"[task={task.id}] 上传交付物传输完成,path={repo_path}")
+    logger.info(
+        f"[task={task.id}] 上传交付物传输完成,path={repo_path},"
+        f"count={len(creation_ids)}"
+    )
 
     # 根目录列表 → repo_context(同 clone 分支;list_files 复用同一会话)
     try:
@@ -1129,12 +1181,20 @@ def _prepare_upload_context(
         )
         return repo_path, ""
 
-    filename = meta.get("filename") or "上传文件"
-    file_count = meta.get("file_count") or "?"
-    header = (
-        f"用户上传的交付物({filename},共 {file_count} 个文件)"
-        f"已就绪在 {repo_path},可直接开始处理,无需 clone"
-    )
+    if len(creation_ids) == 1:
+        meta = metas[0]
+        filename = meta.get("filename") or "上传文件"
+        file_count = meta.get("file_count") or "?"
+        header = (
+            f"用户上传的交付物({filename},共 {file_count} 个文件)"
+            f"已就绪在 {repo_path},可直接开始处理,无需 clone"
+        )
+    else:
+        names = "、".join((m.get("filename") or "上传文件") for m in metas)
+        header = (
+            f"用户上传的 {len(creation_ids)} 个交付物({names})"
+            f"已就绪在 {repo_path}(各占独立子目录),可直接开始处理,无需 clone"
+        )
     repo_context = _format_repo_context("", repo_path, files_result, header=header)
     return repo_path, repo_context
 
@@ -1247,13 +1307,14 @@ def _restore_workspace_if_needed(
     """
     params = task.params or {}
     repo_url = params.get("repo_url")
-    upload_id = params.get("upload_id")
+    creation_ids = _creation_upload_ids(params)
+    followup_ids = _followup_upload_ids(params)
     if (
-        not (repo_url or upload_id)
+        not (repo_url or creation_ids)
         or sandbox_tools.get_workspace_info(task_id_str) is not None
     ):
         return False
-    is_upload_task = bool(upload_id)
+    is_upload_task = bool(creation_ids)
     logger.info(
         f"[task={task.id}] 沙箱会话已回收,"
         + ("重新传输上传文件恢复工作区" if is_upload_task else "重新克隆仓库恢复工作区")
@@ -1266,6 +1327,18 @@ def _restore_workspace_if_needed(
     db.commit()
     _publish_status(task)
     _prepare_repo_context(task, db, task_id_str, git_tokens)
+    # 追问上传同样需重放(沙箱回收后追问文件与创建文件一起丢失):
+    # 传输到 followup_uploads/,与运行中追问落地位置一致(agent 目录级感知)。
+    # 失败不阻断恢复(创建内容已就位,追问文件缺失仅影响该部分上下文)。
+    if followup_ids:
+        try:
+            sandbox_tools.add_uploads_to_workspace(
+                task_id_str, followup_ids, "followup_uploads"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[task={task.id}] 恢复追问上传文件失败(忽略): {e}"
+            )
     return True
 
 
@@ -1276,6 +1349,7 @@ def _restore_workspace_if_needed(
 
 def resume_audit_with_message(
     task: Task, db: Session, user_message: str, retry: bool = False,
+    upload_ids: list[str] | None = None,
 ) -> None:
     """用户在任务完成后追加消息,重启执行(后台审查版)
 
@@ -1368,11 +1442,34 @@ def resume_audit_with_message(
         time.perf_counter() - _t0,
     )
 
+    # 本轮追问附带的文件:传输进工作区 followup_uploads/(不重定向 repo_path)。
+    # restored=True 时 _restore_workspace_if_needed 已按 params.followup_upload_ids
+    # 重放(API 端点在调用前已把本轮新 ids 写入 params),此处跳过避免重复传输;
+    # restored=False(会话存活)时才需显式传输本轮新文件。
+    attachment_note = ""
+    if upload_ids:
+        if not restored:
+            try:
+                sandbox_tools.add_uploads_to_workspace(
+                    task_id_str, upload_ids, "followup_uploads"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[task={task.id}] 追问上传文件传输失败(忽略,文字消息照常处理): {e}"
+                )
+        attachment_note = (
+            "\n\n[本轮附带文件已放入工作区 followup_uploads/ 目录,"
+            "可用 list_files / read_file 查看]"
+        )
+
+    # agent1 本轮执行的追问文本(含附件提示,让 agent 感知新文件)
+    followup_text = user_message + attachment_note
+
     # 把用户消息拼到 user_intent 后面,供 agent1 结束后的后台审查参考
     # (审查需知道完整意图,含追问/重试语境);重试场景用专门标记,
     # 避免审查把续跑当成用户新增需求
     msg_label = "[重试续跑]" if retry else "[用户追加消息]"
-    effective_intent = task.user_input + f"\n\n{msg_label}\n{user_message}"
+    effective_intent = task.user_input + f"\n\n{msg_label}\n{followup_text}"
 
     # 本轮是否正常完成(内存标志):与 run_dual_agent_audit 同理,
     # finally 兑底 error 推送必须用它判定,不能用 task.status ——
@@ -1393,7 +1490,7 @@ def resume_audit_with_message(
         _results, summary, current_plan = executor.run(
             task, db,
             round_idx=start_round_idx,
-            followup_query=user_message,
+            followup_query=followup_text,
             client=react_client,
             repo_context=None,  # 重启不传 repo_context(仓库已 clone,react_agent 自行从 sandbox 取)
             previous_plan=previous_plan,  # plan 跨轮续接(见上方加载注释)

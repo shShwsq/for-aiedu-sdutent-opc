@@ -406,30 +406,95 @@ def clone_repo(repo_url: str, branch: str | None = None, task_id: str = "", git_
     return clone_repo_with_fallback(repo_url, branch, task_id, git_tokens or {})
 
 
-def transfer_upload_to_workspace(
-    task_id: str, files_dir: str, dest_name: str = "uploaded_files",
+def _safe_dirname(name: str, fallback: str = "upload") -> str:
+    """把任意文件名清洗为安全的单层目录名(追问多文件防碰撞用)
+
+    只保留字母数字与 . _ -,其余换为 _;剔除 .. / 前后缀 dot;限长 80。
+    """
+    base = (name or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    base = base.replace("..", "_")
+    cleaned = "".join(c if (c.isalnum() or c in "._-") else "_" for c in base)
+    cleaned = cleaned.strip("._")
+    return (cleaned or fallback)[:80]
+
+
+def _copy_local_dir_into_workspace(
+    ctx: dict[str, Any], src_local: Path, dest_path: str, clear_dest: bool,
 ) -> str:
-    """把服务端上传目录(files_dir)传输进任务沙箱工作区,返回 repo_path
+    """把本地目录 src_local 拷进工作区的 dest_path(绝对路径),返回 dest_path
 
-    orchestrator 上传分支调用(任务 params.upload_id 时替代 clone)。
-    上传内容无法像 git 仓库那样被 agent 自主重新获取,本函数是上传
-    任务进入沙箱的唯一入口(resume/重试链路经 _prepare_repo_context
-    复用,天然幂等:目标目录已存在时先清空再写入)。
-
-    - local 模式:直接 copytree 到 {local_dir}/{dest_name}
+    传输底层原语,transfer_upload_to_workspace 与 add_uploads_to_workspace 共用:
+    - local 模式:copytree(clear_dest 时先 rmtree dest)
     - sandbox 模式:内存重打包 zip → base64 分块写入(文本接口)→
       沙箱内解码解压。SandboxSession.write_file 只支持 UTF-8 文本,
       二进制安全传输必须走 base64;重打包条目均为相对 posix 路径,
-      extractall 无 zip-slip 风险(上传时的 zip-slip 已在
-      services/uploads.py 校验过一遍)。
+      extractall 无 zip-slip 风险(上传时的 zip-slip 已在 services/uploads.py 校验过)。
 
-    传输完成即 _set_repo_path(与 clone_repo_with_fallback 一致),
-    react_agent / workspace 路由可直接通过 task_id 复用。
+    不碰 _set_repo_path(由调用方决定是否重定向工作根)。
     """
     import base64
     import io
     import zipfile
 
+    mode = ctx["mode"]
+    if mode == "local":
+        dest = Path(dest_path)
+        if clear_dest and dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src_local, dest)
+        return str(dest)
+
+    session: SandboxSession = ctx["session"]
+    # 上传树 → 内存 zip → base64 文本
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in sorted(src_local.rglob("*")):
+            if p.is_file():
+                zf.write(p, p.relative_to(src_local).as_posix())
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    # 单块 3MB b64 文本(ASCII,可作 UTF-8 安全走 write_file 文本接口)
+    chunk_size = 3 * 1024 * 1024
+    tmp_dir = f"/tmp/upload_{uuid.uuid4().hex[:8]}"
+    rm_dest = f"rm -rf {shlex.quote(dest_path)} && " if clear_dest else ""
+    session.run_command(
+        f"{rm_dest}mkdir -p {shlex.quote(dest_path)} {shlex.quote(tmp_dir)}"
+    )
+    try:
+        for i in range(0, len(b64), chunk_size):
+            session.write_file(
+                f"{tmp_dir}/{i // chunk_size:05d}.b64", b64[i:i + chunk_size]
+            )
+        # 拼接解码 + 解压(base64 为 coreutils 常备;python3 沙箱必有)
+        session.run_command(
+            f"cat {tmp_dir}/*.b64 | base64 -d > {tmp_dir}.zip && "
+            f"python3 -c \"import zipfile;"
+            f"zipfile.ZipFile('{tmp_dir}.zip').extractall('{dest_path}')\"",
+            timeout=300, check=True,
+        )
+    finally:
+        session.run_command(
+            f"rm -rf {shlex.quote(tmp_dir)} {shlex.quote(tmp_dir)}.zip"
+        )
+    return dest_path
+
+
+def transfer_upload_to_workspace(
+    task_id: str, files_dir: str, dest_name: str = "uploaded_files",
+) -> str:
+    """把服务端上传目录(files_dir)传输进任务沙箱工作区,返回 repo_path
+
+    orchestrator 上传分支调用(任务 params 含创建上传时替代 clone)。
+    上传内容无法像 git 仓库那样被 agent 自主重新获取,本函数是创建上传
+    进入沙箱的入口(resume/重试链路经 _prepare_repo_context 复用,
+    天然幂等:目标目录已存在时先清空再写入)。
+
+    - local 模式:拷到 {local_dir}/{dest_name}
+    - sandbox 模式:拷到 /home/user/repos/{dest_name}
+
+    传输完成即 _set_repo_path(与 clone_repo_with_fallback 一致),
+    react_agent / workspace 路由可直接通过 task_id 复用。
+    """
     src = Path(files_dir)
     if not src.is_dir():
         raise ValueError(f"上传目录不存在: {files_dir}")
@@ -437,49 +502,137 @@ def transfer_upload_to_workspace(
     ctx = _get_or_create_session(task_id)
     mode = ctx["mode"]
     if mode == "local":
-        repo_dir = ctx["local_dir"] / dest_name
-        if repo_dir.exists():
-            shutil.rmtree(repo_dir, ignore_errors=True)
-        shutil.copytree(src, repo_dir)
-        repo_path = str(repo_dir)
+        dest_path = str(Path(ctx["local_dir"]) / dest_name)
     else:
-        session: SandboxSession = ctx["session"]
-        repo_dir = f"/home/user/repos/{dest_name}"
-        # 上传树 → 内存 zip → base64 文本
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for p in sorted(src.rglob("*")):
-                if p.is_file():
-                    zf.write(p, p.relative_to(src).as_posix())
-        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-        # 单块 3MB b64 文本(ASCII,可作 UTF-8 安全走 write_file 文本接口)
-        chunk_size = 3 * 1024 * 1024
-        tmp_dir = f"/tmp/upload_{uuid.uuid4().hex[:8]}"
-        session.run_command(
-            f"rm -rf {shlex.quote(repo_dir)} {shlex.quote(tmp_dir)} && "
-            f"mkdir -p {shlex.quote(repo_dir)} {shlex.quote(tmp_dir)}"
-        )
-        try:
-            for i in range(0, len(b64), chunk_size):
-                session.write_file(
-                    f"{tmp_dir}/{i // chunk_size:05d}.b64", b64[i:i + chunk_size]
-                )
-            # 拼接解码 + 解压(base64 为 coreutils 常备;python3 沙箱必有)
-            session.run_command(
-                f"cat {tmp_dir}/*.b64 | base64 -d > {tmp_dir}.zip && "
-                f"python3 -c \"import zipfile;"
-                f"zipfile.ZipFile('{tmp_dir}.zip').extractall('{repo_dir}')\"",
-                timeout=300, check=True,
-            )
-        finally:
-            session.run_command(
-                f"rm -rf {shlex.quote(tmp_dir)} {shlex.quote(tmp_dir)}.zip"
-            )
-        repo_path = repo_dir
+        dest_path = f"/home/user/repos/{dest_name}"
 
+    repo_path = _copy_local_dir_into_workspace(ctx, src, dest_path, clear_dest=True)
     _set_repo_path(task_id, repo_path)
     logger.info(
         f"[uploads] 传输完成: task={task_id}, mode={mode}, repo_path={repo_path}"
+    )
+    return repo_path
+
+
+def _exclude_from_git(ctx: dict[str, Any], repo_path: str, dest_subdir: str) -> None:
+    """把追问上传目录写入 .git/info/exclude(幂等),避免污染 git diff
+
+    仅当工作区是 git 仓库(存在 .git)时生效;非 git 工作区静默跳过。
+    失败不报错(追问文件已落地,排除仅为避免 diff 噪声)。
+    """
+    line = f"{dest_subdir.rstrip('/')}/"
+    try:
+        if ctx["mode"] == "local":
+            git_dir = Path(repo_path) / ".git"
+            if not git_dir.is_dir():
+                return
+            info = git_dir / "info"
+            info.mkdir(parents=True, exist_ok=True)
+            excl = info / "exclude"
+            existing = excl.read_text(encoding="utf-8") if excl.exists() else ""
+            if line not in existing.splitlines():
+                with open(excl, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+        else:
+            session: SandboxSession = ctx["session"]
+            rp = shlex.quote(repo_path)
+            ln = shlex.quote(line)
+            session.run_command(
+                f"if [ -d {rp}/.git ]; then mkdir -p {rp}/.git/info; "
+                f"grep -qxF {ln} {rp}/.git/info/exclude 2>/dev/null || "
+                f"echo {ln} >> {rp}/.git/info/exclude; fi"
+            )
+    except Exception as e:
+        logger.warning(f"[uploads] 写入 .git/info/exclude 失败(忽略): {e}")
+
+
+def add_uploads_to_workspace(
+    task_id: str, upload_ids: list[str], dest_subdir: str = "followup_uploads",
+) -> list[str]:
+    """把追问上传的多个文件追加进现有工作区,返回相对工作根的 posix 路径列表
+
+    与 transfer_upload_to_workspace 的关键区别:
+    - 不重定向 repo_path(不调 _set_repo_path),agent 继续在原工作根作业;
+    - 不清空现有内容(每个上传落入 {repo_path}/{dest_subdir}/{i}-{name}/ 独立子目录);
+    - git 工作区把 {dest_subdir}/ 写入 .git/info/exclude,不进 diff。
+
+    供运行中追问(react_agent drain)与完成后 resume 共用。
+    工作区未就绪(repo_path 为空)时抛 RuntimeError,由调用方处置。
+    """
+    from app.services.uploads import load_upload_meta, materialize_upload_files
+
+    if not upload_ids:
+        return []
+    ctx = _get_or_create_session(task_id)
+    repo_path = ctx.get("repo_path", "")
+    if not repo_path:
+        raise RuntimeError("工作区尚未就绪,无法追加上传文件")
+
+    added: list[str] = []
+    for i, uid in enumerate(upload_ids):
+        try:
+            meta = load_upload_meta(uid)
+        except Exception:
+            meta = {}
+        name = _safe_dirname(meta.get("filename") or "", fallback=uid[:12] or "upload")
+        dest_rel = f"{dest_subdir.strip('/')}/{i}-{name}"
+        if ctx["mode"] == "local":
+            dest_abs = str(Path(repo_path) / dest_rel)
+        else:
+            dest_abs = f"{repo_path.rstrip('/')}/{dest_rel}"
+        with materialize_upload_files(uid) as files_dir:
+            _copy_local_dir_into_workspace(ctx, files_dir, dest_abs, clear_dest=True)
+        added.append(dest_rel)
+        logger.info(f"[uploads] 追问文件已追加: task={task_id}, upload_id={uid}, dest={dest_abs}")
+
+    _exclude_from_git(ctx, repo_path, dest_subdir)
+    return added
+
+
+def transfer_uploads_to_workspace_root(
+    task_id: str, upload_ids: list[str], dest_name: str = "uploaded_files",
+) -> str:
+    """创建时的多上传:建空工作根 {dest_name}/ 并把每个上传拷进子目录,返回 repo_path
+
+    与单个上传的 transfer_upload_to_workspace(文件直接铺在根)不同:
+    多上传时工作根 = {dest_name}/,各上传各占 {i}-{清洗文件名}/ 子目录防碰撞。
+    会 _set_repo_path 为工作根(与单个上传一致,agent 以根为工作区)。
+    """
+    from app.services.uploads import load_upload_meta, materialize_upload_files
+
+    if not upload_ids:
+        raise ValueError("upload_ids 为空")
+    ctx = _get_or_create_session(task_id)
+    mode = ctx["mode"]
+    if mode == "local":
+        root = Path(ctx["local_dir"]) / dest_name
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        repo_path = str(root)
+    else:
+        repo_path = f"/home/user/repos/{dest_name}"
+        ctx["session"].run_command(
+            f"rm -rf {shlex.quote(repo_path)} && mkdir -p {shlex.quote(repo_path)}"
+        )
+    _set_repo_path(task_id, repo_path)
+
+    for i, uid in enumerate(upload_ids):
+        try:
+            meta = load_upload_meta(uid)
+        except Exception:
+            meta = {}
+        name = _safe_dirname(meta.get("filename") or "", fallback=uid[:12] or "upload")
+        dest_rel = f"{i}-{name}"
+        dest_abs = (
+            str(Path(repo_path) / dest_rel) if mode == "local"
+            else f"{repo_path}/{dest_rel}"
+        )
+        with materialize_upload_files(uid) as files_dir:
+            _copy_local_dir_into_workspace(ctx, files_dir, dest_abs, clear_dest=True)
+    logger.info(
+        f"[uploads] 多上传传输完成: task={task_id}, mode={mode}, "
+        f"count={len(upload_ids)}, repo_path={repo_path}"
     )
     return repo_path
 

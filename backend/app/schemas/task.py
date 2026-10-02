@@ -73,6 +73,9 @@ class TaskCreateRequest(BaseModel):
     # 与 repo_url 互斥(同时提供报 422);只提供上传时 user_input 仍必填
     # (描述要处理什么任务),文件作为附件进入沙箱工作区
     upload_id: str | None = Field(default=None, max_length=64, pattern="^[A-Za-z0-9-]+$")
+    # 多文件上传(新):与 upload_id 合并去重后逐个校验归属与数量上限。
+    # 旧客户端仍传单数 upload_id,新客户端传 upload_ids;二者可共存(合并)
+    upload_ids: list[str] | None = None
 
     # 验证器配置(可选):agent2 可自主调用 verifier_agent 在已部署的测试环境验证
     # react_agent 的发现。对用户透明(前端不出现 verifier_agent 字样,只显示"正在验证")。
@@ -117,6 +120,9 @@ class ConversationResponse(BaseModel):
     reasoning: str | None = None
     # 仅 type=tool_result 有:对应 tool_call 会话记录的 id,前端据此配对展示
     tool_call_id: str | None = None
+    # 仅 user 追问消息有:附带上传文件展示信息(刷新后气泡仍渲染 chip)。
+    # 每项 {upload_id, filename, size, kind};其他消息/历史数据为 None
+    attachments: list[dict[str, Any]] | None = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -208,6 +214,9 @@ class SendMessageRequest(BaseModel):
     """
 
     content: str = Field(min_length=1, max_length=8000)
+    # 本条追问附带的上传文件 id(可空;逐个校验归属,数量受
+    # UPLOAD_MAX_FILES_PER_MESSAGE 约束)。附件随非空文字消息发送
+    upload_ids: list[str] | None = None
 
 
 class SendMessageResponse(BaseModel):

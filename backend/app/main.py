@@ -140,6 +140,7 @@ async def lifespan(app: FastAPI):
     migrate_agent_policy_drop_max_rounds_column()
     # 加 conversations.tool_call_id 列(tool_result 关联对应 tool_call,并行调用时前端精确配对)
     from app.models.task import (
+        migrate_conversation_add_attachments_column,
         migrate_conversation_tool_call_id,
         migrate_stale_review_status,
         migrate_task_add_review_status_column,
@@ -147,6 +148,8 @@ async def lifespan(app: FastAPI):
     )
 
     migrate_conversation_tool_call_id()
+    # 追问多文件上传:加 conversations.attachments 列(附件展示信息,刷新后气泡仍渲染 chip)
+    migrate_conversation_add_attachments_column()
     # 覆盖度清单功能移除:删 tasks.checklist 旧列(幂等)
     migrate_task_drop_checklist_column()
     # agent2 后台审查:加 tasks.review_status 列 + 清理遗留 running 状态

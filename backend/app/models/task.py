@@ -189,6 +189,9 @@ class Conversation(Base):
     # 并行工具调用时 result 不再紧跟 call 落库,前端靠它精确配对 call/result;
     # 历史数据为 None,前端回退相邻配对
     tool_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 仅 user 追问消息有:本条消息附带的上传文件展示信息(刷新后气泡仍渲染 chip)。
+    # 每项 {"upload_id", "filename", "size", "kind"};其他消息/历史数据为 None
+    attachments: Mapped[list | None] = mapped_column(JSONB, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -226,6 +229,35 @@ def migrate_conversation_tool_call_id() -> None:
         )
         conn.commit()
     log.info("conversations.tool_call_id 列迁移完成")
+
+
+def migrate_conversation_add_attachments_column() -> None:
+    """幂等给 conversations 加 attachments 列(追问消息附带的上传文件展示信息)
+
+    背景同 migrate_conversation_tool_call_id:无 Alembic,老库需显式 ALTER。
+    全新库(create_all 已建好)或已迁过 → 直接返回。老数据该列为 NULL,
+    前端不渲染附件 chip,行为与改动前一致。
+    """
+    import logging
+
+    from sqlalchemy import inspect, text
+
+    from app.database import engine
+
+    log = logging.getLogger(__name__)
+
+    with engine.connect() as conn:
+        insp = inspect(conn)
+        if not insp.has_table("conversations"):
+            return  # 全新库,create_all 会建好新列
+        cols = {c["name"] for c in insp.get_columns("conversations")}
+        if "attachments" in cols:
+            return  # 已迁过
+        conn.execute(
+            text("ALTER TABLE conversations ADD COLUMN attachments JSONB")
+        )
+        conn.commit()
+    log.info("conversations.attachments 列迁移完成")
 
 
 def migrate_task_drop_checklist_column() -> None:
