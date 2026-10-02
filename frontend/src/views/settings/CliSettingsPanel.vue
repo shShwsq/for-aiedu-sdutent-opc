@@ -1,25 +1,13 @@
 <script setup lang="ts">
 /**
- * CLI 智能体设置页(选项卡 + 内联表单)
+ * CLI 智能体设置面板(嵌套在 SettingsLayout 内)
  *
  * 顶部选项卡动态加载后端所有已注册 agent 类型(GET /agents/types),
  * 下方平铺当前 agent 的内联配置表单(AgentConfigPanel)。
- *
- * 每个 agent 拥有独立的 Panel 实例(v-if 懒挂载 + v-show 切换):
- * - 草稿、滚动位置、进行中的测试流跨 tab 切换都保留,互不串台
- * - 首次点开某 tab 才加载该 agent 的 detail,避免进页面即并发多个请求
- *
- * 状态按 agent_type 隔离(states Record),SSE 测试回调闭包绑定到对应 entry,
- * 杜绝"A 发起测试 → 切到 B,B 的界面冒出 A 的流"的串台问题。
- *
- * 离开页面时(onUnmounted)中止所有进行中的测试流,避免后端沙箱空跑。
  */
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 
-import AppHeader from '@/components/AppHeader.vue'
 import AgentConfigPanel from '@/components/AgentConfigPanel.vue'
-import WorkspaceSidebar from '@/components/WorkspaceSidebar.vue'
-import WorkspaceToggleButton from '@/components/WorkspaceToggleButton.vue'
 import {
   deleteAgentConfig,
   getAgentConfig,
@@ -34,13 +22,6 @@ import type {
   AgentTypeMeta,
   CredentialValue,
 } from '@/types/agent_configs'
-
-/** 历史任务侧栏是否折叠(默认折叠) */
-const workspaceCollapsed = ref(true)
-
-function toggleWorkspace(): void {
-  workspaceCollapsed.value = !workspaceCollapsed.value
-}
 
 // ============================================================
 // Toast(顶部居中,5s 自动消失)
@@ -268,92 +249,75 @@ async function handleTest(type: string): Promise<void> {
 </script>
 
 <template>
-  <div class="page">
-    <AppHeader>
-      <template #leading>
-        <WorkspaceToggleButton
-          :collapsed="workspaceCollapsed"
-          expand-title="展开历史任务"
-          collapse-title="折叠历史任务"
-          @toggle="toggleWorkspace"
-        />
-      </template>
-    </AppHeader>
-
-    <div class="page-body">
-      <WorkspaceSidebar v-if="!workspaceCollapsed" />
-
-      <main class="main">
-        <!-- 加载中 -->
-        <div v-if="agentTypesLoading" class="loading">
-          <div class="spinner" />
-          <span>加载中...</span>
-        </div>
-
-        <!-- 空状态:无可用 agent 类型或加载失败 -->
-        <div v-else-if="agentTypes.length === 0" class="empty">
-          <p class="empty-title">暂无可用的 CLI 智能体类型</p>
-          <p class="empty-desc">请检查后端 agent 注册表或稍后重试</p>
-        </div>
-
-        <template v-else>
-          <!-- 固定头部(居中,不随面板滚动) -->
-          <div class="main-inner">
-            <!-- 页头 -->
-            <div class="page-header">
-              <h1>CLI 智能体设置</h1>
-            </div>
-
-            <!-- ============ 选项卡 ============ -->
-            <div class="tab-bar" role="tablist">
-              <button
-                v-for="(meta, idx) in agentTypes"
-                :key="meta.agent_type"
-                :ref="(el) => { if (el) tabRefs[idx] = el as HTMLElement }"
-                class="tab"
-                :class="{ 'tab-active': activeType === meta.agent_type }"
-                role="tab"
-                :aria-selected="activeType === meta.agent_type"
-                :tabindex="activeType === meta.agent_type ? 0 : -1"
-                @click="activateTab(meta)"
-              >
-                {{ meta.display_name }}
-              </button>
-            </div>
-          </div>
-
-          <!-- ============ 面板滚动区(全宽,滚动条贴界面右边;仅此区滚动,header/tab 固定在顶部) ============ -->
-          <div class="panels-scroll">
-            <div class="panels-col">
-              <div
-                v-for="p in panels"
-                :key="p.meta.agent_type"
-                role="tabpanel"
-              >
-                <AgentConfigPanel
-                  v-if="activated.has(p.meta.agent_type)"
-                  v-show="activeType === p.meta.agent_type"
-                  :meta="p.meta"
-                  :detail="p.state.detail"
-                  :saving="p.state.saving || p.state.detailLoading"
-                  :error="p.state.error"
-                  :testing="p.state.testing"
-                  :test-result="p.state.testResult"
-                  :test-stage="p.state.testStage"
-                  :test-thinking="p.state.testThinking"
-                  :test-content="p.state.testContent"
-                  @save="(creds, active) => handleSave(p.meta.agent_type, creds, active)"
-                  @clear="handleClear(p.meta.agent_type)"
-                  @test="handleTest(p.meta.agent_type)"
-                />
-              </div>
-            </div>
-          </div>
-        </template>
-      </main>
+  <div class="panel">
+    <!-- 加载中 -->
+    <div v-if="agentTypesLoading" class="loading">
+      <div class="spinner" />
+      <span>加载中...</span>
     </div>
 
-    <!-- ============ 浮动提示弹窗(Teleport 到 body,顶部居中,5s 自动消失) ============ -->
+    <!-- 空状态:无可用 agent 类型或加载失败 -->
+    <div v-else-if="agentTypes.length === 0" class="empty">
+      <p class="empty-title">暂无可用的 CLI 智能体类型</p>
+      <p class="empty-desc">请检查后端 agent 注册表或稍后重试</p>
+    </div>
+
+    <template v-else>
+      <!-- 固定头部(居中,不随面板滚动) -->
+      <div class="panel-inner">
+        <!-- 页头 -->
+        <div class="page-header">
+          <h1>CLI 智能体设置</h1>
+        </div>
+
+        <!-- ============ 选项卡 ============ -->
+        <div class="tab-bar" role="tablist">
+          <button
+            v-for="(meta, idx) in agentTypes"
+            :key="meta.agent_type"
+            :ref="(el) => { if (el) tabRefs[idx] = el as HTMLElement }"
+            class="tab"
+            :class="{ 'tab-active': activeType === meta.agent_type }"
+            role="tab"
+            :aria-selected="activeType === meta.agent_type"
+            :tabindex="activeType === meta.agent_type ? 0 : -1"
+            @click="activateTab(meta)"
+          >
+            {{ meta.display_name }}
+          </button>
+        </div>
+      </div>
+
+      <!-- ============ 面板滚动区 ============ -->
+      <div class="panels-scroll">
+        <div class="panels-col">
+          <div
+            v-for="p in panels"
+            :key="p.meta.agent_type"
+            role="tabpanel"
+          >
+            <AgentConfigPanel
+              v-if="activated.has(p.meta.agent_type)"
+              v-show="activeType === p.meta.agent_type"
+              :meta="p.meta"
+              :detail="p.state.detail"
+              :saving="p.state.saving || p.state.detailLoading"
+              :error="p.state.error"
+              :testing="p.state.testing"
+              :test-result="p.state.testResult"
+              :test-stage="p.state.testStage"
+              :test-thinking="p.state.testThinking"
+              :test-content="p.state.testContent"
+              @save="(creds, active) => handleSave(p.meta.agent_type, creds, active)"
+              @clear="handleClear(p.meta.agent_type)"
+              @test="handleTest(p.meta.agent_type)"
+            />
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- ============ 浮动提示弹窗 ============ -->
     <Teleport to="body">
       <Transition name="toast-slide">
         <div
@@ -387,34 +351,15 @@ async function handleTest(type: string): Promise<void> {
 </template>
 
 <style scoped>
-.page {
+.panel {
   display: flex;
   flex-direction: column;
-  height: 100vh;
-  /* 手机地址栏伸缩兜底 */
-  height: 100dvh;
-  overflow: hidden;
-  background: var(--color-bg);
-}
-
-.page-body {
-  flex: 1;
-  display: flex;
-  align-items: stretch;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
+  height: 100%;
   overflow: hidden;
 }
 
 /* 固定头部(页头 + 选项卡):全宽容器内居中 */
-.main-inner {
+.panel-inner {
   flex-shrink: 0;
   width: 100%;
   max-width: 680px;
@@ -429,6 +374,7 @@ async function handleTest(type: string): Promise<void> {
   justify-content: center;
   gap: var(--space-3);
   flex: 1;
+  padding: var(--space-16);
   color: var(--color-text-secondary);
 }
 
@@ -469,7 +415,7 @@ async function handleTest(type: string): Promise<void> {
   margin: 0;
 }
 
-/* ---- 页头(固定,不随内容滚动) ---- */
+/* ---- 页头 ---- */
 .page-header {
   display: flex;
   align-items: flex-start;
@@ -486,7 +432,7 @@ async function handleTest(type: string): Promise<void> {
 
 /* ---- 响应式:窄屏(手机) ---- */
 @media (max-width: 640px) {
-  .main-inner {
+  .panel-inner {
     padding: var(--space-4) var(--space-3) 0;
   }
 
@@ -496,7 +442,6 @@ async function handleTest(type: string): Promise<void> {
     gap: var(--space-2);
   }
 
-  /* 选项卡项多时横向滑动,不挤压换行 */
   .tab-bar {
     overflow-x: auto;
     scrollbar-width: none;
@@ -511,7 +456,7 @@ async function handleTest(type: string): Promise<void> {
   }
 }
 
-/* ---- 选项卡栏(固定,不随内容滚动) ---- */
+/* ---- 选项卡栏 ---- */
 .tab-bar {
   display: flex;
   gap: var(--space-1);
@@ -520,14 +465,13 @@ async function handleTest(type: string): Promise<void> {
   flex-shrink: 0;
 }
 
-/* ---- 面板滚动区(全宽,垂直滚动条贴界面右边;仅此区滚动) ---- */
+/* ---- 面板滚动区 ---- */
 .panels-scroll {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
 }
 
-/* 面板内容列:在滚动区内部居中 */
 .panels-col {
   max-width: 680px;
   margin: 0 auto;
@@ -558,7 +502,7 @@ async function handleTest(type: string): Promise<void> {
   font-weight: var(--fw-semibold);
 }
 
-/* ---- 浮动提示弹窗(顶部居中,5s 自动消失) ---- */
+/* ---- 浮动提示弹窗 ---- */
 .toast-popup {
   position: fixed;
   top: var(--space-5);

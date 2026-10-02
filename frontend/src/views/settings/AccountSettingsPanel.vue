@@ -1,22 +1,17 @@
 <script setup lang="ts">
 /**
- * 设置页(表格 + 弹窗)
+ * 账户设置面板(嵌套在 SettingsLayout 内)
  *
  * 账号相关配置合并为一张表格展示,点击行打开对应弹窗编辑:
  * - 登录密码:已设密码 → 修改(验证当前密码);未设密码 → 设置
  * - GitHub 账号:已绑定 → 查看 + 解绑;未绑定 → 跳转授权页绑定
- *
- * 与 ModelSettingsView 风格一致(表格 + 弹窗 + 顶部居中 toast)。
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
-import AppHeader from '@/components/AppHeader.vue'
 import DeleteAccountDialog from '@/components/DeleteAccountDialog.vue'
 import GitProviderDialog from '@/components/GitProviderDialog.vue'
 import PasswordDialog from '@/components/PasswordDialog.vue'
-import WorkspaceSidebar from '@/components/WorkspaceSidebar.vue'
-import WorkspaceToggleButton from '@/components/WorkspaceToggleButton.vue'
 import { changePassword, deleteAccount } from '@/api/auth'
 import {
   getGitBindURL,
@@ -32,13 +27,6 @@ import { extractErrorMessage } from '@/utils/error'
 const route = useRoute()
 const router = useRouter()
 const authStore = useAuthStore()
-
-/** 历史任务侧栏是否折叠(默认折叠) */
-const workspaceCollapsed = ref(true)
-
-function toggleWorkspace(): void {
-  workspaceCollapsed.value = !workspaceCollapsed.value
-}
 
 /** OAuth 用户未设密码时为 false */
 const hasPassword = computed(() => authStore.user?.has_password ?? false)
@@ -344,173 +332,156 @@ onMounted(() => {
     syncError.value = ''
     syncDialogOpen.value = true
     // 清除 query,避免刷新重复弹窗
-    router.replace({ path: '/settings' })
+    router.replace({ path: '/settings/account' })
   }
 })
 </script>
 
 <template>
-  <div class="page">
-    <AppHeader>
-      <template #leading>
-        <WorkspaceToggleButton
-          :collapsed="workspaceCollapsed"
-          expand-title="展开历史任务"
-          collapse-title="折叠历史任务"
-          @toggle="toggleWorkspace"
-        />
-      </template>
-    </AppHeader>
+  <div class="panel">
+    <!-- 页头 -->
+    <div class="page-header">
+      <div>
+        <h1>账户设置</h1>
+      </div>
+    </div>
 
-    <div class="page-body">
-      <WorkspaceSidebar v-if="!workspaceCollapsed" />
+    <!-- ============ 统一表格 ============ -->
+    <section class="table-section">
+      <div class="table-wrap">
+        <table class="config-table">
+          <thead>
+            <tr>
+              <th class="col-item">项目</th>
+              <th class="col-desc">说明</th>
+              <th class="col-status">状态</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="row in rows"
+              :key="row.key"
+              :class="['data-row', { 'row-danger': row.statusType === 'danger' }]"
+              @click="openRow(row)"
+            >
+              <td class="col-item">
+                <span :class="['cell-title', { 'text-danger': row.statusType === 'danger' }]">{{ row.item }}</span>
+              </td>
+              <td class="col-desc">
+                <span class="cell-desc">{{ row.desc }}</span>
+              </td>
+              <td class="col-status">
+                <span v-if="row.loading" class="status-spinner" aria-label="加载中" />
+                <span v-else :class="['badge', `badge-${row.statusType}`]">{{ row.status }}</span>
+              </td>
+              <td class="col-actions" @click.stop>
+                <button
+                  class="btn-link"
+                  :class="{ 'link-danger': row.statusType === 'danger' }"
+                  :disabled="row.loading"
+                  @click="openRow(row)"
+                >{{ row.actionText }}</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
 
-      <main class="main">
-        <!-- 页头 -->
-        <div class="page-header">
-          <div>
-            <h1>设置</h1>
+    <!-- ============ 弹窗 ============ -->
+    <PasswordDialog
+      :open="pwdDialogOpen"
+      :has-password="hasPassword"
+      :loading="pwdLoading"
+      :error="pwdError"
+      @confirm="handlePasswordConfirm"
+      @cancel="pwdDialogOpen = false"
+    />
+
+    <!-- Git 平台弹窗(GitHub / Gitee 共用,按 activeProvider 分派) -->
+    <GitProviderDialog
+      v-for="p in PROVIDERS"
+      :key="p"
+      :provider="p"
+      :open="activeProvider === p"
+      :status="providerStatus[p]"
+      :loading="providerLoading[p]"
+      :action="providerAction[p]"
+      :error="providerError[p]"
+      :success="providerSuccess[p]"
+      @bind="handleBind(p)"
+      @unbind="handleUnbind(p)"
+      @refresh="handleRefresh(p)"
+      @cancel="activeProvider = ''"
+    />
+
+    <DeleteAccountDialog
+      :open="deleteDialogOpen"
+      :current-email="currentEmail"
+      :loading="deleteLoading"
+      :error="deleteError"
+      @confirm="handleDeleteConfirm"
+      @cancel="deleteDialogOpen = false"
+    />
+
+    <!-- ============ 邮箱同步确认弹窗 ============ -->
+    <Teleport to="body">
+      <Transition name="dialog-fade">
+        <div v-if="syncDialogOpen" class="dialog-mask" @click.self="syncDialogOpen = false">
+          <div class="dialog-card" role="dialog" aria-modal="true">
+            <header class="dialog-header">
+              <h3>邮箱不一致</h3>
+              <button
+                class="dialog-close"
+                :disabled="syncLoading"
+                aria-label="关闭"
+                @click="syncDialogOpen = false"
+              >×</button>
+            </header>
+
+            <div class="dialog-body">
+              <p class="sync-tip">
+                检测到 {{ providerDisplayName(syncProvider) }} 邮箱与当前账号邮箱不一致,是否将账号邮箱更新为 {{ providerDisplayName(syncProvider) }} 邮箱?
+              </p>
+              <div class="email-compare">
+                <div class="email-row">
+                  <span class="email-label">当前账号</span>
+                  <span class="email-value">{{ syncCurrentEmail || '—' }}</span>
+                </div>
+                <div class="email-row">
+                  <span class="email-label">{{ providerDisplayName(syncProvider) }}</span>
+                  <span class="email-value">{{ syncProviderEmail || '—' }}</span>
+                </div>
+              </div>
+              <p class="sync-note">
+                更新后此邮箱将成为登录邮箱;{{ providerDisplayName(syncProvider) }} verified primary email 视为已验证。
+              </p>
+            </div>
+
+            <footer class="dialog-footer">
+              <span v-if="syncError" class="validation-error">{{ syncError }}</span>
+              <span v-else></span>
+              <div class="footer-actions">
+                <button
+                  class="btn btn-secondary"
+                  :disabled="syncLoading"
+                  @click="syncDialogOpen = false"
+                >保持原邮箱</button>
+                <button
+                  class="btn btn-primary"
+                  :disabled="syncLoading"
+                  @click="handleSyncConfirm"
+                >
+                  <span v-if="syncLoading" class="btn-spinner" />
+                  {{ syncLoading ? '同步中...' : `更新为 ${providerDisplayName(syncProvider)} 邮箱` }}
+                </button>
+              </div>
+            </footer>
           </div>
         </div>
-
-        <!-- ============ 统一表格 ============ -->
-        <section class="table-section">
-          <div class="table-wrap">
-            <table class="config-table">
-              <thead>
-                <tr>
-                  <th class="col-item">项目</th>
-                  <th class="col-desc">说明</th>
-                  <th class="col-status">状态</th>
-                  <th class="col-actions">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr
-                  v-for="row in rows"
-                  :key="row.key"
-                  :class="['data-row', { 'row-danger': row.statusType === 'danger' }]"
-                  @click="openRow(row)"
-                >
-                  <td class="col-item">
-                    <span :class="['cell-title', { 'text-danger': row.statusType === 'danger' }]">{{ row.item }}</span>
-                  </td>
-                  <td class="col-desc">
-                    <span class="cell-desc">{{ row.desc }}</span>
-                  </td>
-                  <td class="col-status">
-                    <span v-if="row.loading" class="status-spinner" aria-label="加载中" />
-                    <span v-else :class="['badge', `badge-${row.statusType}`]">{{ row.status }}</span>
-                  </td>
-                  <td class="col-actions" @click.stop>
-                    <button
-                      class="btn-link"
-                      :class="{ 'link-danger': row.statusType === 'danger' }"
-                      :disabled="row.loading"
-                      @click="openRow(row)"
-                    >{{ row.actionText }}</button>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        <!-- ============ 弹窗 ============ -->
-        <PasswordDialog
-          :open="pwdDialogOpen"
-          :has-password="hasPassword"
-          :loading="pwdLoading"
-          :error="pwdError"
-          @confirm="handlePasswordConfirm"
-          @cancel="pwdDialogOpen = false"
-        />
-
-        <!-- Git 平台弹窗(GitHub / Gitee 共用,按 activeProvider 分派) -->
-        <GitProviderDialog
-          v-for="p in PROVIDERS"
-          :key="p"
-          :provider="p"
-          :open="activeProvider === p"
-          :status="providerStatus[p]"
-          :loading="providerLoading[p]"
-          :action="providerAction[p]"
-          :error="providerError[p]"
-          :success="providerSuccess[p]"
-          @bind="handleBind(p)"
-          @unbind="handleUnbind(p)"
-          @refresh="handleRefresh(p)"
-          @cancel="activeProvider = ''"
-        />
-
-        <DeleteAccountDialog
-          :open="deleteDialogOpen"
-          :current-email="currentEmail"
-          :loading="deleteLoading"
-          :error="deleteError"
-          @confirm="handleDeleteConfirm"
-          @cancel="deleteDialogOpen = false"
-        />
-
-        <!-- ============ 邮箱同步确认弹窗 ============ -->
-        <Teleport to="body">
-          <Transition name="dialog-fade">
-            <div v-if="syncDialogOpen" class="dialog-mask" @click.self="syncDialogOpen = false">
-              <div class="dialog-card" role="dialog" aria-modal="true">
-                <header class="dialog-header">
-                  <h3>邮箱不一致</h3>
-                  <button
-                    class="dialog-close"
-                    :disabled="syncLoading"
-                    aria-label="关闭"
-                    @click="syncDialogOpen = false"
-                  >×</button>
-                </header>
-
-                <div class="dialog-body">
-                  <p class="sync-tip">
-                    检测到 {{ providerDisplayName(syncProvider) }} 邮箱与当前账号邮箱不一致,是否将账号邮箱更新为 {{ providerDisplayName(syncProvider) }} 邮箱?
-                  </p>
-                  <div class="email-compare">
-                    <div class="email-row">
-                      <span class="email-label">当前账号</span>
-                      <span class="email-value">{{ syncCurrentEmail || '—' }}</span>
-                    </div>
-                    <div class="email-row">
-                      <span class="email-label">{{ providerDisplayName(syncProvider) }}</span>
-                      <span class="email-value">{{ syncProviderEmail || '—' }}</span>
-                    </div>
-                  </div>
-                  <p class="sync-note">
-                    更新后此邮箱将成为登录邮箱;{{ providerDisplayName(syncProvider) }} verified primary email 视为已验证。
-                  </p>
-                </div>
-
-                <footer class="dialog-footer">
-                  <span v-if="syncError" class="validation-error">{{ syncError }}</span>
-                  <span v-else></span>
-                  <div class="footer-actions">
-                    <button
-                      class="btn btn-secondary"
-                      :disabled="syncLoading"
-                      @click="syncDialogOpen = false"
-                    >保持原邮箱</button>
-                    <button
-                      class="btn btn-primary"
-                      :disabled="syncLoading"
-                      @click="handleSyncConfirm"
-                    >
-                      <span v-if="syncLoading" class="btn-spinner" />
-                      {{ syncLoading ? '同步中...' : `更新为 ${providerDisplayName(syncProvider)} 邮箱` }}
-                    </button>
-                  </div>
-                </footer>
-              </div>
-            </div>
-          </Transition>
-        </Teleport>
-      </main>
-    </div>
+      </Transition>
+    </Teleport>
 
     <!-- ============ 浮动提示弹窗(Teleport 到 body,顶部居中,5s 自动消失) ============ -->
     <Teleport to="body">
@@ -546,30 +517,9 @@ onMounted(() => {
 </template>
 
 <style scoped>
-.page {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-  /* 手机地址栏伸缩兜底 */
-  height: 100dvh;
-  overflow: hidden;
-  background: var(--color-bg);
-}
-
-.page-body {
-  flex: 1;
-  display: flex;
-  align-items: stretch;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.main {
-  flex: 1;
-  min-width: 0;
+.panel {
   max-width: 760px;
   margin: 0 auto;
-  overflow-y: auto;
   padding: var(--space-6) var(--space-5) var(--space-8);
 }
 
@@ -589,18 +539,16 @@ onMounted(() => {
 
 /* ---- 响应式:窄屏(手机) ---- */
 @media (max-width: 640px) {
-  .main {
+  .panel {
     padding: var(--space-4) var(--space-3) var(--space-6);
   }
 
-  /* 页头标题与操作按钮上下堆叠 */
   .page-header {
     flex-direction: column;
     align-items: stretch;
     gap: var(--space-2);
   }
 
-  /* toast 不超出视口 */
   .toast-popup {
     min-width: 0;
     max-width: calc(100vw - var(--space-6));
@@ -663,7 +611,7 @@ onMounted(() => {
   transform: translate(-50%, -12px);
 }
 
-/* ---- 表格区(复用 ModelSettingsView 风格) ---- */
+/* ---- 表格区 ---- */
 .table-section {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
@@ -720,7 +668,6 @@ onMounted(() => {
   background: var(--color-surface-alt);
 }
 
-/* 危险行(删除账号):hover 用危险色浅底 */
 .data-row.row-danger:hover {
   background: var(--color-danger-light);
 }
@@ -813,7 +760,7 @@ onMounted(() => {
 }
 
 /* ============================================================ */
-/* 邮箱同步确认弹窗(复用 dialog 视觉语言)                       */
+/* 邮箱同步确认弹窗                                              */
 /* ============================================================ */
 .dialog-mask {
   position: fixed;

@@ -36,33 +36,25 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true },
   },
   {
-    path: '/models',
-    name: 'models',
-    component: () => import('@/views/ModelSettingsView.vue'),
-    meta: { requiresAuth: true },
-  },
-  {
-    path: '/cli',
-    name: 'cli-settings',
-    component: () => import('@/views/CliSettingsView.vue'),
-    meta: { requiresAuth: true },
-  },
-  {
     path: '/settings',
-    name: 'settings',
-    component: () => import('@/views/SettingsView.vue'),
+    component: () => import('@/views/settings/SettingsLayout.vue'),
     meta: { requiresAuth: true },
+    children: [
+      { path: '', redirect: '/settings/account' },
+      { path: 'account', name: 'settings-account', component: () => import('@/views/settings/AccountSettingsPanel.vue') },
+      { path: 'models', name: 'settings-models', component: () => import('@/views/settings/ModelSettingsPanel.vue') },
+      { path: 'cli', name: 'settings-cli', component: () => import('@/views/settings/CliSettingsPanel.vue') },
+      { path: 'policy', name: 'settings-policy', component: () => import('@/views/settings/AgentPolicyPanel.vue') },
+    ],
   },
+  // 旧路径重定向(兼容书签)
+  { path: '/models', redirect: '/settings/models' },
+  { path: '/cli', redirect: '/settings/cli' },
+  { path: '/agent-policy', redirect: '/settings/policy' },
   {
     path: '/memory',
     name: 'memory',
     component: () => import('@/views/MemoryView.vue'),
-    meta: { requiresAuth: true },
-  },
-  {
-    path: '/agent-policy',
-    name: 'agent-policy',
-    component: () => import('@/views/AgentPolicyView.vue'),
     meta: { requiresAuth: true },
   },
   {

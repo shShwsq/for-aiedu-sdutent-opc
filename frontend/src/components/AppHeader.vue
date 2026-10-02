@@ -2,14 +2,14 @@
 /**
  * 应用顶栏(登录后的页面共用)
  *
- * 左侧品牌 + 导航(首页/提交任务/模型设置/CLI 设置/协作策略/技能管理/记忆管理),右侧用户信息 + 问号(帮助文档)+ 齿轮(账号设置)+ 登出。
+ * 左侧品牌 + 导航(首页/提交任务/技能管理/记忆管理),右侧用户信息 + 问号(帮助文档)+ 齿轮(设置)+ 登出。
  *
- * 导航为 slot 的默认内容:所有界面默认显示这 7 项,无需每个视图重复声明;
+ * 导航为 slot 的默认内容:所有界面默认显示这些项,无需每个视图重复声明;
  * 当前页高亮依赖 Vue Router 自动添加的 router-link-exact-active。
  * 个别视图若需自定义导航,仍可用 <template #nav> 覆盖默认内容。
  *
- * 硬约束:账号设置(/settings)只由齿轮按钮进入,不入主导航。
- * 记忆管理(/memory)、协作策略(/agent-policy)作为主导航项,与模型设置/CLI 设置并列。
+ * 硬约束:设置中心(/settings)只由齿轮按钮进入,不入主导航。
+ * 模型设置、CLI 设置、协作策略已合并到 /settings 子路由。
  * 问号按钮:打开帮助文档弹窗(所有路由行为一致,展示完整 help.md)。
  * 主题按钮:弹出浅色/深色/跟随系统三选项,选择持久化到 localStorage(useTheme)。
  */
@@ -121,9 +121,7 @@ function handleCloseHelp(): void {
           <slot name="nav">
             <RouterLink to="/">首页</RouterLink>
             <RouterLink to="/tasks/new">提交任务</RouterLink>
-            <RouterLink to="/models">模型设置</RouterLink>
-            <RouterLink to="/cli">CLI 设置</RouterLink>
-            <RouterLink to="/agent-policy">协作策略</RouterLink>
+
             <RouterLink to="/skills">技能管理</RouterLink>
             <RouterLink v-if="practiceEnabled" to="/practice" data-onboarding="app-header-nav-practice">
               自适应练习
@@ -224,8 +222,8 @@ function handleCloseHelp(): void {
         </div>
         <button
           class="btn-settings"
-          title="账号设置"
-          aria-label="账号设置"
+          title="设置"
+          aria-label="设置"
           data-onboarding="app-header-settings"
           @click="router.push('/settings')"
         >

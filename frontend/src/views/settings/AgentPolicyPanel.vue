@@ -1,34 +1,19 @@
 <script setup lang="ts">
 /**
- * 协作策略设置页(/agent-policy)
+ * 协作策略设置面板(嵌套在 SettingsLayout 内)
  *
  * 作为 agent2(检查助手)协作策略的用户级默认配置:
  * - agent2 启停
  * - 验证权限:agent2 是否能自行调用工具验证(实验性)
  * - 验证授权模式:验证动作的默认授权模式(直接执行 / 逐动作授权)
- *
- * 与记忆管理(/memory)、模型设置(/models)、CLI 设置(/cli) 并列为主导航项。
- * 后端 API:PUT /memory/preferences/agent_policy(与 user_profile 文本分离保存)。
- *
- * 任务创建时可在 TaskCreateView 做任务级覆盖(不改本页默认值)。
  */
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
-import AppHeader from '@/components/AppHeader.vue'
 import BaseSelect from '@/components/BaseSelect.vue'
-import WorkspaceSidebar from '@/components/WorkspaceSidebar.vue'
-import WorkspaceToggleButton from '@/components/WorkspaceToggleButton.vue'
 import { getPreferences, saveAgentPolicy } from '@/api/memory'
 import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
 import { extractErrorMessage } from '@/utils/error'
 import type { SaveAgentPolicyRequest } from '@/types/memory'
-
-/** 历史任务侧栏是否折叠(默认折叠) */
-const workspaceCollapsed = ref(true)
-
-function toggleWorkspace(): void {
-  workspaceCollapsed.value = !workspaceCollapsed.value
-}
 
 // ============================================================
 // 默认策略值(与后端 DEFAULT_AGENT_POLICY 对齐)
@@ -197,7 +182,6 @@ function formatTime(iso: string | null | undefined): string {
 
 // ============================================================
 // 字段帮助气泡:圆圈问号按钮,点击显示说明,点击外部关闭
-// 同一时刻只展开一个字段气泡,点开新字段时旧的自动收起
 // ============================================================
 /** 各字段帮助说明(点击问号按钮展示) */
 const FIELD_HELP: Record<string, string> = {
@@ -244,188 +228,169 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="page">
-    <AppHeader>
-      <template #leading>
-        <WorkspaceToggleButton
-          :collapsed="workspaceCollapsed"
-          expand-title="展开历史任务"
-          collapse-title="折叠历史任务"
-          @toggle="toggleWorkspace"
-        />
-      </template>
-    </AppHeader>
-
-    <div class="page-body">
-      <WorkspaceSidebar v-if="!workspaceCollapsed" />
-
-      <main class="main">
-        <div class="main-col">
-          <!-- 页头 -->
-          <div class="page-header">
-            <div>
-              <h1>协作策略</h1>
-              <p class="page-subtitle">
-                检查助手协作策略的用户级默认。任务创建时可单独覆盖。
-              </p>
-            </div>
-            <div class="header-meta">
-              <span class="meta-label">最后保存</span>
-              <span class="meta-value">{{ loading ? '加载中…' : formatTime(updatedAt) }}</span>
-            </div>
-          </div>
-
-          <!-- 加载态 -->
-          <div v-if="loading" class="loading-box">
-            <span class="status-spinner" aria-label="加载中" />
-            <span>正在加载策略配置…</span>
-          </div>
-
-          <!-- 加载失败 -->
-          <div v-else-if="loadError" class="alert alert-error" role="alert">
-            <span>加载失败:{{ loadError }}</span>
-            <button class="btn-link" @click="loadPolicy">重试</button>
-          </div>
-
-          <!-- 策略表单(无卡片,平铺更简洁) -->
-          <section v-else class="policy-form">
-            <!-- 启用 agent2 开关(最核心,控制全局) -->
-            <label class="policy-toggle-row policy-toggle-primary">
-              <input v-model="policyAgent2Enabled" class="switch" type="checkbox" :disabled="saving" />
-              <span>启用检查助手</span>
-              <div
-                :ref="(el) => { if (el) fieldHelpRefs.set('agent2_enabled', el as HTMLElement); else fieldHelpRefs.delete('agent2_enabled') }"
-                class="field-help-wrap"
-              >
-                <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('agent2_enabled')">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-                </button>
-                <Transition name="help-fade">
-                  <div v-if="openHelpKey === 'agent2_enabled'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.agent2_enabled }}</div>
-                </Transition>
-              </div>
-            </label>
-
-            <!-- 单 agent 模式提示:agent2 关闭时说明下方依赖字段为何隐藏 -->
-            <p v-if="!policyAgent2Enabled" class="policy-single-hint">
-              当前为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做覆盖度评估与验证。
-            </p>
-
-            <!-- agent2 依赖字段:关闭时整组隐藏(v-show 保留值,保存 payload 不变) -->
-            <Transition name="collapse">
-              <div v-show="policyAgent2Enabled" class="policy-dependent">
-            <label class="policy-toggle-row">
-              <input v-model="policyAllowVerify" class="switch" type="checkbox" :disabled="saving || !policyAgent2Enabled" />
-              <span>允许检查助手自行验证 <span class="policy-experimental">(实验性)</span></span>
-              <div
-                :ref="(el) => { if (el) fieldHelpRefs.set('allow_verify', el as HTMLElement); else fieldHelpRefs.delete('allow_verify') }"
-                class="field-help-wrap"
-              >
-                <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('allow_verify')">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-                </button>
-                <Transition name="help-fade">
-                  <div v-if="openHelpKey === 'allow_verify'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.allow_verify }}</div>
-                </Transition>
-              </div>
-            </label>
-
-            <label class="policy-toggle-row">
-              <input v-model="policyAllowReference" class="switch" type="checkbox" :disabled="saving || !policyAgent2Enabled" />
-              <span>复核 AI助手引用的网址</span>
-              <div
-                :ref="(el) => { if (el) fieldHelpRefs.set('allow_reference_check', el as HTMLElement); else fieldHelpRefs.delete('allow_reference_check') }"
-                class="field-help-wrap"
-              >
-                <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('allow_reference_check')">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-                </button>
-                <Transition name="help-fade">
-                  <div v-if="openHelpKey === 'allow_reference_check'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.allow_reference_check }}</div>
-                </Transition>
-              </div>
-            </label>
-
-            <Transition name="collapse">
-              <div v-show="policyAllowVerify" class="verifier-config">
-                <label class="policy-field">
-                  <div class="field-head">
-                    <span class="policy-label">验证授权模式</span>
-                    <div
-                      :ref="(el) => { if (el) fieldHelpRefs.set('verifier_auth_mode', el as HTMLElement); else fieldHelpRefs.delete('verifier_auth_mode') }"
-                      class="field-help-wrap"
-                    >
-                      <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('verifier_auth_mode')">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-                      </button>
-                      <Transition name="help-fade">
-                        <div v-if="openHelpKey === 'verifier_auth_mode'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.verifier_auth_mode }}</div>
-                      </Transition>
-                    </div>
-                  </div>
-                  <BaseSelect
-                    v-model="policyVerifierAuthMode"
-                    :options="verifierAuthModeOptions"
-                    :disabled="saving"
-                    class="policy-select"
-                    aria-label="验证授权模式"
-                  />
-                </label>
-              </div>
-            </Transition>
-              </div>
-            </Transition>
-
-            <!-- 执行智能体命令确认模式(独立于 agent2,始终可用) -->
-            <label class="policy-field policy-field-command-confirm">
-              <div class="field-head">
-                <span class="policy-label">执行智能体命令确认模式</span>
-                <div
-                  :ref="(el) => { if (el) fieldHelpRefs.set('executor_command_confirm', el as HTMLElement); else fieldHelpRefs.delete('executor_command_confirm') }"
-                  class="field-help-wrap"
-                >
-                  <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('executor_command_confirm')">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-                  </button>
-                  <Transition name="help-fade">
-                    <div v-if="openHelpKey === 'executor_command_confirm'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.executor_command_confirm }}</div>
-                  </Transition>
-                </div>
-              </div>
-              <BaseSelect
-                v-model="policyExecutorCommandConfirm"
-                :options="executorConfirmOptions"
-                :disabled="saving"
-                class="policy-select"
-                aria-label="执行智能体命令确认模式"
-              />
-            </label>
-
-            <!-- 操作区 -->
-            <div class="policy-actions">
-              <button
-                type="button"
-                class="btn btn-secondary"
-                :disabled="saving || !policyDirty"
-                @click="resetPolicyToDefault"
-              >恢复默认</button>
-  
-              <button
-                type="button"
-                class="btn btn-primary"
-                :disabled="saving || !policyDirty"
-                @click="handleSave"
-              >
-                <span v-if="saving" class="btn-spinner" />
-                {{ saving ? '保存中…' : '保存' }}
-              </button>
-  
-              <span v-if="policyDirty" class="dirty-dot-hint">有未保存改动</span>
-            </div>
-        </section>
-        </div>
-      </main>
+  <div class="panel">
+    <!-- 页头 -->
+    <div class="page-header">
+      <div>
+        <h1>协作策略</h1>
+        <p class="page-subtitle">
+          检查助手协作策略的用户级默认。任务创建时可单独覆盖。
+        </p>
+      </div>
+      <div class="header-meta">
+        <span class="meta-label">最后保存</span>
+        <span class="meta-value">{{ loading ? '加载中…' : formatTime(updatedAt) }}</span>
+      </div>
     </div>
+
+    <!-- 加载态 -->
+    <div v-if="loading" class="loading-box">
+      <span class="status-spinner" aria-label="加载中" />
+      <span>正在加载策略配置…</span>
+    </div>
+
+    <!-- 加载失败 -->
+    <div v-else-if="loadError" class="alert alert-error" role="alert">
+      <span>加载失败:{{ loadError }}</span>
+      <button class="btn-link" @click="loadPolicy">重试</button>
+    </div>
+
+    <!-- 策略表单(无卡片,平铺更简洁) -->
+    <section v-else class="policy-form">
+      <!-- 启用 agent2 开关(最核心,控制全局) -->
+      <label class="policy-toggle-row policy-toggle-primary">
+        <input v-model="policyAgent2Enabled" class="switch" type="checkbox" :disabled="saving" />
+        <span>启用检查助手</span>
+        <div
+          :ref="(el) => { if (el) fieldHelpRefs.set('agent2_enabled', el as HTMLElement); else fieldHelpRefs.delete('agent2_enabled') }"
+          class="field-help-wrap"
+        >
+          <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('agent2_enabled')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
+          </button>
+          <Transition name="help-fade">
+            <div v-if="openHelpKey === 'agent2_enabled'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.agent2_enabled }}</div>
+          </Transition>
+        </div>
+      </label>
+
+      <!-- 单 agent 模式提示:agent2 关闭时说明下方依赖字段为何隐藏 -->
+      <p v-if="!policyAgent2Enabled" class="policy-single-hint">
+        当前为单 agent 模式:AI助手 跑 1 轮直接产出结果,不做覆盖度评估与验证。
+      </p>
+
+      <!-- agent2 依赖字段:关闭时整组隐藏(v-show 保留值,保存 payload 不变) -->
+      <Transition name="collapse">
+        <div v-show="policyAgent2Enabled" class="policy-dependent">
+      <label class="policy-toggle-row">
+        <input v-model="policyAllowVerify" class="switch" type="checkbox" :disabled="saving || !policyAgent2Enabled" />
+        <span>允许检查助手自行验证 <span class="policy-experimental">(实验性)</span></span>
+        <div
+          :ref="(el) => { if (el) fieldHelpRefs.set('allow_verify', el as HTMLElement); else fieldHelpRefs.delete('allow_verify') }"
+          class="field-help-wrap"
+        >
+          <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('allow_verify')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
+          </button>
+          <Transition name="help-fade">
+            <div v-if="openHelpKey === 'allow_verify'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.allow_verify }}</div>
+          </Transition>
+        </div>
+      </label>
+
+      <label class="policy-toggle-row">
+        <input v-model="policyAllowReference" class="switch" type="checkbox" :disabled="saving || !policyAgent2Enabled" />
+        <span>复核 AI助手引用的网址</span>
+        <div
+          :ref="(el) => { if (el) fieldHelpRefs.set('allow_reference_check', el as HTMLElement); else fieldHelpRefs.delete('allow_reference_check') }"
+          class="field-help-wrap"
+        >
+          <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('allow_reference_check')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
+          </button>
+          <Transition name="help-fade">
+            <div v-if="openHelpKey === 'allow_reference_check'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.allow_reference_check }}</div>
+          </Transition>
+        </div>
+      </label>
+
+      <Transition name="collapse">
+        <div v-show="policyAllowVerify" class="verifier-config">
+          <label class="policy-field">
+            <div class="field-head">
+              <span class="policy-label">验证授权模式</span>
+              <div
+                :ref="(el) => { if (el) fieldHelpRefs.set('verifier_auth_mode', el as HTMLElement); else fieldHelpRefs.delete('verifier_auth_mode') }"
+                class="field-help-wrap"
+              >
+                <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('verifier_auth_mode')">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
+                </button>
+                <Transition name="help-fade">
+                  <div v-if="openHelpKey === 'verifier_auth_mode'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.verifier_auth_mode }}</div>
+                </Transition>
+              </div>
+            </div>
+            <BaseSelect
+              v-model="policyVerifierAuthMode"
+              :options="verifierAuthModeOptions"
+              :disabled="saving"
+              class="policy-select"
+              aria-label="验证授权模式"
+            />
+          </label>
+        </div>
+      </Transition>
+        </div>
+      </Transition>
+
+      <!-- 执行智能体命令确认模式(独立于 agent2,始终可用) -->
+      <label class="policy-field policy-field-command-confirm">
+        <div class="field-head">
+          <span class="policy-label">执行智能体命令确认模式</span>
+          <div
+            :ref="(el) => { if (el) fieldHelpRefs.set('executor_command_confirm', el as HTMLElement); else fieldHelpRefs.delete('executor_command_confirm') }"
+            class="field-help-wrap"
+          >
+            <button type="button" class="field-help-btn" aria-label="查看说明" @click.stop="toggleFieldHelp('executor_command_confirm')">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
+            </button>
+            <Transition name="help-fade">
+              <div v-if="openHelpKey === 'executor_command_confirm'" class="field-help-popover" role="tooltip">{{ FIELD_HELP.executor_command_confirm }}</div>
+            </Transition>
+          </div>
+        </div>
+        <BaseSelect
+          v-model="policyExecutorCommandConfirm"
+          :options="executorConfirmOptions"
+          :disabled="saving"
+          class="policy-select"
+          aria-label="执行智能体命令确认模式"
+        />
+      </label>
+
+      <!-- 操作区 -->
+      <div class="policy-actions">
+        <button
+          type="button"
+          class="btn btn-secondary"
+          :disabled="saving || !policyDirty"
+          @click="resetPolicyToDefault"
+        >恢复默认</button>
+
+        <button
+          type="button"
+          class="btn btn-primary"
+          :disabled="saving || !policyDirty"
+          @click="handleSave"
+        >
+          <span v-if="saving" class="btn-spinner" />
+          {{ saving ? '保存中…' : '保存' }}
+        </button>
+
+        <span v-if="policyDirty" class="dirty-dot-hint">有未保存改动</span>
+      </div>
+    </section>
 
     <!-- 浮动提示弹窗 -->
     <Teleport to="body">
@@ -461,32 +426,7 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.page {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-  /* 手机地址栏伸缩兜底 */
-  height: 100dvh;
-  overflow: hidden;
-  background: var(--color-bg);
-}
-
-.page-body {
-  flex: 1;
-  display: flex;
-  align-items: stretch;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.main {
-  flex: 1;
-  min-width: 0;
-  /* 全宽滚动容器:垂直滚动条贴界面右边,内容在 main-col 内居中 */
-  overflow-y: auto;
-}
-
-.main-col {
+.panel {
   max-width: 760px;
   margin: 0 auto;
   padding: var(--space-6) var(--space-5) var(--space-8);
@@ -501,13 +441,11 @@ onUnmounted(() => {
   margin-bottom: var(--space-5);
 }
 
-/* ---- 响应式:窄屏(手机) ---- */
 @media (max-width: 640px) {
-  .main-col {
+  .panel {
     padding: var(--space-4) var(--space-3) var(--space-6);
   }
 
-  /* 页头标题与操作按钮上下堆叠 */
   .page-header {
     flex-direction: column;
     align-items: stretch;
@@ -586,7 +524,7 @@ onUnmounted(() => {
   to { transform: rotate(360deg); }
 }
 
-/* ---- 策略表单(无卡片,直接平铺) ---- */
+/* ---- 策略表单 ---- */
 .policy-form {
   display: flex;
   flex-direction: column;
@@ -605,41 +543,6 @@ onUnmounted(() => {
   color: var(--color-text);
 }
 
-.policy-hint {
-  font-size: var(--fs-xs);
-  color: var(--color-text-muted);
-  line-height: var(--lh-relaxed);
-}
-
-.policy-input {
-  width: 100%;
-  height: 36px;
-  padding: 0 var(--space-3);
-  font-size: var(--fs-sm);
-  color: var(--color-text);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
-  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
-}
-
-.policy-input:hover:not(:disabled):not(:focus) {
-  border-color: var(--color-primary-border);
-}
-
-.policy-input:focus {
-  outline: none;
-  border-color: var(--color-primary);
-  box-shadow: 0 0 0 3px var(--color-primary-light);
-}
-
-.policy-input:disabled {
-  color: var(--color-text-muted);
-  background: var(--color-surface-alt);
-  cursor: not-allowed;
-}
-
-/* BaseSelect 撑满字段宽度(验证授权 / CLI 命令确认) */
 .policy-select {
   width: 100%;
 }
@@ -648,7 +551,7 @@ onUnmounted(() => {
   width: 100%;
 }
 
-/* ---- 字段头部:标签 + 帮助按钮(问号) ---- */
+/* ---- 字段头部:标签 + 帮助按钮 ---- */
 .field-head {
   display: flex;
   align-items: center;
@@ -707,7 +610,6 @@ onUnmounted(() => {
   word-break: break-word;
 }
 
-/* 帮助气泡出现/消失动画 */
 .help-fade-enter-active,
 .help-fade-leave-active {
   transition: opacity var(--transition-fast), transform var(--transition-fast);
@@ -743,7 +645,6 @@ onUnmounted(() => {
   cursor: not-allowed;
 }
 
-/* 主开关行(启用 agent2):加强视觉权重 */
 .policy-toggle-primary {
   padding: var(--space-3);
   background: var(--color-surface);
@@ -751,7 +652,6 @@ onUnmounted(() => {
   font-weight: var(--fw-medium);
 }
 
-/* 单 agent 模式提示(agent2 关闭时展示) */
 .policy-single-hint {
   margin: 0;
   padding: var(--space-2) var(--space-3);
@@ -762,14 +662,13 @@ onUnmounted(() => {
   border-radius: var(--radius-md);
 }
 
-/* agent2 依赖字段容器:作为 policy-form 的单个 flex 项,需恢复内部字段间距 */
 .policy-dependent {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
 }
 
-/* ---- Switch 拨动开关(替代原生 checkbox 外观) ---- */
+/* ---- Switch 拨动开关 ---- */
 input.switch {
   appearance: none;
   flex-shrink: 0;
@@ -820,7 +719,6 @@ input.switch:disabled {
   font-style: italic;
 }
 
-/* 验证授权模式配置(仅 allow_verify 开启时显示) */
 .verifier-config {
   margin-left: var(--space-5);
   padding: var(--space-2) 0;
@@ -830,7 +728,6 @@ input.switch:disabled {
   max-width: 360px;
 }
 
-/* 执行智能体命令确认模式(独立于 agent2,始终可用) */
 .policy-field-command-confirm {
   max-width: 360px;
   margin-bottom: var(--space-2);

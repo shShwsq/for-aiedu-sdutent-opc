@@ -1011,7 +1011,7 @@ onUnmounted(() => {
                 />
                 <RouterLink
                   v-if="llmConfigs.length === 0 && !loadingModels"
-                  to="/models"
+                  to="/settings/models"
                   class="model-empty-link"
                 >配置 →</RouterLink>
               </div>

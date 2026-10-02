@@ -57,7 +57,7 @@ onMounted(async () => {
       // (仅 GitHub 会出现 email_mismatch=true;Gitee 不支持可验证邮箱,恒为 false)
       if (res.email_mismatch && res.provider_email) {
         await router.push({
-          path: '/settings',
+          path: '/settings/account',
           query: {
             email_mismatch: '1',
             provider: provider.value,
@@ -67,7 +67,7 @@ onMounted(async () => {
         })
       } else {
         // 绑定成功跳回设置页(用户能看到绑定状态)
-        await router.push('/settings')
+        await router.push('/settings/account')
       }
     } else {
       // 未登录 → 登录流程:用 code 换 token + 创建/关联账号

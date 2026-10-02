@@ -1,26 +1,13 @@
 <script setup lang="ts">
 /**
- * 模型设置页(统一表格 + 弹窗编辑)
+ * 模型设置面板(嵌套在 SettingsLayout 内)
  *
  * LLM 与 Embedding 配置合并为一张表格展示,通过「类型」列区分。
  * 每条配置有唯一 id 和自定义名称,任务提交时从列表中选择使用。
- *
- * 交互:
- * - 表格列:名称 / 类型 / 厂商·模型 / Key 状态 / 操作(测试·编辑·删除)
- * - 顶部「+ 添加 LLM」「+ 添加 Embedding」→ 打开 ModelConfigDialog
- * - 点击行(非操作区)→ 打开编辑弹窗
- * - 弹窗「确定」→ 写回列表 → 立即整体保存(PUT /models/configs)
- * - 删除 → 从列表移除 → 立即保存
- * - 测试:先保存当前列表,再按 config_id 测试指定配置
- *
- * 由于每次增/改/删都立即持久化,页面不再保留手动「保存设置」按钮。
  */
 import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 
-import AppHeader from '@/components/AppHeader.vue'
 import ModelConfigDialog from '@/components/ModelConfigDialog.vue'
-import WorkspaceSidebar from '@/components/WorkspaceSidebar.vue'
-import WorkspaceToggleButton from '@/components/WorkspaceToggleButton.vue'
 import { getCatalog, getMyModels, saveModels, testEmbedding, testLLM } from '@/api/model_configs'
 import { extractErrorMessage } from '@/utils/error'
 import type {
@@ -32,13 +19,6 @@ import type {
 } from '@/types/model_configs'
 
 type Kind = 'llm' | 'embedding'
-
-/** 历史任务侧栏是否折叠(默认折叠) */
-const workspaceCollapsed = ref(true)
-
-function toggleWorkspace(): void {
-  workspaceCollapsed.value = !workspaceCollapsed.value
-}
 
 // ---- 厂商清单 ----
 const catalog = ref<ModelsCatalog | null>(null)
@@ -275,7 +255,6 @@ async function handleSave(opts?: { silent?: boolean }): Promise<boolean> {
   saving.value = true
   toast.value = null
   try {
-    // 校验(防御性:列表本应始终合法,因弹窗已做校验)
     for (const cfg of llmConfigs) {
       if (!cfg.provider || !cfg.model) {
         showToast(`LLM 配置"${cfg.name || '未命名'}"缺少厂商或模型`, 'error')
@@ -387,11 +366,10 @@ async function handleTestRow(row: TableRow): Promise<void> {
 
 /**
  * 延迟停止测试动画，确保 toast 弹窗已开始滑入动画后再停止旋转
- * toast 动画时长 200ms (transition-base)，延迟 200ms 让视觉上同步
  */
 async function stopTestingWithDelay(cfg: LLMConfigEditable | EmbeddingConfigEditable): Promise<void> {
-  await nextTick() // 等待 Vue 更新 DOM，toast 已插入
-  await new Promise((resolve) => setTimeout(resolve, 200)) // 等待 toast 动画完成
+  await nextTick()
+  await new Promise((resolve) => setTimeout(resolve, 200))
   cfg.testing = false
 }
 
@@ -420,177 +398,156 @@ function modelLabel(row: TableRow): string {
 </script>
 
 <template>
-  <div class="page">
-    <AppHeader>
-      <template #leading>
-        <WorkspaceToggleButton
-          :collapsed="workspaceCollapsed"
-          expand-title="展开历史任务"
-          collapse-title="折叠历史任务"
-          @toggle="toggleWorkspace"
-        />
-      </template>
-    </AppHeader>
-
-    <div class="page-body">
-      <WorkspaceSidebar v-if="!workspaceCollapsed" />
-
-      <main class="main">
-      <!-- 加载中 -->
-      <div v-if="loadingCatalog || loadingConfig" class="loading">
-        <div class="spinner" />
-        <span>加载中...</span>
-      </div>
-
-      <template v-else>
-        <!-- 页头 + 添加按钮 -->
-        <div class="page-header">
-          <div>
-            <h1>我的模型</h1>
-          </div>
-          <div class="header-actions">
-            <button class="btn-add" :disabled="saving" @click="openAddDialog('llm')">
-              + 添加 LLM
-            </button>
-            <button class="btn-add" :disabled="saving" @click="openAddDialog('embedding')">
-              + 添加 Embedding
-            </button>
-          </div>
-        </div>
-
-        <!-- ============ 统一表格 ============ -->
-        <section class="table-section">
-          <div class="table-wrap">
-            <table class="config-table">
-              <thead>
-                <tr>
-                  <th class="col-name">名称</th>
-                  <th class="col-type">类型</th>
-                  <th class="col-provider">厂商</th>
-                  <th class="col-model">模型</th>
-                  <th class="col-key">Key</th>
-                  <th class="col-thinking">思考</th>
-                  <th class="col-actions">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-if="!hasRows" class="empty-row">
-                  <td colspan="7">
-                    <div class="empty-hint">
-                      尚未配置任何模型,点击右上角「+ 添加」新增
-                    </div>
-                  </td>
-                </tr>
-
-                <tr
-                  v-for="row in tableRows"
-                  :key="`${row.kind}-${row.id}`"
-                  class="data-row"
-                  @click="openEditRow(row)"
-                >
-                  <td class="col-name">
-                    <span class="cell-title">{{ configTitle(row.name, row.model) }}</span>
-                  </td>
-                  <td class="col-type">
-                    <span :class="['type-tag', row.kind === 'llm' ? 'tag-llm' : 'tag-emb']">
-                      {{ row.kind === 'llm' ? 'LLM' : 'Embedding' }}
-                    </span>
-                  </td>
-                  <td class="col-provider">
-                    <span class="cell-mono">{{ providerLabel(row) }}</span>
-                  </td>
-                  <td class="col-model">
-                    <span class="cell-mono">{{ modelLabel(row) }}</span>
-                  </td>
-                  <td class="col-key">
-                    <span v-if="row.has_api_key" class="badge badge-ok">已配置</span>
-                    <span v-else class="badge badge-warn">未配置</span>
-                  </td>
-                  <td class="col-thinking">
-                    <!-- Embedding 无思考概念,用斜杠占位 -->
-                    <span v-if="row.enable_thinking === null" class="thinking-na">—</span>
-                    <span v-else-if="row.enable_thinking" class="badge badge-thinking-on">开启</span>
-                    <span v-else class="badge badge-thinking-off">关闭</span>
-                  </td>
-                  <td class="col-actions" @click.stop>
-                    <div class="row-actions">
-                      <button
-                        class="btn-icon"
-                        :class="{ 'is-testing': row.testing }"
-                        :title="row.testing ? '测试中...' : '测试连通性'"
-                        :disabled="row.testing || saving"
-                        @click="handleTestRow(row)"
-                      >
-                        <!-- 心电图图标(Lucide activity),常用于连通性/健康检查 -->
-                        <!-- 测试中时图标自身旋转,保留语义且用 currentColor 自然可见 -->
-                        <svg
-                          class="icon-activity"
-                          :class="{ 'icon-spin': row.testing }"
-                          width="14"
-                          height="14"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          stroke-width="2"
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                          aria-hidden="true"
-                        >
-                          <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
-                        </svg>
-                      </button>
-                      <button
-                        class="btn-icon"
-                        title="编辑"
-                        :disabled="saving"
-                        @click="openEditRow(row)"
-                      >
-                        <!-- 铅笔图标(Lucide pencil) -->
-                        <svg
-                          width="14"
-                          height="14"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          stroke-width="2"
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                          aria-hidden="true"
-                        >
-                          <path d="M12 20h9" />
-                          <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
-                        </svg>
-                      </button>
-                      <button
-                        class="btn-icon btn-danger"
-                        title="删除"
-                        :disabled="saving"
-                        @click="removeRow(row)"
-                      >✕</button>
-                    </div>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        <!-- ============ 弹窗 ============ -->
-        <ModelConfigDialog
-          :open="dialogOpen"
-          :kind="dialogKind"
-          :mode="dialogMode"
-          :initial="dialogInitial"
-          :catalog="catalog"
-          :saving="saving"
-          @confirm="handleDialogConfirm"
-          @cancel="dialogOpen = false"
-        />
-      </template>
-    </main>
+  <div class="panel">
+    <!-- 加载中 -->
+    <div v-if="loadingCatalog || loadingConfig" class="loading">
+      <div class="spinner" />
+      <span>加载中...</span>
     </div>
 
-    <!-- ============ 浮动提示弹窗(Teleport 到 body,右上角,5s 自动消失) ============ -->
+    <template v-else>
+      <!-- 页头 + 添加按钮 -->
+      <div class="page-header">
+        <div>
+          <h1>我的模型</h1>
+        </div>
+        <div class="header-actions">
+          <button class="btn-add" :disabled="saving" @click="openAddDialog('llm')">
+            + 添加 LLM
+          </button>
+          <button class="btn-add" :disabled="saving" @click="openAddDialog('embedding')">
+            + 添加 Embedding
+          </button>
+        </div>
+      </div>
+
+      <!-- ============ 统一表格 ============ -->
+      <section class="table-section">
+        <div class="table-wrap">
+          <table class="config-table">
+            <thead>
+              <tr>
+                <th class="col-name">名称</th>
+                <th class="col-type">类型</th>
+                <th class="col-provider">厂商</th>
+                <th class="col-model">模型</th>
+                <th class="col-key">Key</th>
+                <th class="col-thinking">思考</th>
+                <th class="col-actions">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-if="!hasRows" class="empty-row">
+                <td colspan="7">
+                  <div class="empty-hint">
+                    尚未配置任何模型,点击右上角「+ 添加」新增
+                  </div>
+                </td>
+              </tr>
+
+              <tr
+                v-for="row in tableRows"
+                :key="`${row.kind}-${row.id}`"
+                class="data-row"
+                @click="openEditRow(row)"
+              >
+                <td class="col-name">
+                  <span class="cell-title">{{ configTitle(row.name, row.model) }}</span>
+                </td>
+                <td class="col-type">
+                  <span :class="['type-tag', row.kind === 'llm' ? 'tag-llm' : 'tag-emb']">
+                    {{ row.kind === 'llm' ? 'LLM' : 'Embedding' }}
+                  </span>
+                </td>
+                <td class="col-provider">
+                  <span class="cell-mono">{{ providerLabel(row) }}</span>
+                </td>
+                <td class="col-model">
+                  <span class="cell-mono">{{ modelLabel(row) }}</span>
+                </td>
+                <td class="col-key">
+                  <span v-if="row.has_api_key" class="badge badge-ok">已配置</span>
+                  <span v-else class="badge badge-warn">未配置</span>
+                </td>
+                <td class="col-thinking">
+                  <span v-if="row.enable_thinking === null" class="thinking-na">—</span>
+                  <span v-else-if="row.enable_thinking" class="badge badge-thinking-on">开启</span>
+                  <span v-else class="badge badge-thinking-off">关闭</span>
+                </td>
+                <td class="col-actions" @click.stop>
+                  <div class="row-actions">
+                    <button
+                      class="btn-icon"
+                      :class="{ 'is-testing': row.testing }"
+                      :title="row.testing ? '测试中...' : '测试连通性'"
+                      :disabled="row.testing || saving"
+                      @click="handleTestRow(row)"
+                    >
+                      <svg
+                        class="icon-activity"
+                        :class="{ 'icon-spin': row.testing }"
+                        width="14"
+                        height="14"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+                      </svg>
+                    </button>
+                    <button
+                      class="btn-icon"
+                      title="编辑"
+                      :disabled="saving"
+                      @click="openEditRow(row)"
+                    >
+                      <svg
+                        width="14"
+                        height="14"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M12 20h9" />
+                        <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+                      </svg>
+                    </button>
+                    <button
+                      class="btn-icon btn-danger"
+                      title="删除"
+                      :disabled="saving"
+                      @click="removeRow(row)"
+                    >✕</button>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ============ 弹窗 ============ -->
+      <ModelConfigDialog
+        :open="dialogOpen"
+        :kind="dialogKind"
+        :mode="dialogMode"
+        :initial="dialogInitial"
+        :catalog="catalog"
+        :saving="saving"
+        @confirm="handleDialogConfirm"
+        @cancel="dialogOpen = false"
+      />
+    </template>
+
+    <!-- ============ 浮动提示弹窗 ============ -->
     <Teleport to="body">
       <Transition name="toast-slide">
         <div
@@ -600,7 +557,6 @@ function modelLabel(row: TableRow): string {
           aria-live="polite"
         >
           <span class="toast-icon" aria-hidden="true">
-            <!-- 成功:对勾(Lucide check-circle) -->
             <svg
               v-if="toast.type === 'success'"
               width="18"
@@ -615,7 +571,6 @@ function modelLabel(row: TableRow): string {
               <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
               <polyline points="22 4 12 14.01 9 11.01" />
             </svg>
-            <!-- 失败:警示(Lucide alert-circle) -->
             <svg
               v-else
               width="18"
@@ -640,30 +595,9 @@ function modelLabel(row: TableRow): string {
 </template>
 
 <style scoped>
-.page {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-  /* 手机地址栏伸缩兜底 */
-  height: 100dvh;
-  overflow: hidden;
-  background: var(--color-bg);
-}
-
-.page-body {
-  flex: 1;
-  display: flex;
-  align-items: stretch;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.main {
-  flex: 1;
-  min-width: 0;
+.panel {
   max-width: 920px;
   margin: 0 auto;
-  overflow-y: auto;
   padding: var(--space-8) var(--space-6) var(--space-12);
 }
 
@@ -689,7 +623,6 @@ function modelLabel(row: TableRow): string {
   to { transform: rotate(360deg); }
 }
 
-/* 测试中:心电图图标自身旋转,保留语义且用 currentColor 自然可见 */
 .icon-spin {
   animation: spin 0.9s linear infinite;
   transform-origin: center;
@@ -704,13 +637,11 @@ function modelLabel(row: TableRow): string {
   margin-bottom: var(--space-6);
 }
 
-/* ---- 响应式:窄屏(手机) ---- */
 @media (max-width: 640px) {
-  .main {
+  .panel {
     padding: var(--space-4) var(--space-3) var(--space-8);
   }
 
-  /* 页头标题与「新增模型」按钮上下堆叠 */
   .page-header {
     flex-direction: column;
     align-items: stretch;
@@ -720,12 +651,7 @@ function modelLabel(row: TableRow): string {
 
 .page-header h1 {
   font-size: var(--fs-xl);
-  margin-bottom: var(--space-1);
-}
-
-.subtitle {
-  color: var(--color-text-secondary);
-  font-size: var(--fs-sm);
+  margin: 0;
 }
 
 .header-actions {
@@ -734,13 +660,13 @@ function modelLabel(row: TableRow): string {
   flex-shrink: 0;
 }
 
-/* ---- 浮动提示弹窗(顶部居中,5s 自动消失) ---- */
+/* ---- 浮动提示弹窗 ---- */
 .toast-popup {
   position: fixed;
   top: var(--space-5);
   left: 50%;
   transform: translateX(-50%);
-  z-index: 2000; /* 高于 dialog(1000),确保弹窗打开时仍可见 */
+  z-index: 2000;
   display: flex;
   align-items: flex-start;
   gap: var(--space-2);
@@ -779,7 +705,6 @@ function modelLabel(row: TableRow): string {
   white-space: pre-wrap;
 }
 
-/* 弹窗从顶部滑入(保留 translateX(-50%) 居中) */
 .toast-slide-enter-active,
 .toast-slide-leave-active {
   transition: opacity var(--transition-base), transform var(--transition-base);
@@ -829,7 +754,6 @@ function modelLabel(row: TableRow): string {
 .col-thinking { width: 70px; text-align: center; }
 .col-actions { width: 120px; text-align: right; }
 
-/* 表头与正文同步对齐:类型 / Key / 思考 居中 */
 .config-table thead th.col-type,
 .config-table thead th.col-key,
 .config-table thead th.col-thinking,
@@ -919,7 +843,6 @@ function modelLabel(row: TableRow): string {
   color: #92400e;
 }
 
-/* 思考列:开启(主色调)/ 关闭(中性)/ 不适用(斜杠) */
 .badge-thinking-on {
   background: var(--color-primary-light);
   color: var(--color-primary);
