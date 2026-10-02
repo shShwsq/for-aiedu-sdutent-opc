@@ -487,7 +487,7 @@ ExecutorAgent (ABC)
 18. client.prompt(session_id, [{"type":"text","text":user_msg}], on_event=collector)
 19. recorder.close() + collector.close()
 20. client.close() + _stop_acp_bridge(session, bridge_exec_id)
-21. summary = collector.content_full or "第 N 轮完成(...)"
+21. summary = collector.content_full or "执行完成(...)"
 22. current_plan = _extract_plan(collector.content_full) or previous_plan
 23. return [], summary, current_plan
 ```

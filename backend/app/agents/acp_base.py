@@ -2615,7 +2615,7 @@ def run_acp_agent(
     # ---- 提取 summary 和 plan ----
     summary = collector.content_full or ""
     if not summary:
-        summary = f"第 {round_idx} 轮完成({agent_type},{collector.tool_call_count} 次工具调用)"
+        summary = f"执行完成({agent_type},{collector.tool_call_count} 次工具调用)"
 
     # 挂死兜底提前终止了 prompt:在 summary 里标注截断,让 agent2 评估时
     # 知道本轮输出不完整(任务不 fail,照常评估/追问;前端同步推 error 提示)

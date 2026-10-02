@@ -595,7 +595,7 @@ def run_react_agent(
     # react_agent 不再落库 results(由 agent2 在 done 时调
     # scenario.extract_results 提取并落库)
     if not summary:
-        summary = f"第 {round_idx} 轮完成"
+        summary = "执行完成"
 
     # 修复 4:返回本轮结束时的 plan 状态,供 orchestrator 传给下一轮
     return [], summary, current_plan

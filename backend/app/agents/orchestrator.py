@@ -293,7 +293,7 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         # 暂停检查点:agent1 执行前(react_agent 内部还有细粒度检查点)
         wait_if_paused(task.id)
 
-        task.current_stage = "第 1 轮:AI助手执行"
+        task.current_stage = "AI助手执行"
         db.commit()
         _publish_status(task)
 
@@ -1298,7 +1298,7 @@ def resume_audit_with_message(
         # ===== 单 agent 模式:agent2 已禁用,直接跑 react_agent =====
         if not ua_enabled:
             logger.info(f"[task={task.id}] resume 单 agent 模式(agent2 已禁用)")
-            task.current_stage = f"第 {start_round_idx} 轮:AI助手执行(单 agent)"
+            task.current_stage = "AI助手执行(单 agent)"
             db.commit()
             _publish_status(task)
 
@@ -1323,7 +1323,7 @@ def resume_audit_with_message(
             return  # finally 块仍会执行清理
 
         # ===== 先调 agent2 分析用户消息(analyze 模式,round_idx = start_round_idx)=====
-        task.current_stage = f"第 {start_round_idx} 轮:检查助手分析补充消息"
+        task.current_stage = "检查助手分析补充消息"
         db.commit()
         _publish_status(task)
 
@@ -1355,7 +1355,7 @@ def resume_audit_with_message(
 
         # ===== agent1 执行一轮(降级时直接用用户原始消息,不经 agent2 指令)=====
         wait_if_paused(task.id)
-        task.current_stage = f"第 {start_round_idx} 轮:AI助手执行"
+        task.current_stage = "AI助手执行"
         db.commit()
         _publish_status(task)
 
@@ -1584,7 +1584,7 @@ def _finish_resume(
     (由 _run_background_review 负责收尾)。
     """
     task.status = TaskStatus.COMPLETED
-    task.current_stage = f"重启执行完成,共 {len(react_summaries)} 轮"
+    task.current_stage = "重启执行完成"
     task.completed_at = datetime.now(timezone.utc)
     db.commit()
     _publish_status(task)
