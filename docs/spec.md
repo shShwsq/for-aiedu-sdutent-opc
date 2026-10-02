@@ -594,12 +594,12 @@ Result(任务结果项,通用)
 - 事件翻译:将外部 CLI 的 ACP 事件映射为系统内部 SSE 事件(conversation / thinking_delta / tool_call 等)
 - 凭证注入:从 `user_agent_configs` 加载用户保存的 CLI token,注入沙箱环境变量
 
-### 9.3 跨轮记忆三级压缩
+### 9.3 跨轮记忆(结构化注入 + 三级压缩)
 
-react_agent 在多轮 ReAct 迭代中,LLM 上下文会越来越长,采用三级压缩策略:
-1. **完整保留**(近期轮次):最近几轮的完整 thinking + tool_call + tool_result 原样保留
-2. **丢弃工具详情**(中期轮次):保留 summary 但丢弃 tool_result 原始输出,只留摘要
-3. **LLM 压缩**(早期轮次):调 LLM 将早期对话压缩为一段自然语言摘要,存为 `Conversation(type=history_compress)`
+react_agent 在多轮 ReAct 迭代中,LLM 上下文会越来越长。跨轮历史以**结构化 messages** 注入(逐轮 user 原话 / assistant 执行总结 / system 评审反馈,保留角色边界,编排注入以 `[系统注入|来源]` 标记与用户原话区分),采用三级压缩策略控制 token 成本(预算 `HISTORY_TOKEN_BUDGET=8000`,CJK 感知粗估):
+1. **Level 0 完整保留**:用户原话 + 工具调用摘要 + 执行总结 + 评审反馈
+2. **Level 1 丢工具摘要**:按优先级降级(missing 非空的轮次保留最久)
+3. **Level 2 LLM 压缩**(早期轮次):早期轮次压缩为一段单条 system 摘要,存为 `Conversation(type=history_compress)`;审查完成后后台**预压缩**,用户下一次追问直接命中缓存
 
 压缩后注入下一轮 LLM 上下文,避免 token 爆炸。
 
@@ -615,7 +615,7 @@ react_agent 内置循环检测机制,防止 LLM 陷入重复调用:
 react_agent 维护跨轮 plan 状态:
 - 首轮 LLM 生成 plan(任务分解清单),存入 `Conversation(type=plan)`
 - 后续轮次注入 `previous_plan`,LLM 可续接未完成项,避免重复规划
-- 每轮结束时输出 `final_plan`(可能含已完成/未完成标记),供下一轮继承
+- 每轮结束时输出 `final_plan`(可能含已完成/未完成标记),orchestrator 持久化到 `task.params["_plan"]`,resume 时加载为 `previous_plan`——追问/续跑跨轮保持 plan 连续(已完成项保持 done,只推进未完成项)
 - 前端通过 SSE `plan` 事件实时展示计划状态
 
 ### 9.6 工作区浏览

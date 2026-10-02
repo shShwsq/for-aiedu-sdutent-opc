@@ -68,7 +68,7 @@
 - **审查失败/降级**:保留 agent1 summary 临时结果,`review_status=failed`,落警告对话,仍推 `review_done(review_status=failed)` → `done`;任务状态不回滚(审查失败 ≠ 任务失败)
 - **无"协作总轮次"设置**:初始运行单轮,多轮协作由用户驱动(resume)。原 `AgentPolicy.max_rounds` 已移除(启动迁移 `migrate_agent_policy_drop_max_rounds_column` 幂等 DROP 老库列)
 - **单 agent 退化**:协作策略页关闭 Agent 2(`agent2_enabled=false`)后退化为单 agent 模式——agent1 跑 1 轮直接产出结果,无后台审查,`review_status` 保持 `NULL`
-- **resume(用户驱动多轮)**:用户追加消息 / 点击建议「深挖」触发。审查进行中时 resume 先等待审查结束(`wait_for_review`,超时 120s 拒绝);用户消息**原文直接交给 agent1** 跑一轮(不经 agent2 转述,agent1 跨轮历史由 `_build_history_context` 注入),结束后按轮次类型分流:纯对话轮直接收尾,分析轮再次后台审查。每次 resume = agent1 一轮 + (分析轮)后台审查
+- **resume(用户驱动多轮)**:用户追加消息 / 点击建议「深挖」触发。审查进行中时 resume 先等待审查结束(`wait_for_review`,超时 120s 拒绝);用户消息**原文直接交给 agent1** 跑一轮(不经 agent2 转述,agent1 跨轮历史由 `_build_history_messages` 以结构化 messages 注入,用户追问原文作为独立 user 消息;plan 状态从 `task.params["_plan"]` 跨轮续接),结束后按轮次类型分流:纯对话轮直接收尾,分析轮再次后台审查。每次 resume = agent1 一轮 + (分析轮)后台审查
 - **review_status 状态模型**:`NULL`(未审查:单 agent / 老任务)/ `running`(审查中)/ `done`(完成)/ `failed`(失败,任务仍 COMPLETED)。启动迁移 `migrate_stale_review_status` 把遗留 `running` 置 `failed`(后端重启后审查线程已死)
 
 ### 1.3 交付物来源与上传链路(uploads → orchestrator)
@@ -273,32 +273,41 @@ def run_react_agent(
 ```
 
 **追问轮（`followup_query` 非空，resume/重试时为用户消息或重试指令原文）**：
+
+历史以**结构化 messages** 注入（保留角色边界），用户追问原文作为最后一条独立 user 消息（零包装）：
+
 ```
-基于之前的执行进度,请处理以下新消息(用户追问可直接回答,新需求/修正则执行对应工作,续跑则接着完成,均不要重做已完成的部分)(不需要重新 clone 仓库):
-仓库路径(已 clone,直接用这个路径调 read_file/search_code/list_files): {repo_path}
-
-[之前轮次的对话记忆]
-{history_prefix from _build_history_context}
-
-[本轮补充要求]
-{followup_query}
+[system] {system_prompt}
+—— 以下为逐轮历史(_build_history_messages,按轮次时间序) ——
+[user]      {第 N 轮用户原话}                          ← 用户当轮 question 原文
+[system]    [系统注入|工具调用摘要|第 N 轮] ...(Level 0)
+[assistant] {第 N 轮 react_agent 执行总结}
+[system]    [系统注入|评审反馈|第 N 轮] {agent2 审查反馈}
+—— 历史结束,本轮编排注入 ——
+[system] [系统注入|续跑指引](+ 仓库路径,工作区有文件时)
+[user] {followup_query 原文}
 ```
 
-### 3.4 跨轮记忆（`_build_history_context`，三级压缩）
+编排注入与用户原话以 `[系统注入|来源]` 标记区分（防注入内容被当成用户指令）；落库的 question 即用户可见原文，无需事后剥离。
 
-从 `Conversation` 表加载 `round_idx < current` 的所有记录（排除 `history_compress` 缓存），按轮分组，每轮构造：
+### 3.4 跨轮记忆（`_build_history_messages`，结构化 + 三级压缩）
 
-- **full (Level 0)**：工具调用摘要（intent + 结果片段 200 字符）+ react_agent 总结 + agent2 评估
-- **compact (Level 1)**：丢工具摘要，只保留 react_agent 总结 + agent2 评估
+从 `Conversation` 表加载 `round_idx < current` 的所有记录（排除 `history_compress` 缓存），按轮分组，每轮提取结构化数据：
+
+- **question**：用户当轮原话（`role=user, type=question`，取最后一条）
+- **tool_summary (Level 0)**：工具调用摘要（intent + 结果片段 200 字符）
+- **assistant_summary**：react_agent 当轮最后一条 thinking（执行总结）
+- **review**：agent2 评审反馈（优先 reasoning；type 兼容 `evaluation`/`review` 两代）
 - **priority**：2=missing 非空，1=done=false，0=其他
 
-**超限处理顺序**：
-1. 全部 Level 0 ≤ `MAX_HISTORY_TOTAL_CHARS=12000` → 直接用
-2. 超限 → 按优先级降级（低的先降，同优先级 FIFO），全 Level 1 还超 → 进入 Level 2
-3. **Level 2**：保留最近 `HISTORY_KEEP_RECENT=1` 轮 Level 1，早期轮次调 LLM 压缩
-   - 压缩 prompt：`_HISTORY_COMPRESS_PROMPT`，关闭 thinking 模式加速
+**超限处理顺序**（按 `_estimate_tokens` CJK 感知粗估，预算 `MAX_HISTORY_TOKEN_BUDGET=8000`，可用环境变量 `HISTORY_TOKEN_BUDGET` 覆盖）：
+1. 全部 Level 0 ≤ 预算 → 直接用
+2. 超限 → 按优先级降级（低的先丢工具摘要，同优先级 FIFO），全 Level 1 还超 → 进入 Level 2
+3. **Level 2**：保留最近 `HISTORY_KEEP_RECENT=1` 轮 Level 1，早期轮次压缩为单条 `[系统注入|早期轮次压缩摘要]` system 消息
+   - 压缩 prompt：`_HISTORY_COMPRESS_PROMPT`（必须保留用户要求/关键发现/covered/missing），关闭 thinking 模式加速
    - **带缓存 + 增量压缩**：`_get_or_create_compressed` 查 `type=history_compress` 缓存记录，部分覆盖时增量压缩（旧摘要 + 新轮次），结果落库为新缓存
-4. 无 client 或压缩失败 → 兜底强制截断（`_truncate_segments`）
+   - **后台预压缩**：`precompress_history_for_next_round` 在审查完成后/单 agent 收尾时预写缓存，用户下一次追问直接命中，消除追问路径上的同步 LLM 压缩延迟
+4. 无 client 或压缩失败 → 兜底强制截断（`_truncate_messages`，从最早消息裁剪保最近）
 
 **单条截断**：`MAX_HISTORY_MSG_CHARS=3000`，工具摘要 `MAX_TOOL_HISTORY_CHARS=2000`
 
@@ -325,6 +334,7 @@ def run_react_agent(
 - **代码推进**：工具调用前根据 `_TOOL_STEP_KEYWORDS` 表推断当前 step，标 `in_progress`（粗粒度）
 - **LLM 确认**：LLM 在 thinking 里输出新 `<plan>` 时，`_merge_plan` 按 `step.text` 匹配，信任 LLM 的 `done` 标注（它有 tool_result 上下文，判断更准）
 - **跨轮续接**：`previous_plan` 传入本轮启动时即注入为 system 提醒，避免重新规划已完成项
+- **持久化**：每轮结束 orchestrator 把 plan 状态写入 `task.params["_plan"]`（`_save_plan_to_task`），resume 时加载为 `previous_plan`（`_load_plan_from_task`，含脏数据清洗）——追问/续跑跨轮保持 plan 连续，对齐 Codex 的持久 plan 状态
 
 `_TOOL_STEP_KEYWORDS` 映射示例：
 ```python
@@ -693,12 +703,12 @@ list of `{label, header_name, header_value}`：
 
 | 传递路径 | 机制 | 字符上限 |
 |---------|------|---------|
-| orchestrator → agent1 | `previous_plan` 参数 | - |
+| orchestrator → agent1 | `previous_plan` 参数（resume 时从 `task.params["_plan"]` 加载,跨轮连续） | - |
 | orchestrator → agent2 | `react_summaries` 列表 | - |
 | agent2 跨轮自记忆 | `_build_agent2_history` 从 Conversation 表加载 | 单条 3000，总 12000 |
-| agent1（内置 react_agent）跨轮自记忆 | `_build_history_context` 三级压缩 | 总 12000（Level 2 LLM 压缩） |
+| agent1（内置 react_agent）跨轮自记忆 | `_build_history_messages` 结构化注入（逐轮 user 原话/assistant 总结/system 反馈）+ 三级压缩 | token 预算 8000（`HISTORY_TOKEN_BUDGET` 可覆盖;Level 2 LLM 压缩,后台预压缩） |
 | agent1 → agent2 | agent1 落库 `type=thinking` 的 content（即 summary），agent2 通过 `react_summaries` 接收 | - |
-| agent2 → agent1 | agent2 落库 `type=review` 的 reasoning（旧版任务为 `type=evaluation`），内置 react_agent 经 `_build_history_context` 加载 | - |
+| agent2 → agent1 | agent2 落库 `type=review` 的 reasoning（旧版任务为 `type=evaluation`），内置 react_agent 经 `_build_history_messages` 加载 | - |
 | 长期记忆 → agent2 | `build_agent2_memory_section` 注入 system prompt | 各段 2000 |
 | 长期记忆 → agent1（内置） | `build_react_agent_memory_section` + `build_global_memory_section` 注入 system prompt | 各段 2000 |
 | 长期记忆 → CLI agent | `_load_project_memory_summary` + `_load_global_memory` 注入 prompt 末尾 | 各段 2000 |

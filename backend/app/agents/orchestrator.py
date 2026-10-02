@@ -15,8 +15,12 @@
 
 resume(用户追加消息/点击建议深挖):
 - 用户消息直接交给 agent1 跑一轮(不经 agent2 转述;agent1 跨轮历史
-  由 react_agent._build_history_context 自行注入),随后走后台审查
+  由 react_agent._build_history_messages 以结构化 messages 注入,
+  用户追问原文作为独立 user 消息),随后走后台审查
 - 多轮完全由用户驱动(每次 resume = agent1 一轮 + 后台审查)
+- plan 状态跨轮连续:每轮结束持久化到 task.params["_plan"],
+  resume 时加载为 previous_plan 传入(对齐 Codex 的持久 plan 状态,
+  追问/续跑不重规划已完成项)
 
 单 agent 模式(agent2_enabled=false):react_agent 单轮 + summary 结果,
 无审查,行为与旧版一致。
@@ -221,6 +225,8 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
                 results_count=len(_results),
             )
             react_summaries.append({"round": 1, "summary": summary})
+            # plan 状态持久化(resume 跨轮续接)
+            _save_plan_to_task(task, db, _plan)
 
             # 用 summary 作为唯一结构化结果(agent2 已禁用,不做结构化提取)
             structured_results = [{"title": "执行结果", "content": summary}]
@@ -262,6 +268,9 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
             # resume 线程后续 publish 全被丢弃(对话/状态事件丢失、任务卡死)。
             finish_task(task.id)
             normal_completed = True
+
+            # 预压缩早期历史:用户下一轮追问直接命中缓存(失败兜底)
+            _precompress_history_safely(task, db, len(react_summaries), react_client)
 
             # 记忆归纳(失败兜底,不影响任务完成)
             try:
@@ -317,6 +326,8 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
             results_count=len(_results),
         )
         react_summaries.append({"round": 1, "summary": summary})
+        # plan 状态持久化(resume 跨轮续接)
+        _save_plan_to_task(task, db, current_plan)
 
         # ===== 轮次类型判定:纯对话轮(如问候/纯问答)跳过审查与重下游 =====
         # 本轮无任何工具调用 → agent1 未触碰工作区,无新证据可审;
@@ -380,6 +391,7 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
                 llm_client=llm_client,
                 agent_policy=agent_policy,
                 task_id_str=task_id_str,
+                react_client=react_client,
             )
         finally:
             # 唤醒等待审查的 resume 请求(若有),并清理注册表
@@ -466,8 +478,54 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
 
 
 # ============================================================
-# 辅助:轮次类型判定 / 记录 agent2 的对话 / 临时结果 / 后台审查
+# 辅助:plan 状态持久化 / 轮次类型判定 / 记录 agent2 的对话 / 临时结果 / 后台审查
 # ============================================================
+
+
+def _save_plan_to_task(task: Task, db: Session, plan: list[dict]) -> None:
+    """把本轮结束时的 plan 状态持久化到 task.params["_plan"]
+
+    resume 时由 _load_plan_from_task 加载为 previous_plan 传给下一轮
+    executor.run,保证跨轮 plan 连续(对齐 Codex 的持久 plan 状态:
+    已完成项保持 done,只推进未完成项,不重新规划)。
+    空 plan 也写入(清空上轮残留,防旧 plan 污染新任务语义)。
+    """
+    try:
+        task.params = {**(task.params or {}), "_plan": plan or []}
+        db.commit()
+    except Exception as e:
+        logger.warning(f"[task={task.id}] 保存 plan 状态失败(忽略): {e}")
+
+
+def _load_plan_from_task(task: Task) -> list[dict]:
+    """加载上次持久化的 plan 状态(resume 跨轮续接用)
+
+    无记录/格式异常返回空 list(等同于无 plan,react_agent 正常重新规划)。
+    """
+    plan = (task.params or {}).get("_plan")
+    if not isinstance(plan, list):
+        return []
+    # 只保留合法条目(id/text/status),脏数据不进执行链
+    cleaned = [
+        s for s in plan
+        if isinstance(s, dict) and isinstance(s.get("text"), str) and s.get("text")
+    ]
+    return cleaned
+
+
+def _precompress_history_safely(
+    task: Task, db: Session, completed_round_idx: int, client: LLMClient | None,
+) -> None:
+    """轮次结束后预压缩早期历史(失败兜底,不影响任务生命周期)
+
+    把 Level 2 历史压缩从用户追问的关键路径挪到后台:此处预写缓存,
+    用户下一次追问直接命中,消除追问响应前的同步 LLM 压缩延迟。
+    """
+    try:
+        from app.agents.react_agent import precompress_history_for_next_round
+        precompress_history_for_next_round(db, task.id, completed_round_idx, client)
+    except Exception as e:
+        logger.warning(f"[task={task.id}] 预压缩历史失败(忽略): {e}")
 
 
 def _round_has_tool_calls(db: Session, task_id, round_idx: int) -> bool:
@@ -600,6 +658,7 @@ def _run_background_review(
     llm_client: LLMClient | None,
     agent_policy: dict,
     task_id_str: str,
+    react_client: LLMClient | None = None,
 ) -> None:
     """后台审查:agent2 单次完整核查 + 结果替换 + 终止事件 + 下游链
 
@@ -723,6 +782,10 @@ def _run_background_review(
                 auto_generate_practice_for_task(task, db)
             except Exception as practice_err:
                 logger.warning(f"[task={task.id}] 自动生成练习题失败(忽略): {practice_err}")
+
+        # 预压缩早期历史:用户下一轮追问直接命中缓存,消除追问路径上的
+        # 同步 LLM 压缩延迟(失败兜底,内部已捕获)
+        _precompress_history_safely(task, db, len(react_summaries), react_client)
 
     except Exception as e:
         # 最后防线:保证终止事件一定推送(SSE 不悬挂),任务保持 COMPLETED
@@ -1225,7 +1288,9 @@ def resume_audit_with_message(
     3. 起始 round_idx:用户追加消息时复用消息所在轮(消息与首轮 react 执行
        同轮,不隔轮);失败重试时从 max+1 续接新轮
     4. agent1 直接执行用户消息(原文直传,不经 agent2 转述;
-       跨轮历史由 react_agent._build_history_context 注入)
+       跨轮历史由 react_agent._build_history_messages 以结构化 messages
+       注入,用户追问原文作为独立 user 消息;plan 状态从 task.params["_plan"]
+       跨轮续接,已完成项不重规划)
     5. 轮次类型判定:纯对话轮(本轮无工具调用)直接收尾,保留既有结果
        与审查状态,跳过审查/练习题/记忆归纳
     6. agent1 轮结束:summary 落临时结果,任务 COMPLETED(推 agent1_done)
@@ -1272,8 +1337,10 @@ def resume_audit_with_message(
     )
 
     react_summaries = _load_react_summaries(db, task.id)
-    # 重启时不复用旧 plan(让 LLM 根据新消息重新规划)
-    current_plan: list[dict] = []
+    # plan 跨轮连续:加载上次持久化的 plan 作为本轮起点,
+    # 已完成项保持 done,只推进未完成项;追问若改变方向,LLM 可在
+    # <plan> 更新中新增/调整步骤(_merge_plan 按 text 匹配合并)
+    previous_plan = _load_plan_from_task(task)
 
     # 起始轮:用户追加消息时复用消息所在轮(消息已由 API 端点落库为最新轮,
     # react 执行与该消息同轮——用户消息 → 执行 → 审查构成一轮完整闭环,
@@ -1316,7 +1383,7 @@ def resume_audit_with_message(
     try:
         # ===== 用户消息直接交给 agent1(不经 agent2 转述) =====
         # agent2 职责收敛为后台审查:追问/重试消息原文直传 agent1,
-        # 跨轮历史上下文由 react_agent._build_history_context 注入
+        # 跨轮历史由 react_agent._build_history_messages 注入
         wait_if_paused(task.id)
         task.current_stage = "AI助手执行" if ua_enabled else "AI助手执行(单 agent)"
         db.commit()
@@ -1329,7 +1396,7 @@ def resume_audit_with_message(
             followup_query=user_message,
             client=react_client,
             repo_context=None,  # 重启不传 repo_context(仓库已 clone,react_agent 自行从 sandbox 取)
-            previous_plan=None,
+            previous_plan=previous_plan,  # plan 跨轮续接(见上方加载注释)
         )
         perf_log(task.id, "executor_run", time.perf_counter() - _t0, round_idx=start_round_idx, executor=executor.name)
         emit(
@@ -1338,6 +1405,8 @@ def resume_audit_with_message(
             results_count=len(_results),
         )
         react_summaries.append({"round": start_round_idx, "summary": summary})
+        # plan 状态持久化(供下一次 resume 续接)
+        _save_plan_to_task(task, db, current_plan)
 
         # ===== 轮次类型判定:纯对话轮(仅双 agent 模式)跳过审查与重下游 =====
         # 本轮无任何工具调用 → agent1 回答完全来自历史上下文,无新证据可审;
@@ -1356,7 +1425,7 @@ def resume_audit_with_message(
         # ===== 单 agent 模式:agent2 已禁用,执行完直接收尾(无审查) =====
         if not ua_enabled:
             logger.info(f"[task={task.id}] resume 单 agent 模式(agent2 已禁用)")
-            _finish_resume(task, db, react_summaries)
+            _finish_resume(task, db, react_summaries, react_client=react_client)
             normal_completed = True  # 正常完成:finally 不再兑底推 error(见 finally 注释)
             return  # finally 块仍会执行清理
 
@@ -1403,6 +1472,7 @@ def resume_audit_with_message(
                 llm_client=llm_client,
                 agent_policy=agent_policy,
                 task_id_str=task_id_str,
+                react_client=react_client,
             )
         finally:
             _mark_review_finished(task.id, review_ev)
@@ -1550,7 +1620,10 @@ def _err_detail(e: Exception) -> str:
     return text if text else f"{type(e).__name__}(无错误详情)"
 
 
-def _finish_resume(task: Task, db: Session, react_summaries: list[dict]) -> None:
+def _finish_resume(
+    task: Task, db: Session, react_summaries: list[dict],
+    react_client: LLMClient | None = None,
+) -> None:
     """resume 收尾(单 agent 模式):标记状态 + 终止事件
 
     仅单 agent 模式(agent2 已禁用)使用:无 agent2 评估可展示,
@@ -1572,7 +1645,10 @@ def _finish_resume(task: Task, db: Session, react_summaries: list[dict]) -> None
     # 消除"用户再发新追问触发的 reset_task_bus 被旧线程 finally 的 finish_task 重新覆盖"
     # 竞态 —— 否则新 resume 线程 publish 全被丢弃(对话/状态事件丢失、任务卡死)。
     finish_task(task.id)
-    
+
+    # 预压缩早期历史:用户下一轮追问直接命中缓存(失败兜底)
+    _precompress_history_safely(task, db, len(react_summaries), react_client)
+
     # 重启完成:自动归纳写入长期记忆(失败兑底,不影响;client 用默认,归纳是简单任务)
     try:
         from app.services.memory_summarize import summarize_and_save_memory

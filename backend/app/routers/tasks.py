@@ -1479,8 +1479,9 @@ _CONVERSATION_TRACE_TYPES = {
     "error",       # 错误(关键失败原因,属于结论而非过程)
 }
 
-# 跨轮历史记忆注入块标记(react_agent._build_history_context 生成)。
-# 历史存量数据里追问轮 question 可能把它整段落库,报告侧需裁掉
+# 跨轮历史记忆注入块标记(旧版 react_agent 把历史块拼进 question 落库)。
+# 现行实现历史以结构化 messages 注入(不落库为 question),此标记仅用于
+# 裁掉历史存量数据里追问轮 question 混入的记忆块
 _HISTORY_MEMORY_MARKER = "[之前轮次的对话记忆]"
 
 # 追问轮指令段标签(新旧兼容):记忆块之后紧跟的追问段起点,

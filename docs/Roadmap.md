@@ -45,7 +45,6 @@
 - **verifier_agent(实验性)**:独立的验证智能体,agent2 在评估覆盖度后可调用它在已部署测试环境动态验证 agent1 的发现(如确认 SQL 注入是否真实可利用)。独立 ReAct 循环 + 独立工具集(`http_request` 在沙箱内 urllib 执行 + `run_python_code`),支持 `per_action`(每个动作弹窗确认)/ `direct`(直接执行)两种授权模式。支持登录 token 注入(auth_profile,label 选择身份,LLM 永不见 token 明文)。
 - **协作策略设置页**:用户可配置评估频率(每轮 / 每两轮 / 仅最后)、验证权限(是否允许 agent2 自行验证 + 授权模式默认值 + verifier 测试环境 URL + 多个登录 token)、执行智能体命令确认模式(自动批准 / 逐命令确认,对内置 react_agent 与 CLI 执行器均生效)。
 - **执行智能体命令确认**(executor_command_confirm):控制执行智能体(内置 react_agent + CLI:qoder/deepseek/codex)执行危险命令时是否弹窗确认,防容器破坏与资源耗尽。两条独立机制:**内置 react_agent** 走 `sandbox_tools.run_command` 的 `_PendingCommandConfirm` 机制(与 local 模式危险命令确认同源,SSE 事件 `command_confirm`),通过 `react_agent.py` → `set_current_task` → `_CURRENT_EXECUTOR_COMMAND_CONFIRM` ContextVar → `execute_tool` 自动注入;**CLI 执行智能体** 走 ACP `request_permission` 机制(bridge SSE 推 `permission_request` 事件 → 前端 `CommandConfirmDialog` 弹窗 → `POST /tasks/{id}/permission_response` 回写)。`always_approve`(默认):内置 react_agent 在 sandbox 下直接执行,CLI 注入 YOLO/never 配置跳过审批;`per_command`:两条路径都推确认。local 模式下 dangerous 命令始终推确认(无视此字段)。Codex 受非交互模式限制仅支持 `always_approve`,`per_command` 时自动降级并警告。用户级默认在协作策略页设置,任务级可在新建任务页覆盖(builtin 与 CLI 执行器均显示)。
-- **用户澄清提问(ask_user)**:round 0 agent2 可向用户提问(选择题 + 填空题,最多 2 轮),前端弹窗交互,后端阻塞等待答案。
 
 #### 记忆与技能系统
 
