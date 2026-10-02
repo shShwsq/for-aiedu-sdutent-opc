@@ -525,7 +525,7 @@ Result(任务结果项,通用)
   - 文件数上限:`SKILL_MAX_FILES=100`
   - 列出文件上限:`SKILL_MAX_LISTED_FILES=200`
   - 默认放行的图片扩展名:`.png,.jpg,.jpeg,.webp,.gif`(`SKILL_ALLOWED_EXTENSIONS_EXTRA`;不建议追加 `.svg`,可含恶意脚本)
-  - skill 存储目录:`USER_SKILLS_DIR=./user_skills`
+  - skill 存储目录:`USER_SKILLS_DIR=./data/user_skills`(统一数据根 `data/` 下,旧 `./user_skills` 由启动迁移自动搬家)
 - **隔离**:用户上传的 skill 仅自己可见,他人 `list_skills` 不会列出,也无法 `skill` 工具加载。内置 skill 全员可见但只读
 - **同名冲突**:用户上传与内置 / 他人 skill 同名时直接报错 `无法覆盖`;与自己已有 skill 同名时弹窗确认覆盖
 - **扩展性**:管理员可通过 API 或直接编辑磁盘文件添加新 skill;用户通过 zip 上传添加自己的 skill(仅自己可用)

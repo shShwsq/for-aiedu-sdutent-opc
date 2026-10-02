@@ -30,7 +30,9 @@ logs/
 # 数据库迁移生成的临时文件
 *.sqlite3
 
-# 运行时数据
+# 运行时数据(统一数据根 backend/data/,旧默认目录启动时自动迁移过去;
+# 旧条目保留以防迁移失败/新旧并存分支下残留数据被误提交)
+backend/data/
 _repos/
 uploads_data/
 _repo_cache/
@@ -41,7 +43,7 @@ hermes-git-meta/
 
 # 用户上传的 skill(按用户隔离的运行时数据,不入库)
 backend/skills/user_*/
-# 用户上传 skill 的默认存储目录(可经 USER_SKILLS_DIR 环境变量配置)
+# 用户上传 skill 的旧默认存储目录(新默认 data/user_skills 已被上面 backend/data/ 覆盖)
 backend/user_skills/
 
 # 参考资料

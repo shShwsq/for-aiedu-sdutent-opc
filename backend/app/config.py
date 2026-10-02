@@ -59,8 +59,14 @@ class Settings(BaseSettings):
     # 退避策略见 app/llm/client.py:指数退避+抖动,厂商返回 Retry-After 时优先采用
     LLM_RATE_LIMIT_MAX_RETRIES: int = 3
 
+    # ---- 数据统一根 ----
+    # 4 个运行时数据目录(克隆/缓存/skill/上传)统一收纳在 data/ 根下,
+    # gitignore/备份/卷挂载只需覆盖一处;各子目录仍可独立用 env 重定位。
+    # 旧布局(_repos / _repo_cache / user_skills / uploads_data 平铺在运行目录根)
+    # 由 app/services/data_dirs.py 启动时自动迁移
+    #
     # 仓库克隆临时目录
-    REPO_CLONE_DIR: str = "./_repos"
+    REPO_CLONE_DIR: str = "./data/repos"
     # 仓库克隆深度:0=完整克隆(默认,保留 git 历史供 agent 追溯);>0=浅克隆 --depth N(超大仓库可设 1/50 加速)
     REPO_CLONE_DEPTH: int = 0
     # 仓库克隆超时(秒)。完整克隆比浅克隆慢,默认 600s;超大仓库可调大
@@ -73,7 +79,7 @@ class Settings(BaseSettings):
     REPO_CACHE_ENABLED: bool = True
     # 缓存根目录(后端本机路径;Windows 建议短路径,注意 260 字符长路径限制)
     # 生产环境可指向独立可写 volume(如 /data/secondlook/repo_cache)
-    REPO_CACHE_DIR: str = "./_repo_cache"
+    REPO_CACHE_DIR: str = "./data/repo_cache"
     # 缓存新鲜度 TTL(秒):命中后距上次 fetch 未超此值直接复用,超了才增量 fetch
     REPO_CACHE_FETCH_TTL: int = 300
     # 缓存总大小上限(GB),超限按最久未用 LRU 淘汰(1h 内用过的不会被淘汰)
@@ -94,7 +100,7 @@ class Settings(BaseSettings):
     # 用户上传 skill 存储目录(默认相对后端运行目录)
     # 生产环境可指向独立可写 volume(如 /data/secondlook/user_skills);
     # 内置 skill 始终在代码目录 backend/skills/,不经过此配置
-    USER_SKILLS_DIR: str = "./user_skills"
+    USER_SKILLS_DIR: str = "./data/user_skills"
 
     # 用户 skill 上传限制(单位 MB / 条,安全边界,详见 app/skills/uploader.py)
     # zip 本体上限(默认 50MB)
@@ -119,7 +125,7 @@ class Settings(BaseSettings):
     # 任务创建后长期保留,供失败重试 / 完成后追问 resume 复用)
     # 仅 STORAGE_BACKEND=local 时使用。默认相对路径便于开发;生产必须用 env 覆盖为绝对路径
     # (相对路径按进程 CWD 解析,存储位置随 uvicorn 启动目录漂移),并挂载持久卷
-    UPLOADS_DIR: str = "./uploads_data"
+    UPLOADS_DIR: str = "./data/uploads"
 
     # ---- 引用复核(check_reference,agent2 用)----
     # 场景命中且任务级 _agent_policy 未显式设置 allow_verify 时,自动开启

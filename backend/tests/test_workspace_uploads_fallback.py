@@ -153,6 +153,29 @@ def test_get_workspace_no_uploads_false(monkeypatch):
 
 
 # ============================================================
+# get_workspace.can_restore(纯 params 推导,「重新克隆」按钮显示依据)
+# ============================================================
+
+
+def test_get_workspace_can_restore_true_with_repo_url(monkeypatch):
+    """带 repo_url 的任务(沙箱已过期):can_restore=True,前端显示重新克隆按钮"""
+    monkeypatch.setattr(ws_router.sandbox_tools, "get_workspace_info", lambda tid: None)
+    task = _task(params={"repo_url": "https://example.com/r.git"})
+    res = ws_router.get_workspace(task.id, db=_db(task), current_user=_user())
+    assert res["available"] is False
+    assert res["can_restore"] is True
+
+
+def test_get_workspace_can_restore_false_without_repo_url(monkeypatch):
+    """纯上传任务无 repo_url:can_restore=False,不显示重新克隆按钮"""
+    monkeypatch.setattr(ws_router.sandbox_tools, "get_workspace_info", lambda tid: None)
+    task = _task(params={"upload_ids": ["20990101000000-none"]})
+    res = ws_router.get_workspace(task.id, db=_db(task), current_user=_user())
+    assert res["available"] is False
+    assert res["can_restore"] is False
+
+
+# ============================================================
 # 回退树形状
 # ============================================================
 

@@ -105,6 +105,8 @@ def get_workspace(
     - completed: 任务是否已完成
     - mode: sandbox/local
     - has_uploads: 任务是否带用户上传(沙箱过期后前端回退浏览的依据;零存储访问)
+    - can_restore: 任务是否带 repo_url(工作区过期后前端「重新克隆」按钮的显示依据;
+      纯上传任务无仓库可恢复,不显示)
     """
     task = _check_task_access(task_id, db, current_user)
 
@@ -114,6 +116,7 @@ def get_workspace(
     has_uploads = bool(
         extract_creation_ids(task.params) or extract_followup_ids(task.params)
     )
+    can_restore = bool((task.params or {}).get("repo_url"))
 
     info = sandbox_tools.get_workspace_info(str(task_id))
     if info is None:
@@ -124,6 +127,7 @@ def get_workspace(
             "completed": False,
             "mode": "",
             "has_uploads": has_uploads,
+            "can_restore": can_restore,
         }
 
     repo_path = info.get("repo_path", "")
@@ -134,6 +138,7 @@ def get_workspace(
         "completed": info.get("completed", False),
         "mode": info.get("mode", ""),
         "has_uploads": has_uploads,
+        "can_restore": can_restore,
     }
 
 

@@ -214,7 +214,7 @@ GitHub 和 Gitee 二者均支持,按需配置。留空的平台对应路由会�
 
 | 变量 | 说明 | 默认值 |
 |---|---|---|
-| `REPO_CLONE_DIR` | 本地 clone 临时目录(`SANDBOX_MODE=local` 时使用) | `./_repos` |
+| `REPO_CLONE_DIR` | 本地 clone 临时目录(`SANDBOX_MODE=local` 时使用) | `./data/repos` |
 | `REPO_CLONE_DEPTH` | 克隆深度:`0`=完整克隆(默认,保留 git 历史供 log/blame 追溯);`>0`=浅克隆 `--depth N`(超大仓库可加速) | `0` |
 | `REPO_CLONE_TIMEOUT` | 克隆超时(秒),完整克隆比浅克隆慢,超大仓库可调大 | `600` |
 
@@ -224,7 +224,7 @@ GitHub 和 Gitee 二者均支持,按需配置。留空的平台对应路由会�
 
 | 变量 | 说明 | 默认值 |
 |---|---|---|
-| `UPLOADS_DIR` | 上传内容存储目录 | `./uploads_data` |
+| `UPLOADS_DIR` | 上传内容存储目录 | `./data/uploads` |
 | `UPLOAD_MAX_FILE_MB` | 上传大小上限(MB) | `100` |
 | `UPLOAD_MAX_EXTRACT_MB` | ZIP 解压后总大小上限(MB) | `300` |
 | `UPLOAD_MAX_SINGLE_FILE_MB` | ZIP 内单文件大小上限(MB) | `50` |
@@ -344,10 +344,30 @@ bash deploy.sh                               # 一键构建 + 启动
 - **后端强制单 worker**(uvicorn `--workers 1`):出题 job 与任务 SSE 事件流是进程内存态,多 worker 会导致事件流错连、job 丢失
 - **nginx 关闭 `proxy_buffering`**:任务流/出题流是 SSE 实时推送,缓冲会卡住前端
 - **`/api` 前缀反代去前缀**:前端 baseURL 为 `/api`,nginx 反代到后端时自动去掉
-- **持久化卷**:`backend/logs`(practice_generate.log / perf.log / acp)、`user_skills`(用户上传 skill)、`_repos`
+- **持久化卷**:`backend/logs`(practice_generate.log / perf.log / acp)、`backend/data`(统一数据根:上传交付物 / 用户 skill / 本地克隆 / 仓库缓存,启动时自动把旧布局 `uploads_data` / `user_skills` / `_repos` 迁入)
 - 修改 OAuth 回调等 `VITE_*` 变量后需重新执行 `bash deploy.sh`(构建期注入)
 
 各配置项逐条注释见 [deploy/.env.production.example](deploy/.env.production.example)。
+
+#### 升级到统一数据根(仅旧 Docker 部署需要)
+
+2026-10 起运行时数据(上传交付物 / 用户 skill / 本地克隆 / 仓库缓存)统一收敛到 `backend/data/` 单卷。旧部署的 `uploads_data` / `user_skills` / `backend_repos` 三个卷不再挂载,升级前需手动迁移(named volume 数据不会自动搬):
+
+```bash
+cd deploy && docker compose down
+# 1) 删掉 .env.production 里的 UPLOADS_DIR=.../uploads_data(改用默认值落到 data 卷)
+# 2) 启动一次让 backend_data 卷创建并继承镜像内目录所有权,然后停掉
+docker compose up -d backend && sleep 10 && docker compose down
+# 3) 把旧卷数据拷进新卷(卷名带项目前缀 secondlook_;cp -a 保留 uid 1000 所有权;
+#    _repos 本地克隆是临时数据可不迁)
+docker run --rm -v secondlook_uploads_data:/old -v secondlook_backend_data:/new alpine \
+  sh -c 'cp -a /old/. /new/uploads/'
+docker run --rm -v secondlook_user_skills:/old -v secondlook_backend_data:/new alpine \
+  sh -c 'cp -a /old/. /new/user_skills/'
+docker compose up -d
+```
+
+> 开发环境(非 Docker)无需任何操作:后端启动时自动把运行目录下的旧布局目录搬进 `data/`,显式配置过 `UPLOADS_DIR` 等环境变量的位置一律尊重不动。
 
 ## 文档
 

@@ -69,6 +69,13 @@ async def lifespan(app: FastAPI):
     需要 schema 变更时,在 .env 设置 DB_REBUILD_ON_START=true 触发 drop_all,
     生产环境应切换到 Alembic 迁移管理 schema 变更。
     """
+    # 一次性目录迁移:旧默认数据目录(_repos/_repo_cache/user_skills/uploads_data)
+    # → data/ 统一根。必须先于一切目录消费方(GC/工作区恢复/路由初始化)执行;
+    # 设置被 env 重定位时不动,失败不阻断启动(详见 app/services/data_dirs.py)
+    from app.services.data_dirs import migrate_legacy_data_dirs
+
+    migrate_legacy_data_dirs()
+
     from app.models import email_token, task, user  # noqa: F401
     from app.models import agent_policy  # noqa: F401  # 用户级协作策略独立表
     from app.models import task_artifact  # noqa: F401

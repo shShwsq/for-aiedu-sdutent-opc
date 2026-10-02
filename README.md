@@ -214,7 +214,7 @@ Both GitHub and Gitee are supported; configure as needed. Platforms left empty w
 
 | Variable | Description | Default |
 |---|---|---|
-| `REPO_CLONE_DIR` | Local clone temp directory (used when `SANDBOX_MODE=local`) | `./_repos` |
+| `REPO_CLONE_DIR` | Local clone temp directory (used when `SANDBOX_MODE=local`) | `./data/repos` |
 | `REPO_CLONE_DEPTH` | Clone depth: `0` = full clone (default, keeps git history for `git log`/`git blame`); `>0` = shallow clone `--depth N` (speed up huge repos) | `0` |
 | `REPO_CLONE_TIMEOUT` | Clone timeout in seconds (full clone is slower than shallow; raise for huge repos) | `600` |
 
@@ -224,7 +224,7 @@ Task creation offers three deliverable source tabs: Git repository / upload ZIP 
 
 | Variable | Description | Default |
 |---|---|---|
-| `UPLOADS_DIR` | Storage directory for task deliverable uploads | `./uploads_data` |
+| `UPLOADS_DIR` | Storage directory for task deliverable uploads | `./data/uploads` |
 | `UPLOAD_MAX_FILE_MB` | Max upload size (MB) | `100` |
 | `UPLOAD_MAX_EXTRACT_MB` | Max total extracted size for a ZIP (MB) | `300` |
 | `UPLOAD_MAX_SINGLE_FILE_MB` | Max single file inside a ZIP (MB) | `50` |
@@ -344,10 +344,30 @@ Key points:
 - **Backend is forced to a single worker** (uvicorn `--workers 1`): practice jobs and task SSE streams are in-process state; multiple workers break event delivery
 - **nginx disables `proxy_buffering`**: task/practice streams are realtime SSE, buffering freezes the frontend
 - **`/api` prefix is stripped when proxying**: frontend baseURL is `/api`, nginx proxies to the backend without the prefix
-- **Persistent volumes**: `backend/logs` (practice_generate.log / perf.log / acp), `user_skills` (user-uploaded skills), `_repos`
+- **Persistent volumes**: `backend/logs` (practice_generate.log / perf.log / acp), `backend/data` (unified data root: uploads / user skills / local clones / repo cache; legacy `uploads_data`, `user_skills`, `_repos` layouts are migrated into it automatically at startup)
 - After changing `VITE_*` variables (e.g. OAuth callbacks), re-run `bash deploy.sh` (build-time injection)
 
 See [deploy/.env.production.example](deploy/.env.production.example) for per-variable comments.
+
+#### Upgrading to the unified data root (legacy Docker deployments only)
+
+Since Oct 2026 runtime data (uploaded deliverables / user skills / local clones / repo cache) lives under a single `backend/data/` volume. The legacy `uploads_data` / `user_skills` / `backend_repos` volumes are no longer mounted; migrate them manually before upgrading (named volume data is never moved automatically):
+
+```bash
+cd deploy && docker compose down
+# 1) Remove UPLOADS_DIR=.../uploads_data from .env.production (fall back to the default inside the data volume)
+# 2) Start once so the backend_data volume is created and inherits ownership from the image, then stop
+docker compose up -d backend && sleep 10 && docker compose down
+# 3) Copy old volume data into the new volume (volume names carry the secondlook_ prefix;
+#    cp -a preserves uid 1000 ownership; _repos local clones are temp data, safe to skip)
+docker run --rm -v secondlook_uploads_data:/old -v secondlook_backend_data:/new alpine \
+  sh -c 'cp -a /old/. /new/uploads/'
+docker run --rm -v secondlook_user_skills:/old -v secondlook_backend_data:/new alpine \
+  sh -c 'cp -a /old/. /new/user_skills/'
+docker compose up -d
+```
+
+> Non-Docker dev environments need no action: at startup the backend moves legacy layout directories under the working directory into `data/` automatically; any location explicitly configured via `UPLOADS_DIR` (and friends) is always respected and never touched.
 
 ## Documentation
 

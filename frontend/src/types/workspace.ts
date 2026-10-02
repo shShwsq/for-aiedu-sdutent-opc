@@ -28,6 +28,8 @@ export interface WorkspaceInfo {
   mode: string
   /** 任务是否带用户上传(沙箱过期后前端回退浏览的依据;旧后端无此字段) */
   has_uploads?: boolean
+  /** 任务是否带 repo_url(工作区过期后「重新克隆」按钮的显示依据;纯上传任务不显示) */
+  can_restore?: boolean
 }
 
 /** 工作区恢复(POST /tasks/{id}/workspace/restore)的响应 */
