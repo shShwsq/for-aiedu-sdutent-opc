@@ -14,6 +14,7 @@ import zipfile
 import pytest
 
 from app.config import settings
+from app.services.upload_storage import get_backend, reset_backend_cache
 from app.services.uploads import (
     UploadError,
     load_upload_meta,
@@ -37,6 +38,9 @@ def _uploads_dir(tmp_path, monkeypatch):
     """每个用例用独立的上传目录,不污染真实数据目录"""
     uploads_dir = tmp_path / "uploads_data"
     monkeypatch.setattr(settings, "UPLOADS_DIR", str(uploads_dir))
+    # 后端缓存与用例隔离(防其他测试文件的 s3 单例串场;local 后端无状态)
+    monkeypatch.setattr(settings, "STORAGE_BACKEND", "local")
+    reset_backend_cache()
     return uploads_dir
 
 
@@ -220,3 +224,73 @@ def test_materialize_local_keeps_stage1_after_exit():
     with materialize_upload_files(upload_id) as files2:
         assert (files2 / "a.txt").read_bytes() == b"keep me"
     assert load_upload_meta(upload_id)["upload_id"] == upload_id
+
+
+# ============================================================
+# 工作区回退浏览:local 后端 list_files / stat_file / read_file
+# ============================================================
+
+
+def test_local_list_files_tree_and_noise_pruned():
+    """list_files 返回含中间目录的树条目,噪声目录剪枝(与沙箱树同口径)"""
+    data = _make_zip({
+        "README.md": "hi",
+        "src/main.py": "print(1)",
+        "src/util/helper.py": "x",
+        ".git/config": "[core]",
+        "node_modules/pkg/index.js": "junk",
+    })
+    meta = save_upload(data, "project.zip", "u1")
+    entries = get_backend().list_files(meta["upload_id"])
+    paths = {e["path"]: e["type"] for e in entries}
+    assert paths["README.md"] == "file"
+    assert paths["src"] == "dir"
+    assert paths["src/main.py"] == "file"
+    assert paths["src/util"] == "dir"
+    assert paths["src/util/helper.py"] == "file"
+    # .git / node_modules 剪枝
+    assert not any(
+        ".git" in p or "node_modules" in p for p in paths
+    ), paths
+
+
+def test_local_list_files_missing_upload():
+    """不存在的上传 list_files 抛 UploadError(回退树按已清理占位)"""
+    with pytest.raises(UploadError, match="不存在"):
+        get_backend().list_files("20990101000000-notexist")
+
+
+def test_local_stat_and_read_file_roundtrip():
+    """stat_file / read_file 按相对路径读写,子目录路径正常"""
+    data = _make_zip({"src/main.py": "print(1)"})
+    m1 = save_upload(b"hello", "a.txt", "u1")
+    m2 = save_upload(data, "p.zip", "u1")
+    backend = get_backend()
+    assert backend.stat_file(m1["upload_id"], "a.txt") == 5
+    assert backend.read_file(m1["upload_id"], "a.txt") == b"hello"
+    assert backend.read_file(m2["upload_id"], "src/main.py") == b"print(1)"
+    assert backend.stat_file(m2["upload_id"], "src/main.py") == 8
+    # 反斜杠分隔符归一为 posix
+    assert backend.read_file(m2["upload_id"], "src\\main.py") == b"print(1)"
+
+
+def test_local_read_file_missing_or_dir():
+    """文件不存在 / 路径是目录:抛 UploadError(端点转 404)"""
+    data = _make_zip({"src/main.py": "x"})
+    meta = save_upload(data, "p.zip", "u1")
+    backend = get_backend()
+    with pytest.raises(UploadError, match="文件不存在"):
+        backend.read_file(meta["upload_id"], "b.txt")
+    with pytest.raises(UploadError, match="文件不存在"):
+        backend.read_file(meta["upload_id"], "src")  # 目录不可读
+
+
+def test_local_read_file_traversal_rejected():
+    """.. 穿越与空路径拒绝(防读 files/ 外的 meta.json 等)"""
+    meta = save_upload(b"x", "a.txt", "u1")
+    backend = get_backend()
+    for bad in ("../meta.json", "a/../../b.txt", ""):
+        with pytest.raises(UploadError, match="不合法"):
+            backend.read_file(meta["upload_id"], bad)
+        with pytest.raises(UploadError, match="不合法"):
+            backend.stat_file(meta["upload_id"], bad)

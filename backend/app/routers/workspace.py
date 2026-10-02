@@ -276,13 +276,28 @@ def get_workspace_uploads_tree(
 
 
 def _build_uploads_tree(task: Task, max_entries: int) -> dict:
-    """按槽位布局拼接各上传的文件树(available 判定 + unavailable 占位)"""
+    """按槽位布局拼接各上传的文件树(available 判定 + unavailable 占位)
+
+    带前缀的槽位(多上传 {i}-{name}/、followup_uploads/{i}-{name}/)必须补齐
+    前缀目录链条目:前端 buildUploadsTree 按父路径挂节点、跳过缺父目录的
+    孤儿条目,不补链则整枝文件不显示(list_files 只含 files/ 内部相对条目)。
+    """
     backend = get_backend()
     slots = _task_upload_slots(task)
     entries: list[dict] = []
+    ensured_dirs: set[str] = set()
     unavailable: list[str] = []
     truncated = False
     max_depth = 1
+
+    def _ensure_dir_chain(prefix: str) -> None:
+        """补齐前缀目录链(跨槽位去重,如多个 followup 共享 followup_uploads)"""
+        parts = prefix.split("/")
+        for i in range(1, len(parts) + 1):
+            d = "/".join(parts[:i])
+            if d not in ensured_dirs:
+                ensured_dirs.add(d)
+                entries.append({"path": d, "type": "dir"})
 
     for slot in slots:
         try:
@@ -300,6 +315,8 @@ def _build_uploads_tree(task: Task, max_entries: int) -> dict:
             logger.warning(f"[task={task.id}] 列出上传文件失败(按已清理处理): {e}")
             unavailable.append(slot.prefix or f"上传文件({slot.upload_id[:12]})")
             continue
+        if slot.prefix:
+            _ensure_dir_chain(slot.prefix)
         for f in files:
             path = f"{slot.prefix}/{f['path']}" if slot.prefix else f["path"]
             entries.append({"path": path, "type": f["type"]})
