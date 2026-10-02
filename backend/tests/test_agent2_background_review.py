@@ -477,9 +477,10 @@ def test_followup_during_review_runs_parallel(monkeypatch):
     try:
         orchestrator.run_dual_agent_audit(task, MagicMock())
 
-        # 老审查照常完成:知识点落库、review_done 推送(侧栏 badge 更新)
-        assert task.review_status == "done"
-        assert rec.events("review_done")
+        # 老审查照常落库知识点,但被新流取代(世代门控)→ 不写 badge、
+        # 不推 review_done(任务级字段归新流所有,防 badge 抖动)
+        assert task.review_status == "running"  # 保持 agent1 完成时的值
+        assert not rec.events("review_done")
         # 但不推 done / finish(新流活跃,总线打开)
         assert not rec.events("done")
         assert rec.index(("finish",)) == -1
@@ -590,10 +591,54 @@ def test_leftover_messages_auto_resume_new_round(monkeypatch):
         assert [c[2]["content"] for c in user_conv_events] == ["第一条遗留", "第二条遗留"]
         # 附件累积进 params(沙箱回收后的重放依据)
         assert task.params["followup_upload_ids"] == ["u1", "u2", "u3"]
-        # 审查照常完成(review_done),但新流活跃 → 不推 done/finish
-        assert rec.events("review_done")
+        # 审查照常落库知识点,但新流已接管(世代门控)→ 不写 badge、
+        # 不推 review_done;也不推 done/finish(新流活跃,总线打开)
+        assert task.review_status == "running"
+        assert not rec.events("review_done")
         assert not rec.events("done")
         assert rec.index(("finish",)) == -1
+    finally:
+        _clear_scopes(str(task.id))
+        clear_user_messages(str(task.id))
+
+
+def test_superseded_review_skips_badge_updates(monkeypatch):
+    """审查期间被新流取代(用户追问启动新一轮)→ 老审查照常落库知识点,
+    但跳过 review_status 覆盖与 review_done 事件(badge 归新流所有,
+    不被老审查收尾值短暂覆盖成 done/failed)。"""
+    task = _mk_task()
+    executor = MagicMock()
+    executor.name = "builtin"
+    executor.run = MagicMock(return_value=([], "总结", []))
+
+    probe_results = []
+
+    def _ua(*args, **kwargs):
+        # 审查执行期间:用户追问启动了新一轮(注册新 scope)→ 本流被取代
+        orchestrator._begin_event_scope(task.id)
+        check = kwargs.get("superseded_check")
+        probe_results.append(check() if callable(check) else "missing")
+        return _mk_review_result()
+
+    _patch_env(monkeypatch, executor, _ua)
+    rec = _EventRecorder(monkeypatch)
+    db = MagicMock()
+
+    try:
+        orchestrator.run_dual_agent_audit(task, db)
+
+        # 降级探针被传入且取代后返回 True
+        assert probe_results and probe_results[-1] is True
+        # 知识点照常落库(interim 1 + knowledge 2,按轮产出不受门控影响)
+        results_added = [
+            c.args[0] for c in db.add.call_args_list
+            if isinstance(c.args[0], Result)
+        ]
+        assert len(results_added) == 3
+        # review_status 保持 agent1 完成时的 running(新轮语义),
+        # 不被老审查的 done 覆盖;review_done 事件不推
+        assert task.review_status == "running"
+        assert not rec.events("review_done")
     finally:
         _clear_scopes(str(task.id))
         clear_user_messages(str(task.id))

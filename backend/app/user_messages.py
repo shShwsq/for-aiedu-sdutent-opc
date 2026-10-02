@@ -71,6 +71,18 @@ class _UserMessageQueue:
         with self._lock:
             return len(self._messages) > 0
 
+    def remove(self, message_id: str) -> bool:
+        """按 message_id 移除一条待处理消息(撤回用)
+
+        返回是否移除成功(False = 不在队列:已被消费或从未入队)。
+        """
+        with self._lock:
+            before = len(self._messages)
+            self._messages = [
+                m for m in self._messages if m.get("message_id") != message_id
+            ]
+            return len(self._messages) < before
+
     def clear(self) -> None:
         """清空队列(任务结束/重启时调用)"""
         with self._lock:
@@ -134,6 +146,18 @@ def has_pending_messages(task_id: str | UUID) -> bool:
     """task 是否有待处理的用户消息(快速判断)"""
     queue = _get_or_create(str(task_id))
     return queue.has_pending()
+
+
+def remove_user_message(task_id: str | UUID, message_id: str) -> bool:
+    """撤回一条待处理消息(按 message_id 移除,API 撤回端点调用)
+
+    返回是否移除成功(False = 不在队列:已被 agent 消费或从未入队)。
+    """
+    queue = _get_or_create(str(task_id))
+    removed = queue.remove(message_id)
+    if removed:
+        logger.info(f"[task={task_id}] 撤回待处理消息 {message_id}")
+    return removed
 
 
 def clear_user_messages(task_id: str | UUID) -> None:

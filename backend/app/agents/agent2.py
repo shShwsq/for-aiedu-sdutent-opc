@@ -506,6 +506,7 @@ def run_agent2(
     task: Task | None = None,
     agent_policy: dict[str, Any] | None = None,
     repo_path: str | None = None,
+    superseded_check: Any = None,
 ) -> dict[str, Any]:
     """执行一次 agent2 后台审查
 
@@ -523,6 +524,11 @@ def run_agent2(
         agent_policy: agent 策略(可选)。含 allow_verify 开关,控制是否启用 verify 工具。
         repo_path: 任务工作区路径(可选)。传入时启用只读核查工具,
             agent2 可读真实源码核对 agent1 的发现。
+        superseded_check: 可选回调() -> bool。返回 True 表示本审查已被更新的
+            执行流取代(并行语义:用户追问已启动新一轮)—— 此时跳过 verify
+            动态验证(verifier 的 run_python_code 与新轮 agent1 共享同一任务
+            沙箱,并行会争抢端口/进程,且新轮正在改文件使 PoC 结论不可信),
+            仅完成只读核查。
 
     返回:agent2 的结构化输出
         {
@@ -780,6 +786,25 @@ def run_agent2(
                     "role": "tool",
                     "tool_call_id": tc["id"] or f"call_{tc['index']}",
                     "content": f"[不支持的工具: {fn_name}]",
+                })
+                continue
+
+            # 并行降级:本审查已被新一轮执行取代时跳过动态验证
+            # (verifier 的 run_python_code 与新轮 agent1 共享同一任务沙箱,
+            #  并行执行会争抢端口/进程,且新轮正在改文件使 PoC 结论不可信)
+            if superseded_check is not None and superseded_check():
+                logger.info(
+                    f"[task={task_id}] agent2 审查已被新流取代,"
+                    f"跳过动态验证(第 {verify_count + 1} 次),仅完成只读核查"
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"] or f"call_{tc['index']}",
+                    "content": (
+                        "[本轮审查已被新一轮执行取代,动态验证已跳过:"
+                        "请仅基于已有只读核查结果完成评估,"
+                        "对应发现的 verified 标 \"pending\"、verify_method 标 \"static\"]"
+                    ),
                 })
                 continue
 

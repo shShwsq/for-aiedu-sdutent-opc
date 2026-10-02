@@ -226,6 +226,7 @@ export type SSEEventType =
   | 'conversation'
   | 'conversation_update'
   | 'user_message_pending'
+  | 'user_message_withdrawn'
   | 'status'
   | 'thinking_delta'
   | 'clone_progress'
@@ -279,6 +280,11 @@ export interface ConversationUpdateEventData {
  * 消费时收到同 id 的 conversation 事件 → 条目转入对话流
  */
 export type UserMessagePendingEventData = ConversationEventData
+
+/** user_message_withdrawn 事件 data:待处理消息被用户撤回(前端移除条目) */
+export interface UserMessageWithdrawnEventData {
+  id: string
+}
 
 /** status 事件 data */
 export interface StatusEventData {
@@ -527,5 +533,11 @@ export interface SendMessageResponse {
   /** 是否被接受(false 表示任务状态不允许或内容无效) */
   accepted: boolean
   /** 提示信息(展示给用户) */
+  message?: string
+}
+
+/** 撤回待处理消息的响应(DELETE /tasks/{id}/messages/{message_id}) */
+export interface MessageWithdrawResponse {
+  success: boolean
   message?: string
 }

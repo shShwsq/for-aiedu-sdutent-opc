@@ -910,11 +910,28 @@ def _run_background_review(
     round_idx 必须由调用方显式传入(= 本流 agent1 执行轮),不得用
     len(react_summaries) 推导 —— "某轮有对话却无 thinking 记录"(如
     executor 在首次思考前崩溃后重试)时二者会错位,导致删错轮、遗留陈旧 interim。
+
+    并行世代门控:本流被更新世代取代时(用户追问/遗留续轮已启动新一轮)——
+    ① verify/PoC 动态验证降级跳过(与新轮共享沙箱,防端口/进程争抢);
+    ② 任务级字段(review_status/current_stage)与 review_done 事件归新流
+    所有,本流跳过写入(防 badge 被老审查收尾值短暂覆盖);
+    知识点落库与审查结论卡不受影响(按轮追加,历史完整)。
     """
+    def _superseded() -> bool:
+        return not _is_latest_generation(task_id_str, flow_gen)
+
     try:
-        task.current_stage = "检查助手审查中"
-        db.commit()
-        _publish_status(task)
+        if _superseded():
+            # 审查启动前已被新流取代(如遗留消息自动续轮先启动):
+            # 纯只读降级,不动任务级字段(stage/badge 归新流所有)
+            logger.info(
+                f"[task={task.id}] 审查启动时已被新流取代,降级为只读核查"
+                f"(gen={flow_gen})"
+            )
+        else:
+            task.current_stage = "检查助手审查中"
+            db.commit()
+            _publish_status(task)
 
         # agent2 只读核查用的工作区路径:预克隆失败时 agent1 可能已自主
         # clone,从会话信息刷新(无会话/未 clone 时为 None,禁用只读工具)
@@ -931,6 +948,7 @@ def _run_background_review(
                 repo_url=(task.params or {}).get("repo_url"),
                 task=task, agent_policy=agent_policy,
                 repo_path=cur_repo_path,
+                superseded_check=_superseded,
             )
         except Exception as review_err:
             # run_agent2 内部已兜底降级,这里是最后防线(DB 异常等)
@@ -955,8 +973,10 @@ def _run_background_review(
 
         if review_failed:
             # 审查失败:保留 agent1 summary 临时结果,只标记子状态
-            task.review_status = "failed"
-            task.current_stage = "任务完成(检查未完成,已保留执行结果)"
+            # (被新流取代时跳过任务级字段:badge 归新流所有)
+            if not _superseded():
+                task.review_status = "failed"
+                task.current_stage = "任务完成(检查未完成,已保留执行结果)"
             logger.warning(
                 f"[task={task.id}] 后台审查未完成"
                 f"(degraded={bool(ua_result.get('degraded'))},"
@@ -965,7 +985,8 @@ def _run_background_review(
             )
         else:
             # 审查完成:本轮临时 Result 替换为重点与知识点(按轮追加:
-            # 仅删本轮 round_idx 的临时结果,跨轮知识点保留不覆盖)
+            # 仅删本轮 round_idx 的临时结果,跨轮知识点保留不覆盖;
+            # 知识点落库不受世代门控影响 —— 按轮产出,历史完整)
             structured_results = ua_result.get("results") or []
             grouping = ua_result.get("grouping")
             db.query(Result).filter(
@@ -988,31 +1009,43 @@ def _run_background_review(
                 else:
                     task.params = {"_grouping": grouping}
                 db.commit()
-            task.review_status = "done"
-            task.current_stage = (
-                f"任务完成,检查助手整理出 {len(structured_results)} 个重点与知识点"
-            )
+            if not _superseded():
+                task.review_status = "done"
+                task.current_stage = (
+                    f"任务完成,检查助手整理出 {len(structured_results)} 个重点与知识点"
+                )
             logger.info(
                 f"[task={task.id}] 后台审查完成,"
                 f"整理 {len(structured_results)} 个结构化结果,"
                 f"{len(ua_result.get('suggestions') or [])} 条建议"
             )
-        db.commit()
-        _publish_status(task)
 
-        # 领域事件 + perf 锚点:审查完成(含失败;对照实验的审查时延以此为准)
-        emit(
-            REVIEW_COMPLETED, task.id,
-            review_status=task.review_status,
-            results_count=len(ua_result.get("results") or []),
-            suggestions_count=len(ua_result.get("suggestions") or []),
-        )
-        perf_log(task.id, "review_done", review_status=task.review_status)
+        # 世代门控:被新流取代时跳过 badge 更新与 review_done 事件
+        # (review_status/current_stage 归新流所有,防老审查收尾值覆盖
+        #  新轮的 running 造成侧栏 badge 短暂抖动)
+        if _superseded():
+            logger.info(
+                f"[task={task.id}] 审查收尾时已被新流取代,跳过任务级字段"
+                f"更新与 review_done 事件(gen={flow_gen})"
+            )
+        else:
+            db.commit()
+            _publish_status(task)
 
-        # 通知前端审查结束(侧栏 badge 更新 + 拉取最终结果)。
+            # 领域事件 + perf 锚点:审查完成(含失败;对照实验的审查时延以此为准)
+            emit(
+                REVIEW_COMPLETED, task.id,
+                review_status=task.review_status,
+                results_count=len(ua_result.get("results") or []),
+                suggestions_count=len(ua_result.get("suggestions") or []),
+            )
+            perf_log(task.id, "review_done", review_status=task.review_status)
+
+            # 通知前端审查结束(侧栏 badge 更新 + 拉取最终结果)。
+            publish(task.id, "review_done", {"review_status": task.review_status})
         # done/finish 由 _end_event_scope 统一判定:并行流(用户追问已启动
         # 新一轮 agent1/resume)仍在跑时保持总线打开,由最后活跃流收尾
-        publish(task.id, "review_done", {"review_status": task.review_status})
+        # (被取代也必须调:注销自身 scope,否则总线永久悬挂)
         _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
 
         # ---- 下游链(依赖最终结果,必须在审查后;仅最新流执行,避免并行重复)----
@@ -1045,10 +1078,12 @@ def _run_background_review(
         # 最后防线:保证终止事件一定推送(SSE 不悬挂),任务保持 COMPLETED
         logger.exception(f"[task={task.id}] 后台审查收尾异常(强制终止总线)")
         try:
-            task.review_status = "failed"
-            task.current_stage = "任务完成(检查异常终止,已保留执行结果)"
-            db.commit()
-            publish(task.id, "review_done", {"review_status": "failed"})
+            if not _superseded():
+                # 任务级字段与 review_done 归最新流所有(世代门控)
+                task.review_status = "failed"
+                task.current_stage = "任务完成(检查异常终止,已保留执行结果)"
+                db.commit()
+                publish(task.id, "review_done", {"review_status": "failed"})
             _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
         except Exception:
             _end_event_scope(task.id, flow_gen)

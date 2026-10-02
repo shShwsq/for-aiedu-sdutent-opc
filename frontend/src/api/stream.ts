@@ -30,6 +30,7 @@ import type {
   StatusEventData,
   ThinkingDeltaEventData,
   UserMessagePendingEventData,
+  UserMessageWithdrawnEventData,
   VerifyActionEventData,
 } from '@/types/task'
 
@@ -42,6 +43,8 @@ export interface StreamCallbacks {
    * 以"待处理"条目展示在输入框上方,消费时经 onConversation 转入对话流
    */
   onUserMessagePending?: (data: UserMessagePendingEventData) => void
+  /** 待处理消息被用户撤回:移除待处理条目 */
+  onUserMessageWithdrawn?: (data: UserMessageWithdrawnEventData) => void
   /** 更新已有对话项的 content(如 Kimi 增量参数补全后刷新 tool_call 显示) */
   onConversationUpdate?: (data: ConversationUpdateEventData) => void
   onStatus?: (data: StatusEventData) => void
@@ -88,6 +91,7 @@ export function subscribeTaskStream(
     'conversation',
     'conversation_update',
     'user_message_pending',
+    'user_message_withdrawn',
     'status',
     'thinking_delta',
     'clone_progress',
@@ -123,6 +127,9 @@ export function subscribeTaskStream(
             break
           case 'user_message_pending':
             callbacks.onUserMessagePending?.(data as unknown as UserMessagePendingEventData)
+            break
+          case 'user_message_withdrawn':
+            callbacks.onUserMessageWithdrawn?.(data as unknown as UserMessageWithdrawnEventData)
             break
           case 'status':
             // [诊断] 状态事件:记录后端推送的状态,与前端本地状态对拍

@@ -227,6 +227,13 @@ class SendMessageResponse(BaseModel):
     message: str = ""
 
 
+class MessageWithdrawResponse(BaseModel):
+    """撤回待处理用户消息的响应(DELETE /tasks/{id}/messages/{message_id})"""
+
+    success: bool
+    message: str = ""
+
+
 # ============================================================
 # 验证器动作授权(verifier_agent per_action 模式)
 # ============================================================

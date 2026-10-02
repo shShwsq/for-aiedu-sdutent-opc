@@ -9,6 +9,7 @@ import type {
   Scenario,
   SendMessageRequest,
   SendMessageResponse,
+  MessageWithdrawResponse,
   TaskCreateRequest,
   CommandConfirmEventData,
   CommandConfirmRequest,
@@ -154,18 +155,31 @@ export function deleteTask(taskId: string): Promise<void> {
  * 发送用户补充消息
  *
  * 按 task.status 分发:
- * - running / paused:消息入队,agent1 下一迭代注入 LLM 上下文
+ * - running / paused:消息入队(agent1 消费前以"待处理"条目展示在输入框上方),
+ *   消费时经 conversation 事件转入对话流
  * - completed:启动新的协作 round(resume_audit_with_message)
  * - pending / failed:返回 accepted=false
- *
- * 消息会落库为 Conversation(role=user, type=message)并推送 SSE,
- * 前端通过 onConversation 事件自动追加到对话流当前 round 末尾。
  */
 export function sendTaskMessage(
   taskId: string,
   req: SendMessageRequest,
 ): Promise<SendMessageResponse> {
   return client.post(`/tasks/${taskId}/messages`, req).then((r) => r.data)
+}
+
+/**
+ * 撤回待处理消息(运行中发送、尚未被 agent1 消费的)
+ *
+ * 成功后后端删除 Conversation 记录并推 user_message_withdrawn 事件
+ * (前端移除待处理条目);已被消费则 success=false。
+ */
+export function withdrawTaskMessage(
+  taskId: string,
+  messageId: string,
+): Promise<MessageWithdrawResponse> {
+  return client
+    .delete(`/tasks/${taskId}/messages/${messageId}`)
+    .then((r) => r.data)
 }
 
 // ============================================================

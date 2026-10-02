@@ -76,6 +76,90 @@ def test_stream_fail_twice_returns_degraded_review(monkeypatch):
 
 
 # ============================================================
+# 并行降级:superseded_check(被新流取代时跳过 verify 动态验证)
+# ============================================================
+
+
+def _mk_verify_stream(scripted_rounds):
+    """构造脚本化 LLM 流:按调用序返回 (content, tool_calls, reasoning)"""
+    calls = []
+
+    def _fake_stream(client, messages, *, task_id, round_idx, tools=None):
+        calls.append([m for m in messages if m.get("role") == "tool"])
+        if len(calls) <= len(scripted_rounds):
+            return scripted_rounds[len(calls) - 1]
+        return ('{"covered": [], "missing": [], "reasoning": "兜底", '
+                '"suggestions": [], "results": [], "grouping": null}', [], "")
+
+    _fake_stream.calls = calls
+    return _fake_stream
+
+
+def test_verify_skipped_when_superseded(monkeypatch):
+    """并行降级:superseded_check=True → verify 被跳过(verifier 不执行,
+    LLM 收到降级说明并继续只读评估)—— 与新轮共享沙箱不再跑 PoC。"""
+    import app.agents.verifier_agent as verifier_agent
+
+    verifier_calls = []
+    monkeypatch.setattr(
+        verifier_agent, "run_verifier_agent",
+        lambda *a, **k: verifier_calls.append(1) or "不应执行",
+    )
+    stream = _mk_verify_stream([
+        # 第一轮:LLM 要求动态验证
+        ("", [{"id": "call_1", "index": 0, "name": "verify",
+               "arguments_str": '{"verification_request": "发送 PoC 确认"}'}],
+         "想验证一下"),
+        # 第二轮:看到降级说明后输出最终评估
+        ('{"covered": [], "missing": [], "reasoning": "只读评估完成", '
+         '"suggestions": [], "results": [{"title": "知识点", "content": "说明"}], '
+         '"grouping": null}', [], ""),
+    ])
+    monkeypatch.setattr(agent2, "_stream_agent2_llm", stream)
+
+    result = agent2.run_agent2(
+        "审计这个仓库", [], task_id="task-sup", round_idx=1, client=MagicMock(),
+        superseded_check=lambda: True,
+    )
+
+    assert verifier_calls == []  # PoC 验证被降级跳过
+    assert result.get("reasoning") == "只读评估完成"  # 审查照常完成
+    # LLM 收到降级说明(第二轮上下文的工具结果里)
+    assert any(
+        "已被新一轮执行取代" in m.get("content", "")
+        for m in stream.calls[1]
+    )
+
+
+def test_verify_executed_when_not_superseded(monkeypatch):
+    """未取代:superseded_check=False → verify 正常执行(降级不误伤)。"""
+    import app.agents.verifier_agent as verifier_agent
+
+    verifier_calls = []
+    monkeypatch.setattr(
+        verifier_agent, "run_verifier_agent",
+        lambda *a, **k: verifier_calls.append(1) or "PoC 验证结果:确认存在",
+    )
+    stream = _mk_verify_stream([
+        ("", [{"id": "call_1", "index": 0, "name": "verify",
+               "arguments_str": '{"verification_request": "发送 PoC 确认"}'}],
+         "想验证一下"),
+        ('{"covered": [], "missing": [], "reasoning": "验证后评估", '
+         '"suggestions": [], "results": [{"title": "知识点", "content": "说明"}], '
+         '"grouping": null}', [], ""),
+    ])
+    monkeypatch.setattr(agent2, "_stream_agent2_llm", stream)
+
+    result = agent2.run_agent2(
+        "审计这个仓库", [], task_id="task-nosup", round_idx=1, client=MagicMock(),
+        superseded_check=lambda: False,
+    )
+
+    assert verifier_calls == [1]  # 正常执行了一次 PoC 验证
+    assert result.get("reasoning") == "验证后评估"
+
+
+# ============================================================
 # resume_audit_with_message:降级分流 + 错误兜底
 # ============================================================
 

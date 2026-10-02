@@ -44,6 +44,7 @@ import {
   submitVerifyAction,
   submitCommandConfirm,
   updateTaskVerifierConfig,
+  withdrawTaskMessage,
 } from '@/api/task'
 import { subscribeTaskStream } from '@/api/stream'
 import { listDrafts, listGenerateJobs, getTaskGenerateModel } from '@/api/practice'
@@ -597,6 +598,12 @@ function connectSSE(taskId: string): void {
           created_at: data.created_at || new Date().toISOString(),
         })
       }
+    },
+    onUserMessageWithdrawn: (data) => {
+      // 待处理消息被撤回(本端或多端):移除条目(记录已由后端删除)
+      pendingUserMessages.value = pendingUserMessages.value.filter(
+        (m) => m.id !== data.id,
+      )
     },
     onConversation: (data) => {
       if (!task.value) return
@@ -2161,6 +2168,40 @@ function handleMessageError(message: string): void {
   error.value = message
 }
 
+/** 正在撤回的消息 id 集合(防重复点击) */
+const withdrawingIds = ref<Set<string>>(new Set())
+
+/**
+ * 撤回待处理消息(运行中发送、尚未被 agent1 消费的)
+ *
+ * 后端从队列移除 + 删除 Conversation + 推 user_message_withdrawn 事件
+ * (onUserMessageWithdrawn 移除条目,多端同步;此处乐观移除防闪烁)。
+ * 已被消费则后端拒绝,提示用户。
+ */
+async function handleWithdrawPendingMessage(messageId: string): Promise<void> {
+  if (!task.value?.id || withdrawingIds.value.has(messageId)) return
+  withdrawingIds.value.add(messageId)
+  try {
+    const resp = await withdrawTaskMessage(String(task.value.id), messageId)
+    if (resp.success) {
+      // 乐观移除(SSE 事件到达时幂等)
+      pendingUserMessages.value = pendingUserMessages.value.filter(
+        (m) => m.id !== messageId,
+      )
+    } else {
+      error.value = resp.message || '消息已被处理,无法撤回'
+      // 撤回失败(已被消费):条目本来也会被 conversation 事件转走,防御性移除
+      pendingUserMessages.value = pendingUserMessages.value.filter(
+        (m) => m.id !== messageId,
+      )
+    }
+  } catch (err) {
+    error.value = extractErrorMessage(err)
+  } finally {
+    withdrawingIds.value.delete(messageId)
+  }
+}
+
 /**
  * 侧栏"建议深挖":把检查助手的建议文本作为用户消息发出
  *
@@ -2765,6 +2806,24 @@ function toggleResult(id: string): void {
           </svg>
           <span class="pending-message-text">{{ truncateInput(msg.content, 60) }}</span>
           <span class="pending-message-tag">待处理</span>
+          <button
+            class="pending-message-withdraw"
+            title="撤回这条消息"
+            :disabled="withdrawingIds.has(msg.id)"
+            @click="handleWithdrawPendingMessage(msg.id)"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
         </div>
       </div>
 
@@ -3467,6 +3526,38 @@ function toggleResult(id: string): void {
   font-size: var(--fs-xs);
   color: var(--color-text-secondary);
   opacity: 0.75;
+}
+
+.pending-message-withdraw {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm, 4px);
+  background: transparent;
+  color: var(--color-text-secondary);
+  opacity: 0.6;
+  cursor: pointer;
+}
+
+.pending-message-withdraw svg {
+  width: 11px;
+  height: 11px;
+}
+
+.pending-message-withdraw:hover:not(:disabled) {
+  opacity: 1;
+  color: var(--color-danger);
+  background: var(--color-danger-light);
+}
+
+.pending-message-withdraw:disabled {
+  opacity: 0.3;
+  cursor: default;
 }
 
 .retry-bar-text {

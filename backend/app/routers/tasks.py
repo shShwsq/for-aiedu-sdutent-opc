@@ -62,6 +62,7 @@ from app.schemas.task import (
     SendMessageRequest,
     CommandConfirmRequest,
     CommandConfirmResponse,
+    MessageWithdrawResponse,
     SendMessageResponse,
     TaskCreateRequest,
     TaskCreateResponse,
@@ -88,7 +89,7 @@ from app.user_interaction import (
     submit_command_confirm,
     submit_verify_authorization,
 )
-from app.user_messages import push_user_message
+from app.user_messages import push_user_message, remove_user_message
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["tasks"])
@@ -760,6 +761,60 @@ def submit_task_message(
         accepted=False,
         message=f"任务状态 {task.status.value} 不支持发送消息",
     )
+
+
+# ============================================================
+# 撤回待处理消息(运行中发送、尚未被消费的补充消息)
+# ============================================================
+
+
+@router.delete("/tasks/{task_id}/messages/{message_id}", response_model=MessageWithdrawResponse)
+def withdraw_task_message(
+    task_id: uuid.UUID,
+    message_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User | None = Depends(get_optional_user),
+) -> MessageWithdrawResponse:
+    """撤回运行中发送、尚未被 agent1 消费的待处理消息(TRAE 式)
+
+    仅 running/paused 状态支持(此时消息在 in-memory 队列等待消费):
+    - 仍在队列 → 移除 + 删除 Conversation 记录 + 推 user_message_withdrawn
+      事件(前端移除待处理条目,多端同步;事件入总线历史,刷新后补播一致)
+    - 已被消费(drain 过)→ 拒绝:消息已进入 agent 上下文,无法撤回
+    - 附件说明:入队消息的附件在消费时才传输进沙箱,撤回无需清理工作区
+    """
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if task.user_id is not None:
+        if current_user is None or current_user.id != task.user_id:
+            raise HTTPException(status_code=403, detail="无权操作此任务")
+
+    if task.status not in (TaskStatus.RUNNING, TaskStatus.PAUSED):
+        return MessageWithdrawResponse(
+            success=False,
+            message=f"任务状态 {task.status.value} 无待处理消息,不支持撤回",
+        )
+
+    removed = remove_user_message(task.id, str(message_id))
+    if not removed:
+        # 不在队列:已被消费,或记录不存在
+        conv = db.get(Conversation, message_id)
+        if conv is None:
+            raise HTTPException(status_code=404, detail="消息不存在")
+        return MessageWithdrawResponse(
+            success=False,
+            message="消息已被智能体处理,无法撤回",
+        )
+
+    # 仍在队列:删除落库记录(对话流/刷新快照不再显示)+ 通知前端
+    db.query(Conversation).filter(
+        Conversation.id == message_id,
+        Conversation.task_id == task.id,
+    ).delete(synchronize_session=False)
+    db.commit()
+    publish(task.id, "user_message_withdrawn", {"id": str(message_id)})
+    return MessageWithdrawResponse(success=True, message="消息已撤回")
 
 
 # ============================================================

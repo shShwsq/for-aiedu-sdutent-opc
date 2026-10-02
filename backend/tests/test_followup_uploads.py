@@ -24,7 +24,7 @@ import app.routers.tasks as tasks_router
 import app.tools.sandbox_tools as sandbox_tools
 from app.agents.react_agent import _format_injected_user_messages
 from app.config import settings
-from app.models.task import TaskStatus
+from app.models.task import Task, TaskStatus
 from app.schemas.task import SendMessageRequest
 from app.services.uploads import save_upload
 from app.tools.sandbox_tools import (
@@ -35,6 +35,7 @@ from app.tools.sandbox_tools import (
 from app.user_messages import (
     clear_user_messages,
     drain_user_messages,
+    has_pending_messages,
     push_user_message,
 )
 
@@ -570,3 +571,81 @@ def test_submit_message_completed_no_attachments_keeps_params(monkeypatch):
 
     assert "followup_upload_ids" not in task.params
     assert launch_calls == [(str(task.id), "纯文字追问", None)]
+
+
+# ============================================================
+# 撤回待处理消息(DELETE /tasks/{id}/messages/{message_id})
+# ============================================================
+
+
+def _mk_running_task():
+    task = MagicMock()
+    task.id = uuid.uuid4()
+    task.user_id = None  # 匿名任务:跳过归属校验分支
+    task.status = TaskStatus.RUNNING
+    task.params = {}
+    return task
+
+
+def test_withdraw_pending_message_succeeds(monkeypatch):
+    """撤回仍在队列的消息:移除 + 删 Conversation + 推 user_message_withdrawn 事件。"""
+    task = _mk_running_task()
+    db = MagicMock()
+    db.get.return_value = task
+    published = []
+    monkeypatch.setattr(
+        tasks_router, "publish",
+        lambda tid, etype, data=None: published.append((etype, data)),
+    )
+
+    msg_id = str(uuid.uuid4())
+    push_user_message(task.id, "待撤回的消息", message_id=msg_id, created_at="t")
+    try:
+        resp = tasks_router.withdraw_task_message(task.id, uuid.UUID(msg_id), db, None)
+
+        assert resp.success is True
+        assert not has_pending_messages(task.id)  # 已出队
+        assert any(e == "user_message_withdrawn" for e, _ in published)
+        # Conversation 记录被删除(刷新快照/对话流不再显示)
+        db.query.return_value.filter.return_value.delete.assert_called_once()
+    finally:
+        clear_user_messages(task.id)
+
+
+def test_withdraw_consumed_message_rejected(monkeypatch):
+    """消息已被消费(不在队列但记录存在)→ 拒绝:已进入 agent 上下文。"""
+    task = _mk_running_task()
+    conv = MagicMock()
+    db = MagicMock()
+    db.get.side_effect = lambda cls, mid, *a, **k: task if cls is Task else conv
+    monkeypatch.setattr(tasks_router, "publish", lambda *a, **k: None)
+
+    resp = tasks_router.withdraw_task_message(task.id, uuid.uuid4(), db, None)
+
+    assert resp.success is False
+    assert "无法撤回" in resp.message
+
+
+def test_withdraw_missing_message_404(monkeypatch):
+    """记录不存在(从未发送过)→ 404。"""
+    task = _mk_running_task()
+    db = MagicMock()
+    db.get.side_effect = lambda cls, mid, *a, **k: task if cls is Task else None
+    monkeypatch.setattr(tasks_router, "publish", lambda *a, **k: None)
+
+    with pytest.raises(HTTPException) as ei:
+        tasks_router.withdraw_task_message(task.id, uuid.uuid4(), db, None)
+    assert ei.value.status_code == 404
+
+
+def test_withdraw_non_running_task_rejected(monkeypatch):
+    """非 running/paused 状态(如 completed)→ 拒绝:无待处理消息。"""
+    task = _mk_running_task()
+    task.status = TaskStatus.COMPLETED
+    db = MagicMock()
+    db.get.return_value = task
+    monkeypatch.setattr(tasks_router, "publish", lambda *a, **k: None)
+
+    resp = tasks_router.withdraw_task_message(task.id, uuid.uuid4(), db, None)
+
+    assert resp.success is False
