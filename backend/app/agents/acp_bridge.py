@@ -202,6 +202,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
         CLI 检测到危险命令时会发 JSON-RPC 请求(method=request_permission, 有 id),
         bridge 在 SSE 流里推 event: permission_request 事件给后端,后端问用户,
         用户确认后调 POST /permission_response,bridge 把结果写回 CLI stdin。
+
+        stream_error 处理:
+        CLI 进程退出/stdout EOF/读失败等异常关流时,bridge 在关闭连接前推
+        event: stream_error 事件(含原因),后端 _rpc 据此抛 ACPStreamAborted,
+        不会把流中断误当作正常完成(残缺输出流入 agent2 审查)。
         """
         if self.path == "/permission_response":
             self._handle_permission_response()
@@ -269,7 +274,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     except queue.Empty:
                         # 暂无数据,检查 CLI 进程是否还活着
                         if not _cli.alive:
-                            print(f"[bridge] CLI 进程在等待响应时退出(method={request_method})", file=sys.stderr, flush=True)
+                            rc = _cli.proc.poll() if _cli.proc else None
+                            print(f"[bridge] CLI 进程在等待响应时退出(method={request_method}, returncode={rc})", file=sys.stderr, flush=True)
+                            self._push_stream_error(
+                                "cli_exit", f"CLI 进程在执行中退出(returncode={rc})",
+                            )
                             break
                         # 推送 idle 心跳到 SSE(带 event: idle 标记,便于 recorder 记录)
                         # 每 5s 一次,让后端知道 bridge 还活着、CLI 还在跑
@@ -290,9 +299,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     if kind == "end":
                         # EOF,CLI 进程关闭了 stdout(读线程哨兵)
                         print(f"[bridge] CLI stdout EOF(method={request_method})", file=sys.stderr, flush=True)
+                        self._push_stream_error(
+                            "stdout_eof", "CLI 输出流关闭(EOF),疑似进程崩溃",
+                        )
                         break
                     if kind == "error":
                         print(f"[bridge] 读 CLI stdout 失败(method={request_method}): {payload}", file=sys.stderr, flush=True)
+                        self._push_stream_error(
+                            "read_error", f"读取 CLI 输出失败: {payload}",
+                        )
                         break
 
                     # 有数据,重置 idle 计数
@@ -342,7 +357,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 if not got_final:
                     # 流在收到最终响应前结束(读失败/EOF/CLI 退出/客户端断开):
                     # 关闭连接让客户端立即收到 EOF 快速失败,而非等它自己的
-                    # read 超时(keep-alive 下连接会一直开着)
+                    # read 超时(keep-alive 下连接会一直开着)。
+                    # 异常路径(CLI 退出/EOF/读失败)已先推 event: stream_error
+                    # 告知原因,客户端 _rpc 据此抛 ACPStreamAborted 而非静默返回 {}
                     self.close_connection = True
                 if line_count == 0:
                     print(f"[bridge] 警告:CLI 未输出任何响应行(method={request_method})", file=sys.stderr, flush=True)
@@ -359,6 +376,27 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     self._send_json(500, json.dumps({"error": str(e)}))
                 except Exception:
                     print(f"[bridge] 流式响应异常: {e}", file=sys.stderr, flush=True)
+
+    def _push_stream_error(self, reason: str, message: str) -> None:
+        """异常关流前推 event: stream_error 事件,告知后端终止原因
+
+        仅在未收到最终响应的异常路径调用(CLI 进程退出/stdout EOF/读失败)。
+        后端 ACPClient._rpc 收到后抛 ACPStreamAborted 并把 message 带进
+        截断标注,让本轮以"输出不完整"收尾而非被当作正常完成
+        (CLI 崩溃如 Node OOM 时,残缺输出不能直接流入 agent2 审查)。
+        客户端已断开时(BrokenPipe/连接重置)静默跳过——无从告知。
+
+        SSE 格式与 permission_request 一致(event: 行 + data: JSON 载荷),
+        载荷:{"reason": "cli_exit|stdout_eof|read_error", "message": "人类可读描述"}
+        """
+        payload = {"reason": reason, "message": message}
+        try:
+            sse = f"event: stream_error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            self.wfile.write(sse.encode("utf-8"))
+            self.wfile.flush()
+            print(f"[bridge] 推送 stream_error 事件(reason={reason})", file=sys.stderr, flush=True)
+        except (BrokenPipeError, ConnectionError, OSError):
+            pass  # 客户端已断开,尽力而为
 
     def _handle_request_permission(self, msg: dict) -> None:
         """处理 CLI 发来的 request_permission JSON-RPC 请求。

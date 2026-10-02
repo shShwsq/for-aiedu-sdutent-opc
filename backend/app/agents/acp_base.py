@@ -144,6 +144,19 @@ class PromptIdleTimeout(Exception):
         )
 
 
+class ACPStreamAborted(RuntimeError):
+    """SSE 流在收到 JSON-RPC 最终响应前异常结束(CLI 崩溃/连接中断)
+
+    ACP 协议要求每个请求必须回最终响应(含错误响应),因此"流结束但未收到
+    id 匹配的响应"必然是异常终止——此前 _rpc 静默返回 {} 会把 CLI 崩溃
+    (如 Node OOM)当作正常收尾,残缺输出直接流入 agent2 审查。
+    bridge 会在关流前推 event: stream_error 事件携带原因;未收到该事件
+    (网络中断/旧版 bridge)时用通用描述兜底。
+    继承 RuntimeError:new_session 的 bridge 日志增强路径(run_acp_agent)
+    仍可捕获并附上 CLI stderr。prompt() 捕获后走截断兜底(同 idle 超时)。
+    """
+
+
 # ============================================================
 # ACP HTTP 客户端
 # ============================================================
@@ -249,6 +262,10 @@ class ACPClient:
             # bridge 推 event: permission_request 时,后续 data: 行是 permission 载荷,
             # 不是 ACP 通知,需要走 permission_handler 路径
             current_event_type: str | None = None
+            # bridge 在异常关流前推的 stream_error 原因(人类可读,如
+            # "CLI 进程在执行中退出(returncode=3)");None 表示未收到
+            # (网络中断/旧版 bridge),流结束时用通用描述兜底
+            stream_abort_msg: str | None = None
 
             # idle 看门狗:idle_probe 非 None 时把阻塞读挪到后台线程,
             # 主线程按 _IDLE_POLL_SECONDS 检查无数据 idle 时长(挂死兜底)
@@ -293,6 +310,23 @@ class ACPClient:
                     self._handle_permission_request(perm_payload)
                     continue  # 不走 on_event,继续读后续 SSE
 
+                # stream_error 事件:bridge 即将因异常关闭连接(CLI 崩溃/
+                # stdout EOF/读失败),记录原因,流结束后由 _rpc 抛
+                # ACPStreamAborted(该事件是关流前最后一条,不在 on_event 分发)
+                if current_event_type == "stream_error":
+                    try:
+                        err_payload = json.loads(data)
+                    except json.JSONDecodeError:
+                        err_payload = {"message": data[:200]}
+                    if not isinstance(err_payload, dict):
+                        err_payload = {"message": str(err_payload)[:200]}
+                    stream_abort_msg = str(
+                        err_payload.get("message")
+                        or err_payload.get("reason")
+                        or "未知原因"
+                    )
+                    continue
+
                 try:
                     msg = json.loads(data)
                 except json.JSONDecodeError:
@@ -323,6 +357,17 @@ class ACPClient:
                     on_event(msg)
 
         if final_result is None:
+            if request_id is not None:
+                # 流结束但未收到 id 匹配的最终响应:CLI 崩溃/连接中断等
+                # 异常终止(ACP 要求每个请求必须回最终响应,正常完成不可
+                # 能走到这里)。此前静默返回 {} 会把崩溃当作正常收尾,
+                # 残缺输出直接流入 agent2 审查,必须显式报错。
+                msg = stream_abort_msg or (
+                    "连接在收到 JSON-RPC 最终响应前中断(CLI 崩溃或网络异常)"
+                )
+                if self.recorder:
+                    self.recorder.record_raw(f"stream aborted: {msg}", kind="meta")
+                raise ACPStreamAborted(msg)
             final_result = {}
         return final_result
 
@@ -538,6 +583,8 @@ class ACPClient:
         idle_probe: 返回当前是否有活动工具的回调(如 collector.has_active_tools)。
         非 None 时启用挂死兜底:分级 idle 超时后发 session/cancel 并返回空结果,
         同时置 last_prompt_truncated(调用方用已累积输出收尾,不 fail 任务)。
+        流异常终止(ACPStreamAborted,CLI 崩溃/连接中断)同样走截断兜底:
+        cancel(CLI 已死时无害)→ 置 last_prompt_truncated → 返回空结果。
         """
         self.last_prompt_truncated = None
         try:
@@ -556,6 +603,15 @@ class ACPClient:
             logger.warning(f"[acp] prompt idle 兜底触发: {e}")
             if self.recorder:
                 self.recorder.record_raw(f"idle timeout: {e}", kind="meta")
+            self.cancel(session_id)
+            self.last_prompt_truncated = str(e)
+            return {}
+        except ACPStreamAborted as e:
+            # CLI 崩溃/连接中断兜底:与 idle 同款善后——cancel(CLI 已死时
+            # bridge 返回 503,cancel 内部吞掉无害)→ 置截断标记 → 返回空
+            # 结果,由调用方用已累积输出收尾本轮并标注"输出不完整",
+            # 让 agent2 评估时知情(流结束原因已由 _rpc 记入 recorder)
+            logger.warning(f"[acp] prompt 流异常终止兜底触发: {e}")
             self.cancel(session_id)
             self.last_prompt_truncated = str(e)
             return {}
@@ -2597,12 +2653,13 @@ def run_acp_agent(
     if not summary:
         summary = f"执行完成({agent_type},{collector.tool_call_count} 次工具调用)"
 
-    # 挂死兜底提前终止了 prompt:在 summary 里标注截断,让 agent2 评估时
-    # 知道本轮输出不完整(任务不 fail,照常评估/追问;前端同步推 error 提示)
+    # 兜底提前终止了 prompt(idle 挂死超时 / CLI 崩溃连接中断):在 summary 里
+    # 标注截断,让 agent2 评估时知道本轮输出不完整(任务不 fail,照常评估/追问;
+    # 前端同步推 error 提示)
     if client.last_prompt_truncated:
         trunc_reason = client.last_prompt_truncated
         logger.warning(
-            f"[task={task.id}] {agent_type} 第 {round_idx} 轮被 idle 兜底提前终止: {trunc_reason},"
+            f"[task={task.id}] {agent_type} 第 {round_idx} 轮被兜底提前终止: {trunc_reason},"
             f"用已累积输出({len(collector.content_full)}字符)收尾"
         )
         publish(task.id, "thinking_delta", {
@@ -2610,11 +2667,11 @@ def run_acp_agent(
             "round_idx": round_idx,
             "role": "agent1",
             "phase": "error",
-            "delta": f"[CLI 长时间无响应,本轮已提前终止: {trunc_reason}]",
+            "delta": f"[本轮提前终止: {trunc_reason}]",
             "iteration": collector.iteration,
         })
         summary += (
-            f"\n\n[系统注记:本轮执行因 CLI 长时间无响应({trunc_reason})被提前终止,"
+            f"\n\n[系统注记:本轮执行提前终止({trunc_reason}),"
             "以上为终止前已输出的内容,可能不完整]"
         )
 

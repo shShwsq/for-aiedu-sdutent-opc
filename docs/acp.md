@@ -178,7 +178,7 @@ JSONL 事件(定义于 `codex-rs/exec/src/exec_events.rs`)与 ACP 通知的映�
 ```
 后端(FastAPI)
    │  HTTP POST /rpc(JSON-RPC 请求体)
-   │  ◄─ SSE 流(通知 + 最终响应 + permission_request 事件)
+   │  ◄─ SSE 流(通知 + 最终响应 + permission_request / stream_error 事件)
    ▼
 沙箱内 bridge(acp_bridge.py,监听 8088)
    │  stdin ▲ │ ▼ stdout(newline-delimited JSON-RPC)
@@ -202,7 +202,7 @@ ACP CLI 子进程(qodercli --acp --yolo / dsh --profile acp)
 2. **凭证注入**:用户凭证加密存储,运行时映射为环境变量(如 `QODER_PERSONAL_ACCESS_TOKEN`、`DEEPSEEK_API_KEY`、`CODEX_API_KEY`)注入 bridge 进程,CLI 子进程继承,命令行与协议中均无明文
 3. **串行协议**:ACP over stdio 是串行的(同一时刻一个请求),bridge 用锁保护 send+collect 全程;Codex 的 exec 也是每次 prompt 起一个新进程
 4. **流式翻译**:`session/update` 的 `agent_message_chunk` / `thought_chunk` / `tool_call` / `plan` 分别映射为前端的正文增量、思考增量、工具卡片、计划事件;按 `tool_call` 切分 ReAct 迭代
-5. **挂死兜底**:prompt 期间长时间无数据事件时分级 idle 超时(工具执行中放宽、等模型输出收紧),超时发 `session/cancel` 并用已累积输出收尾,不直接 fail 任务
+5. **挂死/崩溃兜底**:prompt 期间长时间无数据事件时分级 idle 超时(工具执行中放宽、等模型输出收紧),超时发 `session/cancel` 并用已累积输出收尾,不直接 fail 任务;CLI 崩溃/连接中断(SSE 流结束但未收到 JSON-RPC 最终响应)时,bridge 关流前推 `event: stream_error` 携带原因(进程退出/EOF/读失败),后端抛 `ACPStreamAborted` 并走同款截断善后,summary 标注"本轮输出不完整"让 agent2 知情,不把崩溃当作正常完成
 6. **新增 agent 成本**:在 registry 注册(bin、acp_args、credential_env、bridge_script)+ 写一个薄 wrapper,其余全复用
 
 ---

@@ -775,6 +775,7 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 - **克隆跳过**(`clone_skip.py`):用户可在克隆阶段点击跳过预克隆,一次性标志让 orchestrator 终止当前 clone 并降级为 react_agent 自主克隆
 - **沙箱续期**:`SANDBOX_RENEW_INTERVAL_MINUTES`(默认 5),会话被访问时距上次续期超过此值就 renew TTL,防长任务拖过 TTL 被 Server 回收
 - **CLI 挂死兜底**:`ACP_IDLE_TIMEOUT_OUTPUT_SECONDS`(默认 300,无活动工具时)/ `ACP_IDLE_TIMEOUT_TOOL_SECONDS`(默认 1800,有工具在跑时),超时 cancel + 用已累积输出收尾,防 CLI 静默挂死
+- **CLI 崩溃/流中断兜底**:SSE 流在收到 JSON-RPC 最终响应前结束(如 Node OOM 崩溃)时,bridge 关流前推 `event: stream_error`(含原因:cli_exit / stdout_eof / read_error),后端 `ACPClient._rpc` 抛 `ACPStreamAborted`;`prompt()` 捕获后与挂死超时同款善后——cancel + 置 `last_prompt_truncated` + 用已累积输出收尾,summary 标注"本轮输出不完整"让 agent2 知情,不再把崩溃当作正常完成
 - **LLM 限流退避**:`LLM_RATE_LIMIT_MAX_RETRIES`(默认 3),429 时指数退避 + 抖动重试,厂商返回 Retry-After 时优先采用
 
 
