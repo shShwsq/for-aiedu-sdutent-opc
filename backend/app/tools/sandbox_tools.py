@@ -28,6 +28,8 @@ from app.git_provider import get_provider_for_url
 from app.pause_controller import wait_if_paused
 from app.perf import perf_log, perf_timer
 from app.sandbox.client import SandboxSession, check_local_write_permission, create_sandbox
+from app.services.repo_cache import cache_key as repo_cache_key
+from app.services.repo_cache import ensure_bare_cache, sandbox_mount
 from app.user_interaction import (
     request_command_confirm,
     wait_for_command_confirm,
@@ -42,8 +44,8 @@ logger = logging.getLogger(__name__)
 # completed_at: 任务完成时间(用于延迟清理,任务结束后保留 session 供前端浏览工作区)
 _sessions: dict[str, dict[str, Any]] = {}
 
-# 任务完成后保留 session 的时间(秒),超时后自动清理
-_SESSION_TTL_AFTER_COMPLETE = 3600  # 1 小时
+# 任务完成后保留 session 的时间(秒),超时后自动清理:
+# 由 settings.WORKSPACE_TTL_AFTER_COMPLETE 配置(默认 24h,原硬编码 3600)
 
 # 整树快照缓存:task_id -> (写入时间戳, payload),TTL 秒。
 # 前端文件树首屏一次拉整树,短 TTL 兼顾运行中任务的变更新鲜度
@@ -62,23 +64,59 @@ _MEMORY_FILE = "project_memory.md"
 # 全局长期记忆文件(跨项目通用经验,每任务启动时覆盖为当前用户的全局记忆)
 _GLOBAL_MEMORY_FILE = "global_memory.md"
 
+# local 会话元信息文件名(临时目录根,进程重启后孤儿恢复按它定位 task)
+_LOCAL_SESSION_META_FILE = ".secondlook_meta.json"
 
-def _get_or_create_session(task_id: str) -> dict[str, Any]:
+
+def _get_or_create_session(
+    task_id: str,
+    repo_url: str | None = None,
+    branch: str | None = None,
+    git_tokens: dict | None = None,
+) -> dict[str, Any]:
     """获取或创建任务的沙箱上下文
 
     复用已有会话时顺带做"访问续期":距上次续期超过
     SANDBOX_RENEW_INTERVAL_MINUTES 就 renew 一次 TTL,防长任务
     (多轮协作/用户等待)拖过创建时的 TTL 被 Server 回收(回收后 404)。
+
+    repo_url/branch/git_tokens(可选,仅新建会话时生效;复用已有会话的
+    调用方不感知——容器已建好,挂载无法追加):
+    - sandbox 模式:先 ensure bare 仓库缓存,再把本任务仓库自己的 bare
+      目录只读挂载进容器(clone 时从挂载路径秒级本地克隆)。缓存任何
+      失败仅 warning,照常建会话(clone 阶段自动降级全量远程克隆)。
+    - local 模式:不在此接缓存(clone 阶段直接从宿主机 bare 目录克隆),
+      只写会话元信息供进程重启后孤儿目录恢复。
     """
     if task_id not in _sessions:
+        extra_volumes: list[tuple[str, str, bool]] = []
+        if settings.SANDBOX_MODE == "sandbox" and repo_url:
+            try:
+                bare_dir = ensure_bare_cache(
+                    repo_url, branch=branch, git_tokens=git_tokens, task_id=task_id
+                )
+                mount_info = sandbox_mount(repo_url)
+                if bare_dir and mount_info:
+                    # 只读挂载本任务仓库的 bare 子目录(非缓存根,跨租户隔离)
+                    extra_volumes.append((mount_info[0], mount_info[1], True))
+            except Exception as e:
+                logger.warning(
+                    f"[sandbox] task={task_id} 仓库缓存挂载准备失败"
+                    f"(降级全量远程克隆): {e}"
+                )
         # [perf] 新建沙箱会话(拉镜像/启容器/等 healthy,可能是大耗时点)
         with perf_timer(task_id, "sandbox_session", reused=False, mode=settings.SANDBOX_MODE):
-            session = create_sandbox()
+            session = create_sandbox(extra_volumes=extra_volumes or None)
         ctx = {"session": session, "repo_path": "", "mode": settings.SANDBOX_MODE}
         # local 模式:复用 SandboxSession 自有的本地临时目录(单一临时目录,
         # 避免过去 session 一份、ctx 一份的双份临时目录问题)
         if settings.SANDBOX_MODE == "local":
             ctx["local_dir"] = session.local_dir
+            _write_local_session_meta(task_id, session.local_dir)
+        # sandbox 模式:缓存挂载成功才记录,clone 阶段据此走容器内本地克隆
+        if settings.SANDBOX_MODE == "sandbox" and len(extra_volumes) == 1 and repo_url:
+            ctx["cache_key"] = repo_cache_key(repo_url)
+            ctx["cache_mount"] = extra_volumes[0][1]
         # 创建即起算 TTL,记下起点供后续访问续期节流判断
         ctx["_last_renew"] = time.monotonic()
         _sessions[task_id] = ctx
@@ -95,6 +133,39 @@ def _get_or_create_session(task_id: str) -> dict[str, Any]:
             if ctx["session"].renew():
                 ctx["_last_renew"] = time.monotonic()
     return _sessions[task_id]
+
+
+def precreate_session_for_repo(
+    task_id: str, repo_url: str,
+    branch: str | None = None, git_tokens: dict | None = None,
+) -> None:
+    """提前创建会话(sandbox 模式:预建 bare 缓存并只读挂载进容器)
+
+    幂等:已有会话直接复用(不感知参数)。必须在任何其他会话创建调用
+    (如任务启动时的记忆文件写入)之前调用——否则会话已建、容器无法
+    追加挂载,缓存机会不可逆丢失。local 模式无副作用(缓存在 clone 阶段接)。
+    """
+    _get_or_create_session(
+        task_id, repo_url=repo_url, branch=branch, git_tokens=git_tokens
+    )
+
+
+def _write_local_session_meta(task_id: str, local_dir: Path) -> None:
+    """local 模式:写会话元信息到临时目录根(进程重启后孤儿目录恢复用,B2)
+
+    文件为根级隐藏文件;workspace 浏览只列 repo_path 子目录,不会污染工作区列表。
+    写失败仅 warning(不影响会话创建)。
+    """
+    try:
+        meta_path = Path(local_dir) / _LOCAL_SESSION_META_FILE
+        meta_path.write_text(
+            json.dumps(
+                {"task_id": task_id, "created_at": time.time()}, ensure_ascii=False
+            ),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.warning(f"[task={task_id}] 写会话元信息失败(忽略): {e}")
 
 
 def _set_repo_path(task_id: str, repo_path: str) -> None:
@@ -122,10 +193,11 @@ def cleanup_expired_sessions() -> int:
     now = time.time()
     expired = [
         tid for tid, ctx in _sessions.items()
-        if ctx.get("completed_at") and now - ctx["completed_at"] > _SESSION_TTL_AFTER_COMPLETE
+        if ctx.get("completed_at")
+        and now - ctx["completed_at"] > settings.WORKSPACE_TTL_AFTER_COMPLETE
     ]
     for tid in expired:
-        close_session(tid)
+        close_session(tid, save_diff=True)
     return len(expired)
 
 
@@ -144,7 +216,8 @@ def cleanup_expired_sessions_bg() -> None:
         _last_cleanup_scan = now
         expired = [
             tid for tid, ctx in _sessions.items()
-            if ctx.get("completed_at") and now - ctx["completed_at"] > _SESSION_TTL_AFTER_COMPLETE
+            if ctx.get("completed_at")
+            and now - ctx["completed_at"] > settings.WORKSPACE_TTL_AFTER_COMPLETE
         ]
     if not expired:
         return
@@ -152,17 +225,32 @@ def cleanup_expired_sessions_bg() -> None:
     def _cleanup() -> None:
         for tid in expired:
             try:
-                close_session(tid)
+                close_session(tid, save_diff=True)
             except Exception as e:
                 logger.warning(f"[task={tid}] 后台清理过期 session 失败: {e}")
 
     threading.Thread(target=_cleanup, name="session-cleanup", daemon=True).start()
 
 
-def close_session(task_id: str) -> None:
-    """关闭沙箱,清理资源"""
+def close_session(task_id: str, save_diff: bool = False) -> None:
+    """关闭沙箱,清理资源
+
+    save_diff=True(TTL 过期清理路径):销毁前兜底捕获工作区 diff——任务已完成
+    但尚无 kind="git_diff" artifact(完成时捕获曾失败/异常路径)则捕获保存。
+    捕获必须在 _sessions.pop 之前(workspace_diff.capture 依赖会话);
+    删除任务路径(routers/tasks.py)传 False(任务即将删除,保存无意义)。
+    """
     if task_id not in _sessions:
         return
+    if save_diff:
+        ctx_peek = _sessions.get(task_id) or {}
+        if ctx_peek.get("completed_at") and ctx_peek.get("repo_path"):
+            try:
+                # 延迟导入避免循环依赖(workspace_diff 依赖 sandbox_tools)
+                from app.services.workspace_diff import save_diff_best_effort_on_close
+                save_diff_best_effort_on_close(task_id)
+            except Exception as e:
+                logger.warning(f"[task={task_id}] 清理前兜底保存 diff 失败(忽略): {e}")
     ctx = _sessions.pop(task_id)
     _tree_cache.pop(task_id, None)
     session: SandboxSession = ctx["session"]
@@ -666,6 +754,7 @@ def _clone_repo_local(
     ctx: dict, clone_url: str, repo_name: str, branch: str | None,
     task_id: str = "", cancellable: bool = False,
     progress_callback: Callable[[int, str], None] | None = None,
+    use_depth: bool = True,
 ) -> dict:
     """local 模式:本地 git clone(Popen 流式读进度 + 推 SSE)
 
@@ -682,11 +771,14 @@ def _clone_repo_local(
 
     cancellable=True 时(仅 orchestrator 预克隆路径),轮询中检查跳过标志,
     用户请求跳过预克隆时 kill 进程并抛 CloneSkippedError。
+
+    use_depth=False 时不拼 --depth(本地路径克隆对 depth 仅告警且无意义,
+    bare 缓存路径恒全量)。
     """
     local_dir: Path = ctx["local_dir"]
     repo_dir = local_dir / repo_name
 
-    cmd = ["git", "clone", "--progress"] + _clone_depth_args()
+    cmd = ["git", "clone", "--progress"] + (_clone_depth_args() if use_depth else [])
     if branch:
         cmd.extend(["--branch", branch])
     cmd.extend([clone_url, str(repo_dir)])
@@ -789,6 +881,7 @@ def _clone_repo_sandbox(
     ctx: dict, clone_url: str, repo_name: str, branch: str | None,
     task_id: str = "", cancellable: bool = False,
     progress_callback: Callable[[int, str], None] | None = None,
+    use_depth: bool = True,
 ) -> dict:
     """sandbox 模式:在沙箱里 git clone(后台命令 + 进度文件轮询流式推进度)
 
@@ -818,7 +911,8 @@ def _clone_repo_sandbox(
 
     # --progress 强制非 tty(后台命令无 tty)也输出进度到 stderr;
     # stderr 重定向到进度文件(\r 实时落盘),退出码写标记文件供轮询判完成
-    git_cmd = "git clone --progress " + " ".join(_clone_depth_args())
+    # use_depth=False 时不拼 --depth(从容器内挂载的 bare 缓存克隆,本地路径 depth 无意义)
+    git_cmd = "git clone --progress " + " ".join(_clone_depth_args() if use_depth else [])
     if branch:
         git_cmd += f" --branch {shlex.quote(branch)}"
     git_cmd += f" {shlex.quote(clone_url)} {shlex.quote(repo_dir)}"
@@ -2809,8 +2903,76 @@ def clone_repo_with_fallback(
         raise ValueError(f"无法从 URL 解析仓库名: {repo_url}")
     repo_name = match.group(1)
 
-    ctx = _get_or_create_session(task_id)
+    # 传 repo_url/branch:新建会话时(sandbox 模式)预建缓存并挂载;已有会话不受影响
+    ctx = _get_or_create_session(
+        task_id, repo_url=repo_url, branch=branch, git_tokens=git_tokens
+    )
     mode = ctx["mode"]
+
+    # ---- bare 仓库缓存快路径(任何失败落入下方原远程候选链,缓存永不阻塞任务) ----
+    if mode == "local" and settings.REPO_CACHE_ENABLED:
+        try:
+            bare_dir = ensure_bare_cache(
+                repo_url, branch=branch, git_tokens=git_tokens, task_id=task_id
+            )
+        except Exception as e:
+            # 防御:ensure 内部已兜底,此处再包一层,缓存异常绝不阻塞克隆
+            bare_dir = None
+            logger.warning(
+                f"[clone_fallback] task={task_id} bare 缓存准备异常,"
+                f"降级远程克隆: {str(e)[:200]}"
+            )
+        if bare_dir:
+            try:
+                logger.info(
+                    f"[clone_fallback] task={task_id} 命中 bare 缓存,本地克隆: {bare_dir}"
+                )
+                result = _clone_repo_local(
+                    ctx, str(bare_dir), repo_name, branch, task_id=task_id,
+                    cancellable=cancellable, progress_callback=progress_callback,
+                    use_depth=False,
+                )
+                _set_repo_path(task_id, result["path"])
+                logger.info(f"[clone_fallback] task={task_id} 缓存本地克隆成功")
+                return result
+            except CloneSkippedError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    f"[clone_fallback] task={task_id} 缓存本地克隆失败,"
+                    f"降级远程克隆: {str(e)[:200]}"
+                )
+                # 清理半成品目录(与原链同规则),避免下方重试撞目录
+                leftover = Path(ctx["local_dir"]) / repo_name
+                if leftover.exists():
+                    shutil.rmtree(leftover, ignore_errors=True)
+    elif mode == "sandbox" and ctx.get("cache_key") == repo_cache_key(repo_url):
+        # 会话创建时已把本任务仓库的 bare 缓存只读挂载进容器 → 容器内本地克隆
+        try:
+            logger.info(
+                f"[clone_fallback] task={task_id} 命中挂载的 bare 缓存,"
+                f"容器内本地克隆: {ctx['cache_mount']}"
+            )
+            result = _clone_repo_sandbox(
+                ctx, ctx["cache_mount"], repo_name, branch, task_id=task_id,
+                cancellable=cancellable, progress_callback=progress_callback,
+                use_depth=False,
+            )
+            _set_repo_path(task_id, result["path"])
+            logger.info(f"[clone_fallback] task={task_id} 缓存容器内克隆成功")
+            return result
+        except CloneSkippedError:
+            raise
+        except Exception as e:
+            logger.warning(
+                f"[clone_fallback] task={task_id} 缓存容器内克隆失败,"
+                f"降级远程克隆: {str(e)[:200]}"
+            )
+    elif mode == "sandbox":
+        # LLM 运行中克隆其他仓库(容器无法追加挂载)或缓存未开 → 走原远程链
+        logger.info(
+            f"[clone_fallback] task={task_id} 会话未挂载该仓库的 bare 缓存,走远程克隆"
+        )
 
     errors: list[str] = []
     # 分支尝试顺序:指定了 branch 先带 --branch,全失败后不带分支再跑一遍

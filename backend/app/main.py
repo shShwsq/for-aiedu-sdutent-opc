@@ -171,6 +171,20 @@ async def lifespan(app: FastAPI):
 
         _gc_task = asyncio.create_task(gc_loop())
 
+    # 孤儿临时目录恢复(local 模式):进程重启后 _sessions 内存丢失,
+    # mkdtemp 目录残留磁盘。后台线程抢救未保存的 diff 后清理(防泄漏);
+    # 不阻塞启动(rmtree 大目录可能秒级),无需 cancel(daemon 线程)
+    if settings.SANDBOX_MODE == "local":
+        import threading
+
+        from app.services.workspace_diff import recover_orphan_local_workspaces
+
+        threading.Thread(
+            target=recover_orphan_local_workspaces,
+            name="orphan-workspace-recovery",
+            daemon=True,
+        ).start()
+
     yield
 
     if _gc_task is not None:

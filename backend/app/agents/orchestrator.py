@@ -1255,6 +1255,15 @@ def _prepare_repo_context(
     params = task.params or {}
     repo_url = params.get("repo_url")
 
+    # sandbox 模式:先于记忆文件写入预建会话并挂载 bare 仓库缓存
+    # (记忆文件写入也会创建会话但不带 repo_url,容器无法追加挂载,
+    # 机会不可逆;幂等,已有会话直接复用)
+    if repo_url:
+        sandbox_tools.precreate_session_for_repo(
+            task_id_str, repo_url,
+            branch=params.get("branch"), git_tokens=git_tokens or {},
+        )
+
     # 记忆文件提前写入(不依赖是否选仓库,供执行侧 read_file 查全量):
     # - 全局记忆文件:无条件写(无记忆则写空串清残留)
     # - 项目记忆文件:选了仓库且能匹配到 Project 时写,否则写空串清残留
@@ -1615,6 +1624,15 @@ def _restore_workspace_if_needed(
     db.commit()
     _publish_status(task)
     _prepare_repo_context(task, db, task_id_str, git_tokens)
+    # 重新 clone 出来是干净仓库:把重启前已保存的 git_diff artifact 补回
+    # (B3:重启前后工作成果不丢;截断的 patch 不可 apply 会自动跳过;
+    # 失败仅 warning,不阻断恢复)
+    try:
+        from app.services.workspace_diff import reapply_workspace_diff
+
+        reapply_workspace_diff(task, db, task_id_str)
+    except Exception as e:
+        logger.warning(f"[task={task.id}] 恢复补回 diff 失败(忽略): {e}")
     # 追问上传同样需重放(沙箱回收后追问文件与创建文件一起丢失):
     # 传输到 followup_uploads/,与运行中追问落地位置一致(agent 目录级感知)。
     # 失败不阻断恢复(创建内容已就位,追问文件缺失仅影响该部分上下文)。

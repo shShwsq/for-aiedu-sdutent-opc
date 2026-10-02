@@ -12,6 +12,7 @@ import uuid
 
 import pytest
 
+from app.config import settings
 from app.tools import sandbox_tools
 
 
@@ -323,10 +324,10 @@ def test_cleanup_bg_does_not_block_request(monkeypatch, task_id):
         "session": FakeSession(),
         "repo_path": "/repo",
         "mode": "local",
-        "completed_at": time.time() - sandbox_tools._SESSION_TTL_AFTER_COMPLETE - 10,
+        "completed_at": time.time() - settings.WORKSPACE_TTL_AFTER_COMPLETE - 10,
     }
 
-    def slow_close(tid):
+    def slow_close(tid, **kw):
         time.sleep(0.5)
         sandbox_tools._sessions.pop(tid, None)
 
@@ -350,11 +351,11 @@ def test_cleanup_bg_throttles_scan(monkeypatch, task_id):
         "session": FakeSession(),
         "repo_path": "/repo",
         "mode": "local",
-        "completed_at": time.time() - sandbox_tools._SESSION_TTL_AFTER_COMPLETE - 10,
+        "completed_at": time.time() - settings.WORKSPACE_TTL_AFTER_COMPLETE - 10,
     }
     calls: list[str] = []
     monkeypatch.setattr(
-        sandbox_tools, "close_session", lambda tid: calls.append(tid)
+        sandbox_tools, "close_session", lambda tid, **kw: calls.append(tid)
     )
 
     sandbox_tools.cleanup_expired_sessions_bg()

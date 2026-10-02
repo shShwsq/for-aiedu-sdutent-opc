@@ -27,6 +27,11 @@ def _patch_env(monkeypatch):
     monkeypatch.setattr(
         orchestrator, "_add_conversation", lambda *a, **kw: None,
     )
+    # 预建会话(挂载缓存用)是沙箱副作用,本文件只测 clone 后的上下文生成
+    monkeypatch.setattr(
+        orchestrator.sandbox_tools, "precreate_session_for_repo",
+        lambda *a, **kw: None,
+    )
 
 
 def test_nonempty_repo_returns_context(monkeypatch):

@@ -731,10 +731,16 @@ def check_local_write_permission(target: Path, base_dir: Path, original_path: st
                 raise ValueError(f"非法路径:{ro} 目录受保护,禁止写入({original_path})")
 
 
-def create_sandbox() -> SandboxSession:
+def create_sandbox(
+    extra_volumes: list[tuple[str, str, bool]] | None = None,
+) -> SandboxSession:
     """创建一个沙箱会话
 
-    根据 settings.SANDBOX_MODE 决定走真实沙箱还是 local 模式
+    根据 settings.SANDBOX_MODE 决定走真实沙箱还是 local 模式。
+
+    extra_volumes:额外挂载卷描述列表 (host_path, mount_path, read_only),
+    供 sandbox 模式按任务挂载 bare 仓库缓存(local 模式忽略)。host_path 是
+    Server 宿主机路径,需在 Server [storage].allowed_host_paths 放行前缀。
     """
     mode = settings.SANDBOX_MODE
 
@@ -751,7 +757,7 @@ def create_sandbox() -> SandboxSession:
             )
         return SandboxSession(mode="local")
     elif mode == "sandbox":
-        return _create_real_sandbox()
+        return _create_real_sandbox(extra_volumes)
     else:
         raise ValueError(f"未知 SANDBOX_MODE: {mode}")
 
@@ -767,28 +773,42 @@ def _parse_domain(server_url: str) -> str:
     return server_url.lstrip("/")
 
 
-def _build_volumes() -> list[Any]:
-    """根据配置构建 SSH key 挂载卷(可选)
+def _build_volumes(
+    extra_volumes: list[tuple[str, str, bool]] | None = None,
+) -> list[Any]:
+    """根据配置构建挂载卷:SSH key(可选)+ 额外卷(bare 仓库缓存等)
 
     沙箱默认用户是 user,把宿主机 SSH 目录只读挂载到 /home/user/.ssh,
     供 git clone git@github.com:... 使用。需在 server [storage].allowed_host_paths 放行。
 
+    extra_volumes:(host_path, mount_path, read_only) 描述列表。Volume/Host
+    构造统一在此处,调用方(sandbox_tools)不直接依赖 opensandbox SDK。
+
     注意:SANDBOX_SSH_KEY_HOST_PATH 是 Server 宿主机上的路径(跨机部署时后端
     无法也不应本地验证),必须是绝对路径,不要用 ~。
     """
-    if not settings.SANDBOX_SSH_KEY_HOST_PATH:
-        return []
     from opensandbox.models.sandboxes import Host, Volume
 
-    host_path = settings.SANDBOX_SSH_KEY_HOST_PATH
-    return [
-        Volume(
-            name="ssh-keys",
-            host=Host(path=host_path),
-            mountPath="/home/user/.ssh",
-            readOnly=True,
+    volumes: list[Any] = []
+    if settings.SANDBOX_SSH_KEY_HOST_PATH:
+        volumes.append(
+            Volume(
+                name="ssh-keys",
+                host=Host(path=settings.SANDBOX_SSH_KEY_HOST_PATH),
+                mountPath="/home/user/.ssh",
+                readOnly=True,
+            )
         )
-    ]
+    for idx, (host_path, mount_path, read_only) in enumerate(extra_volumes or []):
+        volumes.append(
+            Volume(
+                name=f"extra-vol-{idx}",
+                host=Host(path=host_path),
+                mountPath=mount_path,
+                readOnly=read_only,
+            )
+        )
+    return volumes
 
 
 def _build_resource() -> dict[str, str] | None:
@@ -801,7 +821,9 @@ def _build_resource() -> dict[str, str] | None:
     return resource or None
 
 
-def _create_real_sandbox() -> SandboxSession:
+def _create_real_sandbox(
+    extra_volumes: list[tuple[str, str, bool]] | None = None,
+) -> SandboxSession:
     """创建真实沙箱(同步)
 
     使用官方 SandboxSync 同步 API,无需 asyncio 包装。
@@ -821,7 +843,7 @@ def _create_real_sandbox() -> SandboxSession:
         # 创建沙箱涉及拉镜像/启容器/等 healthy,首次尤慢,HTTP 请求超时给足 5 分钟
         request_timeout=timedelta(minutes=5),
     )
-    volumes = _build_volumes()
+    volumes = _build_volumes(extra_volumes)
     resource = _build_resource()
 
     kwargs: dict[str, Any] = {

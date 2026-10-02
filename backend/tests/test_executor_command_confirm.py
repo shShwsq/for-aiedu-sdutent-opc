@@ -61,7 +61,7 @@ def sandbox_mode(monkeypatch):
     fake_session = MagicMock()
     fake_session.run_command.return_value = "output line\nEXIT_CODE:0"
 
-    def _fake_create():
+    def _fake_create(extra_volumes=None):
         return fake_session
 
     monkeypatch.setattr(sandbox_tools, "create_sandbox", _fake_create)

@@ -485,6 +485,47 @@ SANDBOX_SSH_KEY_HOST_PATH=~/.ssh
 
 后端 `client.py` 会自动把这个路径作为只读 Volume 挂载到每个沙箱的 `/home/user/.ssh`。
 
+### 3.5 仓库缓存挂载(可选,sandbox 模式加速)
+
+SecondLook 支持同一仓库跨任务复用克隆(bare 仓库缓存 + `fetch --prune` 增量更新)。
+sandbox 模式下,后端会把**本任务仓库自己的 bare 缓存子目录**以只读 Volume 挂载进容器,
+任务克隆从挂载路径秒级完成,不再每次全量远程 clone。
+
+安全设计:
+
+- 只挂载本任务仓库的 bare 子目录(非缓存根),容器读不到其他用户/其他仓库
+- 挂载只读(容器内不可写,无法污染缓存);bare 的 remote URL 是匿名形态,无 token 落盘
+- 默认关闭,需显式开启
+
+开启步骤(后端与 Server 须能访问同一份缓存目录):
+
+1. **Server 端**:在 `~/.sandbox.toml` 的 `[storage].allowed_host_paths` 放行缓存目录
+   **专用窄前缀**(建议专用目录,勿直接放行 `/home` 或 `/`):
+
+```toml
+[storage]
+# SSH 目录与仓库缓存目录分别放行
+allowed_host_paths = ["/home", "/data/secondlook/repo_cache"]
+```
+
+2. **把缓存目录放到 Server 可访问的路径**:后端与 Server 同机时,把后端
+   `REPO_CACHE_DIR` 直接指向该目录即可;跨机部署时需通过 NFS/共享盘等方式
+   让 Server 宿主机能读到同一份缓存(缓存由后端维护写入,Server 只需只读挂载)。
+
+3. **后端** `.env`:
+
+```bash
+# sandbox 模式缓存总开关(默认关)
+REPO_CACHE_SANDBOX_ENABLED=true
+# 缓存在 Server 宿主机上的绝对路径(与 SANDBOX_SSH_KEY_HOST_PATH 同语义,
+# 是 Server 机器路径,不是后端本地路径)
+REPO_CACHE_SANDBOX_HOST_DIR=/data/secondlook/repo_cache
+```
+
+已知限制:LLM 运行中克隆**其他**仓库时(容器无法追加挂载),自动降级为全量远程
+克隆(日志记 `[clone_fallback] 会话未挂载该仓库的 bare 缓存,走远程克隆`)。
+缓存任何失败(目录未放行/磁盘/网络)一律降级原克隆链,不会阻塞任务。
+
 ## 四、后端连接配置
 
 在 SecondLook 后端的 `backend/.env` 里配置:
@@ -614,6 +655,7 @@ SANDBOX_MEMORY=4Gi
 | `SANDBOX_API_KEY` | `[server].api_key` | 两边必须一致,或都留空 |
 | `SANDBOX_IMAGE` | — | 沙箱容器镜像,Server 本地需存在 |
 | `SANDBOX_SSH_KEY_HOST_PATH` | `[storage].allowed_host_paths` | 后端挂载,Server 放行路径前缀 |
+| `REPO_CACHE_SANDBOX_ENABLED` + `REPO_CACHE_SANDBOX_HOST_DIR` | `[storage].allowed_host_paths` | 仓库缓存只读挂载(3.5 节),Server 放行缓存目录专用窄前缀 |
 | `SANDBOX_CPU` / `SANDBOX_MEMORY` | — | 通过 SDK `resource` 参数传入 |
 
 ## 参考链接

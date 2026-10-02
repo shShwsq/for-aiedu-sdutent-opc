@@ -66,6 +66,31 @@ class Settings(BaseSettings):
     # 仓库克隆超时(秒)。完整克隆比浅克隆慢,默认 600s;超大仓库可调大
     REPO_CLONE_TIMEOUT: int = 600
 
+    # ---- 仓库缓存(bare cache) ----
+    # 同一仓库跨任务复用:首次全量 clone --bare 入缓存,之后任务秒级本地克隆 +
+    # 按需 fetch --prune 增量更新。任何缓存失败一律降级原克隆链,不阻塞任务
+    # local 模式缓存开关(默认开;缓存目录不可用时自动降级)
+    REPO_CACHE_ENABLED: bool = True
+    # 缓存根目录(后端本机路径;Windows 建议短路径,注意 260 字符长路径限制)
+    # 生产环境可指向独立可写 volume(如 /data/secondlook/repo_cache)
+    REPO_CACHE_DIR: str = "./_repo_cache"
+    # 缓存新鲜度 TTL(秒):命中后距上次 fetch 未超此值直接复用,超了才增量 fetch
+    REPO_CACHE_FETCH_TTL: int = 300
+    # 缓存总大小上限(GB),超限按最久未用 LRU 淘汰(1h 内用过的不会被淘汰)
+    REPO_CACHE_MAX_GB: float = 5.0
+    # sandbox 模式缓存开关(默认关!需先在 OpenSandbox Server
+    # [storage].allowed_host_paths 放行缓存目录前缀,并把 REPO_CACHE_DIR
+    # 对应的 Server 宿主机路径填到 REPO_CACHE_SANDBOX_HOST_DIR)
+    REPO_CACHE_SANDBOX_ENABLED: bool = False
+    # 缓存在 Server 宿主机上的绝对路径(与 SANDBOX_SSH_KEY_HOST_PATH 同语义,
+    # 跨机部署时后端本地 REPO_CACHE_DIR 与它指向同一份缓存)
+    REPO_CACHE_SANDBOX_HOST_DIR: str = ""
+
+    # ---- 工作区保留 ----
+    # 任务完成后 session(含克隆的工作区)保留秒数,超时后惰性清理
+    # (原硬编码 3600;教育场景默认放宽到 24h 便于当天回顾)
+    WORKSPACE_TTL_AFTER_COMPLETE: int = 86400
+
     # 用户上传 skill 存储目录(默认相对后端运行目录)
     # 生产环境可指向独立可写 volume(如 /data/secondlook/user_skills);
     # 内置 skill 始终在代码目录 backend/skills/,不经过此配置

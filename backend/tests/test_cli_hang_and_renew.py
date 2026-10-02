@@ -290,7 +290,7 @@ def test_auto_renew_local_mode_noop():
 def test_session_reuse_renews_after_interval(monkeypatch):
     mock_session = MagicMock()
     mock_session.renew.return_value = True
-    monkeypatch.setattr(sandbox_tools, "create_sandbox", lambda: mock_session)
+    monkeypatch.setattr(sandbox_tools, "create_sandbox", lambda **kw: mock_session)
     monkeypatch.setattr(settings, "SANDBOX_MODE", "sandbox")
     monkeypatch.setattr(settings, "SANDBOX_RENEW_INTERVAL_MINUTES", 0)
 
@@ -308,7 +308,7 @@ def test_session_reuse_renews_after_interval(monkeypatch):
 def test_session_reuse_throttles_renew_within_interval(monkeypatch):
     mock_session = MagicMock()
     mock_session.renew.return_value = True
-    monkeypatch.setattr(sandbox_tools, "create_sandbox", lambda: mock_session)
+    monkeypatch.setattr(sandbox_tools, "create_sandbox", lambda **kw: mock_session)
     monkeypatch.setattr(settings, "SANDBOX_MODE", "sandbox")
     monkeypatch.setattr(settings, "SANDBOX_RENEW_INTERVAL_MINUTES", 5)
 

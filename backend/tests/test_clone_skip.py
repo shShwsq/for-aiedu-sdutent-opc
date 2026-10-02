@@ -61,7 +61,9 @@ def _fake_local_ctx(tmp_path):
 def test_fallback_raises_when_skip_requested_before_attempt(monkeypatch, tmp_path):
     """cancellable=True 且已请求跳过 → 尝试前检查点直接抛,不进协议回退。"""
     task_id = uuid.uuid4().hex
-    monkeypatch.setattr(st, "_get_or_create_session", lambda _tid: _fake_local_ctx(tmp_path))
+    # 本测试只测原协议回退链的跳过检查点:关缓存,避免 ensure_bare_cache 走真实网络
+    monkeypatch.setattr(st.settings, "REPO_CACHE_ENABLED", False)
+    monkeypatch.setattr(st, "_get_or_create_session", lambda _tid, **kw: _fake_local_ctx(tmp_path))
     request_skip_clone(task_id)
     with pytest.raises(st.CloneSkippedError):
         st.clone_repo_with_fallback(
@@ -72,7 +74,8 @@ def test_fallback_raises_when_skip_requested_before_attempt(monkeypatch, tmp_pat
 def test_fallback_non_cancellable_ignores_skip_flag(monkeypatch, tmp_path):
     """cancellable=False(LLM 工具路径)不检查标志,克隆照常且标志保留。"""
     task_id = uuid.uuid4().hex
-    monkeypatch.setattr(st, "_get_or_create_session", lambda _tid: _fake_local_ctx(tmp_path))
+    monkeypatch.setattr(st.settings, "REPO_CACHE_ENABLED", False)
+    monkeypatch.setattr(st, "_get_or_create_session", lambda _tid, **kw: _fake_local_ctx(tmp_path))
     monkeypatch.setattr(st, "_set_repo_path", lambda *a, **kw: None)
     monkeypatch.setattr(
         st, "_clone_repo_local",
@@ -91,8 +94,9 @@ def test_fallback_non_cancellable_ignores_skip_flag(monkeypatch, tmp_path):
 def test_fallback_mid_chain_skip_stops_remaining_protocols(monkeypatch, tmp_path):
     """第一种协议失败后才请求跳过 → 第二次尝试前检查点抛出,不再继续回退。"""
     task_id = uuid.uuid4().hex
+    monkeypatch.setattr(st.settings, "REPO_CACHE_ENABLED", False)
     calls: list[str] = []
-    monkeypatch.setattr(st, "_get_or_create_session", lambda _tid: _fake_local_ctx(tmp_path))
+    monkeypatch.setattr(st, "_get_or_create_session", lambda _tid, **kw: _fake_local_ctx(tmp_path))
 
     def _fake_clone(ctx, url, repo_name, branch, task_id="", cancellable=False, progress_callback=None):
         calls.append(url)
@@ -186,6 +190,11 @@ def _patch_env(monkeypatch):
     )
     monkeypatch.setattr(
         orchestrator, "_add_conversation", lambda *a, **kw: None,
+    )
+    # 预建会话(挂载缓存用)是沙箱副作用,本文件只测跳过检查点
+    monkeypatch.setattr(
+        orchestrator.sandbox_tools, "precreate_session_for_repo",
+        lambda *a, **kw: None,
     )
 
 
