@@ -3,9 +3,11 @@
 覆盖完整链路:generate(异步 job) → drafts → confirm → sessions → answers → stats,
 外加 activate / summary / trend / 历史会话 / 错题过滤 / 越权隔离 / 鉴权。
 
-在配置的数据库内建独立 schema pytest_practice(会话级 drop/create),
-不污染开发数据;无建 schema 权限时跳过。
+在配置的数据库内建独立 schema(进程唯一:pytest_practice_{pid}_{rand},
+会话级 drop/create),不污染开发数据、并发测试进程互不干扰;
+无建 schema 权限时跳过。
 """
+import os
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -40,7 +42,9 @@ from app.models.task import Result, Task
 from app.models.user import User
 from app.routers import practice as practice_router
 
-TEST_SCHEMA = "pytest_practice"
+# schema 名含 PID + 随机后缀:并发 pytest 进程(多会话/前后台任务)各自
+# 独立建 schema,session 开始的 DROP SCHEMA 不会误删他人正在用的 schema
+TEST_SCHEMA = f"pytest_practice_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 _TABLES = (
     "practice_attempts", "practice_sessions", "practice_questions",
     "user_knowledge_states", "knowledge_points",

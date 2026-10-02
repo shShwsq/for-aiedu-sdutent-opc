@@ -10,6 +10,7 @@
 数据库部分沿用 test_practice_api 的独立 schema + fake 生成器模式。
 """
 import json
+import os
 import time
 import uuid
 
@@ -41,7 +42,9 @@ from app.models.user import User
 from app.routers import practice as practice_router
 from app.services.practice import jobs as gen_jobs
 
-TEST_SCHEMA = "pytest_practice_stream"
+# schema 名含 PID + 随机后缀:并发 pytest 进程各自独立建 schema,
+# session 开始的 DROP SCHEMA 不会误删他人正在用的 schema(同 test_practice_api)
+TEST_SCHEMA = f"pytest_practice_stream_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 _TABLES = (
     "practice_attempts", "practice_sessions", "practice_questions",
     "user_knowledge_states", "knowledge_points",
