@@ -2,14 +2,15 @@
 
 覆盖新流程的关键契约:
 - agent1 结束即任务完成(推 agent1_done,总线保持打开);done 在审查后
-- 审查完成:临时结果被重点与知识点整体替换,review_status=done
+- 审查完成:本轮临时结果被重点与知识点替换(按轮追加),review_status=done
 - 审查失败:任务仍 COMPLETED,临时结果保留,review_status=failed
 - review_status 流转:running(审查开始)→ done/failed
-- 审查互斥注册表:register_pending_resume 原子路由(queued/enqueue/immediate)
-- 核查中追问排队:审查结束自动 resume(总线保持打开,不推 done)
+- 事件活跃期(scope):done/finish 仅由最后活跃流收尾,并行流互不干扰
+- 核查中追问:直接启动新一轮(不等老审查),老审查收尾不关总线
+- 异常路径:error 事件先于总线关闭推送(否则前端收不到错误横幅)
 - 单 agent 模式:无审查事件,review_status 不动
 - suggestions 落库契约(前端解析 type=suggestions 渲染深挖卡片)
-- 临时结果助手 _replace_interim_results:先清后落单条
+- 临时结果助手 _replace_interim_results:按轮清理后落单条
 """
 import json
 from unittest.mock import MagicMock
@@ -299,158 +300,228 @@ def test_replace_interim_results_clears_and_writes_single_row():
 
 
 # ============================================================
-# 审查互斥注册表:register_pending_resume 原子路由 + _seal_review
+# 事件活跃期(scope):done/finish 仅由最后活跃流收尾
 # ============================================================
 
 
-def _clear_registry(task_id: str) -> None:
-    """清理注册表残留(测试隔离:pending/claim/event)"""
+def _clear_scopes(task_id: str) -> None:
+    """清理 scope 注册表残留(测试隔离)"""
     with orchestrator._review_lock:
-        orchestrator._review_done_events.pop(task_id, None)
-        orchestrator._pending_resume_messages.pop(task_id, None)
-        orchestrator._resume_claims.discard(task_id)
+        orchestrator._event_scopes.pop(task_id, None)
 
 
-def test_register_pending_resume_routes():
-    """三路由:无审查=immediate;审查中=queued(登记);claim 窗口=enqueue。"""
-    task_id = "task-route"
+def test_end_event_scope_solo_flow_pushes_done(monkeypatch):
+    """唯一活跃流收尾:推 done + finish_task(与原单流行为一致)。"""
+    task_id = "task-scope-solo"
     try:
-        # 无审查注册 → immediate
-        assert orchestrator.register_pending_resume(task_id, "消息") == "immediate"
+        gen = orchestrator._begin_event_scope(task_id)
+        rec = _EventRecorder(monkeypatch)
 
-        # 审查中 → queued + 登记(含附件)
-        orchestrator._mark_review_started(task_id)
-        assert orchestrator.register_pending_resume(
-            task_id, "深挖依赖", ["upload-1"],
-        ) == "queued"
-        with orchestrator._review_lock:
-            pending = orchestrator._pending_resume_messages[task_id]
-        assert pending == [("深挖依赖", ["upload-1"])]
+        ended = orchestrator._end_event_scope(
+            task_id, gen, ("done", {"status": "completed"}),
+        )
 
-        # claim 窗口(queued resume 已接管)→ enqueue(claim 优先于审查事件)
-        with orchestrator._review_lock:
-            orchestrator._resume_claims.add(task_id)
-        assert orchestrator.register_pending_resume(task_id, "再补一条") == "enqueue"
+        assert ended is True
+        assert len(rec.events("done")) == 1
+        assert rec.index("done") < rec.index(("finish",))
+        assert not orchestrator._has_active_scope(task_id)
     finally:
-        _clear_registry(task_id)
+        _clear_scopes(task_id)
 
 
-def test_seal_review_takes_pending_and_claims():
-    """_seal_review:注销审查事件 + 取走排队消息;有消息时登记 claim。"""
-    task_id = "task-seal"
+def test_end_event_scope_parallel_flow_keeps_bus_open(monkeypatch):
+    """并行流在跑:先收尾的流不推 done、不 finish(总线保持打开)。"""
+    task_id = "task-scope-parallel"
     try:
-        ev = orchestrator._mark_review_started(task_id)
-        orchestrator.register_pending_resume(task_id, "排队消息")
+        gen_old = orchestrator._begin_event_scope(task_id)
+        gen_new = orchestrator._begin_event_scope(task_id)
+        assert gen_new > gen_old  # 世代号单调递增(最新流世代更大)
 
-        pending = orchestrator._seal_review(task_id)
+        rec = _EventRecorder(monkeypatch)
+        # 老流(如老审查)先收尾:静默返回 False,不动总线
+        ended_old = orchestrator._end_event_scope(
+            task_id, gen_old, ("done", {"status": "completed"}),
+        )
+        assert ended_old is False
+        assert not rec.events("done")
+        assert rec.index(("finish",)) == -1
+        assert orchestrator._has_active_scope(task_id)  # 新流仍活跃
 
-        assert pending == [("排队消息", None)]
-        with orchestrator._review_lock:
-            assert task_id not in orchestrator._review_done_events  # 事件已注销
-            assert task_id not in orchestrator._pending_resume_messages  # 消息已取走
-            assert task_id in orchestrator._resume_claims  # 已接管
-        assert ev.is_set() is False  # ev 由 _finalize_review 置位,seal 不动
+        # 新流收尾:推 done + finish
+        ended_new = orchestrator._end_event_scope(
+            task_id, gen_new, ("done", {"status": "completed"}),
+        )
+        assert ended_new is True
+        assert len(rec.events("done")) == 1
+        assert rec.index("done") < rec.index(("finish",))
     finally:
-        _clear_registry(task_id)
+        _clear_scopes(task_id)
+
+
+def test_end_event_scope_idempotent_double_call(monkeypatch):
+    """重复 end(收尾点 + finally 兜底):discard 幂等,不重复推 done。"""
+    task_id = "task-scope-idem"
+    try:
+        gen = orchestrator._begin_event_scope(task_id)
+        rec = _EventRecorder(monkeypatch)
+
+        assert orchestrator._end_event_scope(
+            task_id, gen, ("done", {"status": "completed"}),
+        ) is True
+        # finally 兜底的第二次 end:terminal=None,不重复推 done
+        assert orchestrator._end_event_scope(task_id, gen) is True
+
+        assert len(rec.events("done")) == 1
+        assert not orchestrator._has_active_scope(task_id)
+    finally:
+        _clear_scopes(task_id)
+
+
+def test_is_latest_generation_tracks_newest_flow():
+    """世代判定:后启动的流为最新;老流跳过重下游。"""
+    task_id = "task-scope-gen"
+    try:
+        gen1 = orchestrator._begin_event_scope(task_id)
+        assert orchestrator._is_latest_generation(task_id, gen1) is True
+
+        gen2 = orchestrator._begin_event_scope(task_id)
+        assert orchestrator._is_latest_generation(task_id, gen1) is False
+        assert orchestrator._is_latest_generation(task_id, gen2) is True
+    finally:
+        _clear_scopes(task_id)
+
+
+def test_force_cleanup_event_scopes_clears_leak(monkeypatch):
+    """泄漏兜底:force_cleanup 清空全部 scope + 关总线(防 SSE 永久悬挂)。"""
+    task_id = "task-scope-leak"
+    try:
+        orchestrator._begin_event_scope(task_id)
+        orchestrator._begin_event_scope(task_id)  # 模拟两条泄漏的流
+        rec = _EventRecorder(monkeypatch)
+
+        orchestrator.force_cleanup_event_scopes(task_id)
+
+        assert not orchestrator._has_active_scope(task_id)
+        assert rec.index(("finish",)) != -1  # 总线兜底关闭
+    finally:
+        _clear_scopes(task_id)
+
+
+def test_launch_resume_thread_registers_scope_synchronously(monkeypatch):
+    """launch_resume_thread:scope 在线程启动前同步注册
+    (老审查收尾若发生在端点返回后、线程体执行前,也能看到本流活跃,
+    不会误推 done 关闭总线)。"""
+    task_id = "task-scope-launch"
+    monkeypatch.setattr(
+        orchestrator, "_run_resume_in_background", lambda *a, **k: None,
+    )
+    try:
+        orchestrator.launch_resume_thread(task_id, "追问消息")
+        # 函数返回即断言(不等线程体):scope 已注册
+        assert orchestrator._has_active_scope(task_id)
+    finally:
+        _clear_scopes(task_id)
+
+
+def test_resume_wrapper_fallback_clears_scope(monkeypatch):
+    """resume 前置段异常上抛 → 包装器兜底:标记失败 + error 先于总线关闭
+    + scope 清理(防泄漏导致后续所有流被误判"并行中")。"""
+    task_id = "11111111-1111-1111-1111-111111111111"  # 合法 UUID(包装器内会解析)
+    task = _mk_task()
+    task.status = TaskStatus.RUNNING
+    db = MagicMock()
+    db.get = lambda *a, **k: task
+    monkeypatch.setattr(orchestrator, "SessionLocal", lambda: db)
+
+    def _raise(task, db, message, **kwargs):
+        raise RuntimeError("前置段崩溃")
+
+    monkeypatch.setattr(orchestrator, "resume_audit_with_message", _raise)
+    rec = _EventRecorder(monkeypatch)
+
+    try:
+        orchestrator._run_resume_in_background(task_id, "消息")
+    finally:
+        _clear_scopes(task_id)
+
+    assert task.status == TaskStatus.FAILED
+    assert rec.events("error")  # 前端能收到失败通知
+    assert rec.index("error") < rec.index(("finish",))  # 先推后关
+    assert not orchestrator._has_active_scope(task_id)  # 无泄漏
 
 
 # ============================================================
-# 核查中追问排队:审查结束自动 resume(总线保持打开)
+# 核查中追问:老审查与新轮并行(不等审查,总线不断)
 # ============================================================
 
 
-def test_pending_message_auto_resumes_without_done(monkeypatch):
-    """审查期间注册的追问 → 审查结束后自动 launch_resume_thread(queued),
-    不推 done、不 finish_task(总线保持打开,前端 SSE 不断线)。"""
+def test_followup_during_review_runs_parallel(monkeypatch):
+    """核查中用户追问已启动新流 → 老审查照常落库知识点并推 review_done,
+    但收尾不推 done / 不 finish(总线保持打开,新轮事件无缝续达)。"""
     task = _mk_task()
     executor = MagicMock()
     executor.name = "builtin"
     executor.run = MagicMock(return_value=([], "总结", []))
 
-    # 在审查执行期间(run_agent2 回调)注册排队消息,模拟核查中用户追问
+    # 在审查执行期间(run_agent2 回调)注册新流 scope,
+    # 模拟"核查中用户追问 → 端点已同步启动新一轮 resume"
     def _ua(*args, **kwargs):
-        orchestrator.register_pending_resume(task.id, "深挖一下依赖漏洞")
+        orchestrator._begin_event_scope(task.id)
         return _mk_review_result()
 
     _patch_env(monkeypatch, executor, _ua)
-
-    launched = []
-    monkeypatch.setattr(
-        orchestrator, "launch_resume_thread",
-        lambda tid, msg, upload_ids=None, queued=False:
-            launched.append((tid, msg, upload_ids, queued)),
-    )
     rec = _EventRecorder(monkeypatch)
 
     try:
         orchestrator.run_dual_agent_audit(task, MagicMock())
+
+        # 老审查照常完成:知识点落库、review_done 推送(侧栏 badge 更新)
+        assert task.review_status == "done"
+        assert rec.events("review_done")
+        # 但不推 done / finish(新流活跃,总线打开)
+        assert not rec.events("done")
+        assert rec.index(("finish",)) == -1
+        # 清理组跳过(新流仍在跑,不得清运行时状态)
+        # (mark_task_completed 已被 _patch_env 屏蔽为 no-op,此处以 scope 状态佐证)
+        assert orchestrator._has_active_scope(str(task.id))
     finally:
-        _clear_registry(str(task.id))
-
-    # 自动 resume 启动:消息原文 + queued 标志
-    assert launched == [(str(task.id), "深挖一下依赖漏洞", None, True)]
-    # review_done 照常推送(侧栏 badge 更新),但不推 done / finish(总线打开)
-    assert rec.events("review_done")
-    assert not rec.events("done")
-    assert rec.index(("finish",)) == -1
+        _clear_scopes(str(task.id))
 
 
-def test_no_pending_message_publishes_done(monkeypatch):
-    """无排队消息 → 审查结束推 done + finish_task(原行为不变)。"""
+def test_no_parallel_flow_publishes_done(monkeypatch):
+    """无并行流 → 审查结束推 done + finish_task(原行为不变)。"""
     task = _mk_task()
     executor = MagicMock()
     executor.name = "builtin"
     executor.run = MagicMock(return_value=([], "总结", []))
 
     _patch_env(monkeypatch, executor, lambda *a, **k: _mk_review_result())
-
-    launched = []
-    monkeypatch.setattr(
-        orchestrator, "launch_resume_thread",
-        lambda tid, msg, upload_ids=None, queued=False:
-            launched.append((tid, msg, upload_ids, queued)),
-    )
     rec = _EventRecorder(monkeypatch)
 
     orchestrator.run_dual_agent_audit(task, MagicMock())
 
-    assert launched == []  # 无自动 resume
     assert rec.index("review_done") < rec.index("done")  # done 照常
     assert rec.index("done") < rec.index(("finish",))    # finish 照常
 
 
-def test_multiple_pending_messages_merged(monkeypatch):
-    """多条排队消息合并为一次 resume(消息 \n\n 连接,附件去重保序)。"""
+def test_dual_audit_failure_error_before_finish(monkeypatch):
+    """异常路径(P3 回归):error 事件必须先于 finish_task 推送
+    (总线关闭后 publish 会被静默丢弃,前端将永远收不到错误横幅)。"""
     task = _mk_task()
     executor = MagicMock()
     executor.name = "builtin"
-    executor.run = MagicMock(return_value=([], "总结", []))
+    executor.run = MagicMock(side_effect=RuntimeError("agent1 崩溃"))
 
-    def _ua(*args, **kwargs):
-        orchestrator.register_pending_resume(task.id, "第一条", ["u1", "u2"])
-        orchestrator.register_pending_resume(task.id, "第二条", ["u2", "u3"])
-        return _mk_review_result()
+    _patch_env(monkeypatch, executor, lambda *a, **k: _mk_review_result())
+    rec = _EventRecorder(monkeypatch)
 
-    _patch_env(monkeypatch, executor, _ua)
+    orchestrator.run_dual_agent_audit(task, MagicMock())
 
-    launched = []
-    monkeypatch.setattr(
-        orchestrator, "launch_resume_thread",
-        lambda tid, msg, upload_ids=None, queued=False:
-            launched.append((tid, msg, upload_ids, queued)),
-    )
-    _EventRecorder(monkeypatch)
-
-    try:
-        orchestrator.run_dual_agent_audit(task, MagicMock())
-    finally:
-        _clear_registry(str(task.id))
-
-    assert len(launched) == 1
-    tid, msg, upload_ids, queued = launched[0]
-    assert msg == "第一条\n\n第二条"
-    assert upload_ids == ["u1", "u2", "u3"]  # 去重保序
-    assert queued is True
+    assert task.status == TaskStatus.FAILED
+    assert rec.events("error")
+    assert rec.index("error") < rec.index(("finish",))
+    # 异常路径 scope 也被 finally 兜底注销(无泄漏)
+    assert not orchestrator._has_active_scope(str(task.id))
 
 
 # ============================================================

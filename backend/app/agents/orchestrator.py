@@ -69,127 +69,110 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 后台审查互斥:审查运行中,用户追问排队、审查结束后自动 resume
+# 事件活跃期(scope):执行流注册/注销,done/finish 仅由最后活跃流推送
 # ============================================================
 
-# task_id → 审查完成信号(审查开始时注册,审查结束时置位)
-_review_done_events: dict[str, threading.Event] = {}
-# task_id → 审查期间排队的用户追问(核查中发送的消息,审查结束后自动合并
-# 触发新一轮 resume;每项为 (消息文本, 附件 upload_ids),与
-# _review_done_events 同锁保证原子路由)
-_pending_resume_messages: dict[str, list[tuple[str, list[str] | None]]] = {}
-# queued resume 已接管、任务状态尚未翻转为 RUNNING 的窗口标记:
-# 该窗口内新到的消息按"运行中"语义入队(push_user_message),
-# 防止 immediate resume 与 queued resume 并发双跑同一任务
-_resume_claims: set[str] = set()
+# task_id → 流世代计数(每次启动执行流 +1:初始运行/resume/重试)
+_task_gens: dict[str, int] = {}
+# task_id → 活跃事件期世代集合(执行流开始注册、事件收尾注销)。
+# 非空 = 该任务仍有流在产出事件(agent1 执行中/审查中),
+# 此时任何流的收尾都不得推 done/finish(否则并行流事件全被丢弃)
+_event_scopes: dict[str, set[int]] = {}
 _review_lock = threading.Lock()
 
 
-def _mark_review_started(task_id) -> threading.Event:
-    """标记审查开始,返回完成信号(审查结束时 set)"""
-    key = str(task_id)
-    ev = threading.Event()
-    with _review_lock:
-        _review_done_events[key] = ev
-    return ev
+def _begin_event_scope(task_id) -> int:
+    """执行流启动:注册事件活跃期,返回本流世代号
 
-
-def register_pending_resume(
-    task_id, content: str, upload_ids: list[str] | None = None,
-) -> str:
-    """completed 任务收到用户追问时的原子路由判定(供 API 端点调用)
-
-    返回三种路由:
-    - "queued":后台审查仍在进行 → 消息(含附件)登记排队,审查结束后
-      自动 resume(替代旧的 wait_for_review 同步阻塞:接口立即返回,
-      前端 SSE 不断线)
-    - "enqueue":queued resume 已接管(状态翻转窗口)→ 调用方按运行中
-      语义入队(push_user_message),由新一轮 react_agent 迭代边界消费
-    - "immediate":无审查在跑 → 调用方直接启动 resume(原行为)
+    - 世代号单调递增:后启动的流世代更大,"最新流"负责重下游(记忆归纳/
+      练习题/历史预压缩),老流跳过避免并行重复
+    - 总线已结束(上一轮完全收尾)时兜底重置,让本流事件可推送
+      (常规 immediate resume 由 API 端点先 reset,此处幂等兜底)
     """
     key = str(task_id)
     with _review_lock:
-        if key in _resume_claims:
-            return "enqueue"
-        if key in _review_done_events:
-            _pending_resume_messages.setdefault(key, []).append(
-                (content, upload_ids)
-            )
-            return "queued"
-        return "immediate"
+        _task_gens[key] = _task_gens.get(key, 0) + 1
+        gen = _task_gens[key]
+        _event_scopes.setdefault(key, set()).add(gen)
+        finished = is_task_finished(key)
+    if finished:
+        reset_task_bus(key)
+    return gen
 
 
-def _seal_review(task_id) -> list[tuple[str, list[str] | None]]:
-    """审查结束的单一决策点(原子):注销审查信号 + 取走排队消息。
+def _end_event_scope(task_id, gen: int, terminal: tuple[str, dict] | None = None) -> bool:
+    """执行流的事件活跃期结束(审查收尾/纯对话轮收尾/单 agent 收尾)
 
-    返回排队的用户追问列表(空 = 无 queued resume)。有消息时登记
-    _resume_claims(见该字段注释),由 resume 线程置 RUNNING 后清除。
+    - 仍有其他活跃 scope(并行流在跑):静默返回 False,不推终止事件、
+      不关闭总线 —— 老审查与新一轮 agent1 并行时,老收尾不影响新流
+    - 自己是最后一个:推 terminal 事件(如 done)并 finish_task 关闭总线,
+      返回 True。异常路径 terminal=None(error 事件已由调用方推送,仅收尾)
+    判定与推送在同一把锁内原子完成,消除"判定空闲与新一轮 begin 之间"
+    的竞态窗口(begin 的总线重置也在同锁内检查,不会误重置已推 done 的总线)
     """
     key = str(task_id)
     with _review_lock:
-        _review_done_events.pop(key, None)
-        pending = _pending_resume_messages.pop(key, [])
-        if pending:
-            _resume_claims.add(key)
-    return pending
+        scopes = _event_scopes.get(key)
+        if scopes:
+            scopes.discard(gen)
+            if not scopes:
+                _event_scopes.pop(key, None)
+        if _event_scopes.get(key):
+            return False  # 并行流仍在产出事件
+        if terminal:
+            publish(task_id, terminal[0], terminal[1])
+        finish_task(task_id)
+        return True
 
 
-def _finalize_review(task, review_ev: threading.Event) -> None:
-    """审查收尾(在审查线程 finally 中调用):
+def _has_active_scope(task_id) -> bool:
+    """任务是否仍有活跃事件期(线程 finally 清理判定用)"""
+    with _review_lock:
+        return bool(_event_scopes.get(str(task_id)))
 
-    - 有排队追问(核查中用户消息):事件总线保持打开(不推 done /
-      finish_task),自动启动新一轮 resume —— 前端 SSE 不断线,
-      新轮的 status/conversation/thinking_delta 事件继续实时送达
-    - 无排队追问:推 done 终止事件 + finish_task 关闭总线(原行为)
+
+def _is_latest_generation(task_id, gen: int) -> bool:
+    """本流是否为最新世代(重下游:记忆归纳/练习题/预压缩 仅最新流执行)"""
+    with _review_lock:
+        return _task_gens.get(str(task_id)) == gen
+
+
+def force_cleanup_event_scopes(task_id) -> None:
+    """线程包装器最后防线:强制清空任务全部事件活跃期并关闭总线
+
+    仅在执行链在 scope 注册后意外崩溃、且包装器无法触达 gen 时使用
+    (如 retry 链路中 resume 前置段异常上抛到 _run_retry_in_background)。
+    正常流程的 scope 注销必须走 _end_event_scope(gen)。
+
+    泄漏后果:该任务之后所有流被误判"并行中" → 永不推 done/finish、
+    清理组永不执行、SSE 永久悬挂。retry 场景无并行流,强制清空安全。
     """
-    pending = _seal_review(task.id)
-    try:
-        if pending:
-            message = "\n\n".join(item[0] for item in pending)
-            # 合并多排队消息的附件(去重保序)
-            merged_uploads: list[str] = []
-            for _, uids in pending:
-                for uid in (uids or []):
-                    if uid not in merged_uploads:
-                        merged_uploads.append(uid)
-            logger.info(
-                f"[task={task.id}] 审查结束,自动处理排队追问 {len(pending)} 条"
-            )
-            launch_resume_thread(
-                str(task.id), message,
-                upload_ids=merged_uploads or None, queued=True,
-            )
-        else:
-            publish(task.id, "done", {"status": "completed"})
-            finish_task(task.id)
-    except Exception:
-        # 兜底:自动 resume 启动失败时按正常完成收尾,防止 SSE 悬挂
-        logger.exception(f"[task={task.id}] 审查收尾异常(按完成收尾)")
-        try:
-            publish(task.id, "done", {"status": "completed"})
-            finish_task(task.id)
-        except Exception:
-            pass
-    finally:
-        review_ev.set()
+    key = str(task_id)
+    with _review_lock:
+        leaked = _event_scopes.pop(key, None)
+    if leaked:
+        logger.warning(
+            f"[task={task_id}] 强制清空事件活跃期(执行链异常兜底,"
+            f"leaked_gens={sorted(leaked)})"
+        )
+    finish_task(task_id)
 
 
-def launch_resume_thread(
-    task_id: str, user_message: str,
-    upload_ids: list[str] | None = None, queued: bool = False,
-) -> None:
-    """启动 resume 后台线程(用户追问驱动新一轮执行)
+def launch_resume_thread(task_id: str, user_message: str,
+                         upload_ids: list[str] | None = None) -> None:
+    """启动 resume 后台线程(用户追问驱动新一轮执行,不等老审查)
 
-    - queued=True(审查结束自动 resume):总线可能已被审查异常路径关闭,
-      先探测并重置;正常路径总线保持打开(前端 SSE 不断线)
-    - queued=False(API 端点 immediate 路径):端点已同步 reset 总线 +
-      置 RUNNING,此处直接启动线程
+    追问直达 agent1:老审查(若有)继续在后台跑完,与新轮 agent1 并行;
+    done/finish 由最后活跃流统一收尾(见 _end_event_scope)。
+
+    scope 注册在启动线程**之前同步完成**:老审查收尾若发生在端点返回后、
+    线程体执行前,也能看到本流活跃 → 不会误推 done 关闭总线。消除
+    "端点置 RUNNING 与线程内注册 scope 之间"的窗口竞态。
     """
-    if queued and is_task_finished(task_id):
-        reset_task_bus(task_id)
+    flow_gen = _begin_event_scope(task_id)
     thread = threading.Thread(
         target=_run_resume_in_background,
-        args=(task_id, user_message, upload_ids),
+        args=(task_id, user_message, upload_ids, flow_gen),
         daemon=True,
         name=f"task-{task_id}-resume",
     )
@@ -197,19 +180,32 @@ def launch_resume_thread(
 
 
 def _run_resume_in_background(
-    task_id: str, user_message: str, upload_ids: list[str] | None = None,
+    task_id: str, user_message: str,
+    upload_ids: list[str] | None = None, flow_gen: int | None = None,
 ) -> None:
     """后台线程执行重启审计(与 _run_task_in_background 对齐)
 
     用独立的 DB session(线程安全),执行完毕后关闭。
+
+    flow_gen 由 launch_resume_thread 同步注册并传入(端点→线程无注册窗口);
+    直接调用(测试等)未传时自行注册。兜底 except 必须清 scope ——
+    resume_audit_with_message 在注册与 try 之间仍有一段裸代码(状态翻转/
+    LLM client 构建/工作区恢复),若抛异常逃逸到此处而 scope 未清,
+    该任务之后所有流都会被误判"并行中":永不推 done、清理组永不执行、
+    SSE 永久悬挂。
     """
+    if flow_gen is None:
+        flow_gen = _begin_event_scope(task_id)
     db = SessionLocal()
     try:
         task = db.get(Task, uuid.UUID(task_id))
         if not task:
             logger.error(f"重启任务:task {task_id} 不存在")
+            _end_event_scope(task_id, flow_gen)  # 清 scope 防泄漏(幂等)
             return
-        resume_audit_with_message(task, db, user_message, upload_ids=upload_ids)
+        resume_audit_with_message(
+            task, db, user_message, upload_ids=upload_ids, flow_gen=flow_gen,
+        )
     except Exception as e:
         logger.exception(f"[task={task_id}] 重启后台执行失败")
         # 兜底:确保 task 状态被标记为失败
@@ -220,19 +216,19 @@ def _run_resume_in_background(
                 task.error_message = _err_detail(e)[:1000]
                 task.current_stage = "重启执行失败"
                 db.commit()
-                # 兜底推送终止事件 + 标记总线结束:防止 SSE 订阅者因线程
-                # 在主 try 块前崩溃收不到 error 而永久挂起
-                publish(task.id, "error", {
-                    "status": "failed",
-                    "error_message": _err_detail(e)[:1000],
-                })
-                finish_task(task.id)
+            # 兜底推送终止事件:防止 SSE 订阅者因线程在主 try 块前崩溃
+            # 收不到 error 而永久挂起(并行流在跑时仅推事件,不动总线)
+            publish(task_id, "error", {
+                "status": "failed",
+                "error_message": _err_detail(e)[:1000],
+            })
         except Exception:
             pass
+        finally:
+            # error 已在上方推送(先推后关,防静默丢弃);清 scope 防泄漏
+            _end_event_scope(task_id, flow_gen)
     finally:
         db.close()
-        # 清理 in-memory 暂停状态(防止任务结束但状态卡住)
-        clear_pause_state(task_id)
 
 
 def run_dual_agent_audit(task: Task, db: Session) -> None:
@@ -317,6 +313,9 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
     # 任务完成后用户发追问会把状态改回 RUNNING,若按状态判定,
     # 已正常完成的任务会被误判为"未完成"而推送 error 并重新标记总线结束
     normal_completed = False
+    # 注册本流事件活跃期:done/finish 仅由最后活跃流收尾(并行时老流
+    # 提前收尾不关总线,见 _end_event_scope)
+    flow_gen = _begin_event_scope(task.id)
 
     try:
         # ---------- 预处理:若用户选了仓库,主动 clone + list_files ----------
@@ -391,14 +390,14 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
                 results_count=all_results_count,
             )
 
-            # 提前推送 done 事件:results 已落库,让前端立即拉取展示
-            publish(task.id, "done", {"status": "completed"})
-            # 立即标记总线结束(不等 finally):任务已完成,后续 publish 静默丢弃。
-            # 提前标记可消除竞态 —— 若等 finally 再标记,用户在此期间发追问会触发
-            # reset_task_bus(清 _finished),随后 finally 的 finish_task 又把它重新置 True,
-            # resume 线程后续 publish 全被丢弃(对话/状态事件丢失、任务卡死)。
-            finish_task(task.id)
+            # 事件活跃期收尾:推 done + 关总线(仅当无并行流;
+            # 判定与推送在 _end_event_scope 锁内原子完成,消除竞态)
+            _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
             normal_completed = True
+
+            # ---- 重下游(仅最新流执行:并行时老流跳过,避免与新流重复)----
+            if not _is_latest_generation(task.id, flow_gen):
+                return  # 已有更新的流接管(用户追问已启动新轮)
 
             # 预压缩早期历史:用户下一轮追问直接命中缓存(失败兜底)
             _precompress_history_safely(task, db, len(react_summaries), react_client)
@@ -466,6 +465,7 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         if not _round_has_tool_calls(db, task.id, 1):
             _finish_conversation_round(
                 task, db, rounds=len(react_summaries), mode="dual_agent",
+                flow_gen=flow_gen,
             )
             normal_completed = True  # 正常完成:finally 不再兑底推 error
             return  # finally 块仍会执行清理
@@ -512,22 +512,21 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         normal_completed = True
 
         # ---------- 后台审查(同一线程;失败只影响 review_status) ----------
-        review_ev = _mark_review_started(task.id)
-        try:
-            _run_background_review(
-                task, db,
-                user_intent=user_intent,
-                react_summaries=react_summaries,
-                scenario_id=scenario_id,
-                llm_client=llm_client,
-                agent_policy=agent_policy,
-                task_id_str=task_id_str,
-                react_client=react_client,
-            )
-        finally:
-            # 审查收尾:有排队追问 → 总线保持打开并自动 resume;
-            # 无 → 推 done + 关闭总线(原行为)
-            _finalize_review(task, review_ev)
+        # 审查期间用户追问可并行启动新一轮 resume(不等审查):
+        # done/finish 由最后活跃流的 _end_event_scope 统一收尾。
+        # _run_background_review 永不抛异常(内部全兜底),无需 try 包裹
+        _run_background_review(
+            task, db,
+            user_intent=user_intent,
+            react_summaries=react_summaries,
+            scenario_id=scenario_id,
+            llm_client=llm_client,
+            agent_policy=agent_policy,
+            task_id_str=task_id_str,
+            react_client=react_client,
+            flow_gen=flow_gen,
+            round_idx=1,
+        )
 
     except Exception as e:
         logger.exception(f"[task={task.id}] 双智能体协作失败")
@@ -556,57 +555,54 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
             save_repo_tree_artifact(task, db, task_id_str)
         except Exception as diff_err:
             logger.warning(f"[task={task.id}] 失败时捕获工作区产物失败(忽略): {diff_err}")
+        # 事件活跃期收尾移交 finally 统一处理:error 事件必须在
+        # finish_task 之前推送(总线关闭后 publish 会被静默丢弃)
     finally:
-        # 清理暂停状态(防止任务结束时仍有 in-memory 残留)
-        try:
-            clear_pause_state(task.id)
-        except Exception as cleanup_err:
-            logger.warning(f"[task={task.id}] 清理暂停状态失败: {cleanup_err}")
-        # 清理跳过预克隆标志(未消费时兜底清理,防残留影响后续任务)
-        try:
-            clear_skip_state(task.id)
-        except Exception as cleanup_err:
-            logger.warning(f"[task={task.id}] 清理跳过标志失败: {cleanup_err}")
-        # 清理用户补充消息队列(防止任务结束时仍有 in-memory 残留)
-        try:
-            clear_user_messages(task.id)
-        except Exception as cleanup_err:
-            logger.warning(f"[task={task.id}] 清理用户消息队列失败: {cleanup_err}")
-        # 清理 verifier 待授权动作(防止任务结束时仍有阻塞的验证动作)
-        try:
-            clear_pending_verify_action(task.id)
-        except Exception as cleanup_err:
-            logger.warning(f"[task={task.id}] 清理验证待授权状态失败: {cleanup_err}")
-        # 清理危险命令待确认状态(防止任务结束时仍有阻塞的命令确认)
-        try:
-            clear_pending_command_confirm(task.id)
-        except Exception as cleanup_err:
-            logger.warning(f"[task={task.id}] 清理命令待确认状态失败: {cleanup_err}")
-        # 延迟关闭沙箱:标记任务完成,保留 session 供前端浏览工作区文件
-        # 实际清理由 workspace 路由的 cleanup_expired_sessions() 惰性触发(TTL 1 小时)
-        try:
-            sandbox_tools.mark_task_completed(task_id_str)
-        except Exception as cleanup_err:
-            logger.warning(f"[task={task.id}] 标记任务完成失败: {cleanup_err}")
-        # 通知事件总线:任务结束
-        # done 事件已在 try 块中提前推送(在归纳记忆/git diff 之前),正常路径
-        # 也已同步调用 finish_task(提前标记总线结束,消除与 reset_task_bus 的竞态)。
-        # 此处仅兜底:异常路径(本轮未正常完成)推送 error 事件 + 标记总线结束。
+        # 通知事件总线:任务结束。
+        # done 事件已在各收尾点经 _end_event_scope 推送(正常路径)。
+        # 此处仅兜底:异常路径(本轮未正常完成)推送 error 事件。
         # 注意:判定必须用本轮执行的内存标志 normal_completed,不能用 task.status ——
         # 任务完成后用户发追问会把状态改回 RUNNING(API 端点同步落库),若按状态判定,
-        # 已正常完成的任务会被误判为"未完成"而推送 error(前端显示"未知错误"失败横幅),
-        # 并重新标记总线结束(resume 线程后续事件全被静默丢弃,任务卡死)。
+        # 已正常完成的任务会被误判为"未完成"而推送 error(前端显示"未知错误"失败横幅)。
         if not normal_completed:
             # [诊断] error 事件推送日志:前端 onError 的唯一事件源,全量记录
             logger.warning(
                 f"[task={task.id}] finally 兜底推送 error 事件 "
                 f"(status={task.status.value}, error_message={task.error_message!r})"
             )
+            # error 无条件推送(并行流失败也须通知前端);必须在 end-scope 之前
+            # (总线关闭后 publish 会被静默丢弃,前端将永远收不到错误横幅)
             publish(task.id, "error", {
                 "status": "failed",
                 "error_message": task.error_message or "未知错误(无异常详情,请查看服务日志)",
             })
-            finish_task(task.id)
+        # 无条件收尾(幂等):正常路径已在各收尾点 end 过(discard 无副作用),
+        # 此处兜底 ① 异常路径的 scope 注销 ② "正常完成后仍抛异常"的边角泄漏。
+        # 若此时尚有并行流在跑则静默返回,不动总线
+        _end_event_scope(task.id, flow_gen)
+        # ---- 状态清理组:仅当本任务无活跃流时执行 ----
+        # (审查与新一轮 resume 并行时,老线程 finally 不得清掉新流正在用的
+        #  运行时状态:用户消息队列/暂停标志/沙箱 completed 标记等。
+        #  必须在 end-scope 之后:异常路径下自身 scope 尚未注销,
+        #  先查会被误判"并行中"而永久跳过清理)
+        if not _has_active_scope(task.id):
+            for cleanup_fn, name in [
+                (clear_pause_state, "暂停状态"),
+                (clear_skip_state, "跳过预克隆标志"),
+                (clear_user_messages, "用户消息队列"),
+                (clear_pending_verify_action, "验证待授权状态"),
+                (clear_pending_command_confirm, "命令待确认状态"),
+                (sandbox_tools.mark_task_completed, "沙箱完成标记"),
+            ]:
+                try:
+                    cleanup_fn(task_id_str)
+                except Exception as cleanup_err:
+                    logger.warning(f"[task={task.id}] 清理{name}失败: {cleanup_err}")
+        else:
+            logger.info(
+                f"[task={task.id}] 并行流仍在运行,跳过状态清理"
+                f"(gen={flow_gen})"
+            )
 
 
 # ============================================================
@@ -680,7 +676,7 @@ def _round_has_tool_calls(db: Session, task_id, round_idx: int) -> bool:
 
 
 def _finish_conversation_round(
-    task: Task, db: Session, *, rounds: int, mode: str,
+    task: Task, db: Session, *, rounds: int, mode: str, flow_gen: int,
 ) -> None:
     """纯对话轮收尾:跳过后台审查与重下游,直接完成任务
 
@@ -690,7 +686,7 @@ def _finish_conversation_round(
     问答 —— 纯追问即回答,不为一次对话触发整条审查流水线。
 
     终止事件序列与单 agent 收尾同构:agent1_done → done → finish_task
-    (不进入 review_running,后续追问走 immediate resume,无需排队)。
+    (经 _end_event_scope:老审查与新流并行时不关总线,由最后活跃流收尾)
     """
     task.status = TaskStatus.COMPLETED
     task.current_stage = "任务完成(本轮为纯对话,跳过审查)"
@@ -701,8 +697,7 @@ def _finish_conversation_round(
     emit(TASK_COMPLETED, task.id, mode=mode, rounds=rounds)
     perf_log(task.id, "agent1_done", rounds=rounds, conversation_round=True)
     publish(task.id, "agent1_done", {"status": "completed"})
-    publish(task.id, "done", {"status": "completed"})
-    finish_task(task.id)
+    _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
 
 
 def _record_agent2_review(
@@ -761,13 +756,15 @@ def _record_agent2_review(
 def _replace_interim_results(
     db: Session, task: Task, round_idx: int, summary: str,
 ) -> int:
-    """用 agent1 本轮 summary 替换任务的全部 Result(临时结果)
+    """用 agent1 本轮 summary 替换本轮的临时 Result(按轮追加模式)
 
-    每次 agent1 执行轮结束后调用:先删该任务全部旧 Result(上一轮临时结果
-    或上次审查产出),再落本轮 summary 为唯一临时结果。保证任务任何时刻
-    都"有结果可看",且审查完成前的结果与最新一轮执行对应。
+    仅删除该任务**本轮 round_idx** 的旧 Result(同轮重跑幂等),再落本轮
+    summary 为临时结果。跨轮 Result(上轮知识点)保留 —— 知识点按轮
+    追加累积,并行审查(老审查写知识点与新轮临时结果共存)互不覆盖。
     """
-    db.query(Result).filter(Result.task_id == task.id).delete()
+    db.query(Result).filter(
+        Result.task_id == task.id, Result.round_idx == round_idx,
+    ).delete()
     interim = [
         Result(
             task_id=task.id,
@@ -791,13 +788,21 @@ def _run_background_review(
     agent_policy: dict,
     task_id_str: str,
     react_client: LLMClient | None = None,
+    flow_gen: int,
+    round_idx: int,
 ) -> None:
-    """后台审查:agent2 单次完整核查 + 结果替换 + 终止事件 + 下游链
+    """后台审查:agent2 单次完整核查 + 知识点落库 + 终止判定 + 下游链
 
     在 agent1 完成后的同一后台线程内执行;**永不抛异常** ——
     所有失败都转为 review_status=failed(保留临时结果),任务保持 COMPLETED。
-    审查结束(无论成败)推送 review_done + done 并 finish_task,
-    随后链式触发练习题生成与记忆归纳(依赖最终结果)。
+    审查结束(无论成败)推送 review_done;done/finish 由 _end_event_scope
+    统一判定(并行流在跑时保持总线打开)。下游链(记忆/练习题/预压缩)
+    仅最新世代流执行,避免并行重复。
+
+    知识点按轮追加:只删本轮 round_idx 的临时 Result,跨轮知识点保留。
+    round_idx 必须由调用方显式传入(= 本流 agent1 执行轮),不得用
+    len(react_summaries) 推导 —— "某轮有对话却无 thinking 记录"(如
+    executor 在首次思考前崩溃后重试)时二者会错位,导致删错轮、遗留陈旧 interim。
     """
     try:
         task.current_stage = "检查助手审查中"
@@ -813,7 +818,7 @@ def _run_background_review(
         try:
             ua_result = run_agent2(
                 user_intent, react_summaries,
-                task_id=task.id, db=db, round_idx=len(react_summaries),
+                task_id=task.id, db=db, round_idx=round_idx,
                 scenario_id=scenario_id, client=llm_client,
                 user_id=task.user_id,
                 repo_url=(task.params or {}).get("repo_url"),
@@ -831,9 +836,9 @@ def _run_background_review(
             }
         perf_log(
             task.id, "review_eval", time.perf_counter() - _t0,
-            round_idx=len(react_summaries),
+            round_idx=round_idx,
         )
-        _record_agent2_review(db, task, len(react_summaries), ua_result)
+        _record_agent2_review(db, task, round_idx, ua_result)
 
         review_failed = (
             bool(ua_result.get("degraded"))
@@ -852,14 +857,18 @@ def _run_background_review(
                 f"results={len(ua_result.get('results') or [])}),保留临时结果"
             )
         else:
-            # 审查完成:临时结果整体替换为重点与知识点
+            # 审查完成:本轮临时 Result 替换为重点与知识点(按轮追加:
+            # 仅删本轮 round_idx 的临时结果,跨轮知识点保留不覆盖)
             structured_results = ua_result.get("results") or []
             grouping = ua_result.get("grouping")
-            db.query(Result).filter(Result.task_id == task.id).delete()
+            db.query(Result).filter(
+                Result.task_id == task.id,
+                Result.round_idx == round_idx,
+            ).delete()
             for r in structured_results:
                 db.add(Result(
                     task_id=task.id,
-                    round_idx=len(react_summaries),
+                    round_idx=round_idx,
                     title=r.get("title", "(无标题)"),
                     content=r.get("content", ""),
                     metadata_=r.get("metadata"),
@@ -894,11 +903,17 @@ def _run_background_review(
         perf_log(task.id, "review_done", review_status=task.review_status)
 
         # 通知前端审查结束(侧栏 badge 更新 + 拉取最终结果)。
-        # 终止事件(done/finish_task)不在此推:由 _finalize_review 统一决策 ——
-        # 审查期间有排队追问时总线保持打开,自动 resume 新一轮(不推 done)
+        # done/finish 由 _end_event_scope 统一判定:并行流(用户追问已启动
+        # 新一轮 agent1/resume)仍在跑时保持总线打开,由最后活跃流收尾
         publish(task.id, "review_done", {"review_status": task.review_status})
+        _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
 
-        # ---- 下游链(依赖最终结果,必须在审查后)----
+        # ---- 下游链(依赖最终结果,必须在审查后;仅最新流执行,避免并行重复)----
+        if not _is_latest_generation(task.id, flow_gen):
+            logger.info(
+                f"[task={task.id}] 并行流已接管(gen={flow_gen}),跳过审查下游链"
+            )
+            return
 
         # 任务成功完成:自动归纳写入长期记忆(失败兜底,不影响任务完成)
         try:
@@ -917,7 +932,7 @@ def _run_background_review(
 
         # 预压缩早期历史:用户下一轮追问直接命中缓存,消除追问路径上的
         # 同步 LLM 压缩延迟(失败兜底,内部已捕获)
-        _precompress_history_safely(task, db, len(react_summaries), react_client)
+        _precompress_history_safely(task, db, round_idx, react_client)
 
     except Exception as e:
         # 最后防线:保证终止事件一定推送(SSE 不悬挂),任务保持 COMPLETED
@@ -927,10 +942,9 @@ def _run_background_review(
             task.current_stage = "任务完成(检查异常终止,已保留执行结果)"
             db.commit()
             publish(task.id, "review_done", {"review_status": "failed"})
-            publish(task.id, "done", {"status": "completed"})
-            finish_task(task.id)
+            _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
         except Exception:
-            finish_task(task.id)
+            _end_event_scope(task.id, flow_gen)
 
 
 def _add_conversation(
@@ -1481,7 +1495,7 @@ def _restore_workspace_if_needed(
 
 def resume_audit_with_message(
     task: Task, db: Session, user_message: str, retry: bool = False,
-    upload_ids: list[str] | None = None,
+    upload_ids: list[str] | None = None, flow_gen: int | None = None,
 ) -> None:
     """用户在任务完成后追加消息,重启执行(后台审查版)
 
@@ -1489,7 +1503,8 @@ def resume_audit_with_message(
     改为重试语境,其余流程一致。
 
     流程(每次 resume = agent1 一轮 + 后台审查,多轮由用户驱动):
-    1. task.status: COMPLETED/FAILED → RUNNING
+    1. task.status: COMPLETED/FAILED → RUNNING(不等老审查:老审查
+       继续在后台跑完,与本轮 agent1 并行,见"并行语义"注释)
     2. 加载历史上下文(react_summaries / LLM 配置),恢复工作区
     3. 起始 round_idx:用户追加消息时复用消息所在轮(消息与首轮 react 执行
        同轮,不隔轮);失败重试时从 max+1 续接新轮
@@ -1500,18 +1515,23 @@ def resume_audit_with_message(
     5. 轮次类型判定:纯对话轮(本轮无工具调用)直接收尾,保留既有结果
        与审查状态,跳过审查/练习题/记忆归纳
     6. agent1 轮结束:summary 落临时结果,任务 COMPLETED(推 agent1_done)
-    7. 后台审查(同初始运行):整理重点与知识点替换临时结果,推 review_done + done
+    7. 后台审查(同初始运行):知识点按轮追加,推 review_done;done/finish
+       由最后活跃流统一收尾(_end_event_scope)
+
+    并行语义(事件活跃期 scope):追问可在老审查未结束时直接启动本函数,
+    老审查线程与本线程并行 —— 老审查照常落库自己轮次的知识点/结论,
+    本流照常执行;done/finish 仅由最后活跃流推送,互不干扰。
 
     用户消息本身已由 API 端点落库为 Conversation(role=user, type=message),
     本函数不重复落库。
-
-    注意:本函数在独立后台线程中调用(类似 _run_task_in_background),
-    与原执行线程互斥 —— 两条进入路径都保证审查结束后才启动 resume:
-    - immediate:API 端点路由判定无审查在跑时直接启动(register_pending_resume)
-    - queued:核查期间用户追问先排队,审查线程结束时由 _finalize_review
-      自动启动(_seal_review 原子决策,消除并发双跑竞态)
     """
     task_id_str = str(task.id)
+
+    # 注册本流事件活跃期(先于状态翻转:确保老流收尾判定能看到本流)。
+    # launch_resume_thread 已同步注册并传入 gen(消除端点→线程注册窗口);
+    # 直接调用方(retry 链路/测试)未传时在此自行注册
+    if flow_gen is None:
+        flow_gen = _begin_event_scope(task.id)
 
     task.status = TaskStatus.RUNNING
     task.current_stage = (
@@ -1520,11 +1540,6 @@ def resume_audit_with_message(
     task.error_message = None  # 清除之前的错误信息(若有)
     db.commit()
     _publish_status(task)
-
-    # 状态已翻转为 RUNNING:解除 queued resume 的接管标记
-    # (此后新消息按 running 语义入队,不再走排队/立即 resume 路由)
-    with _review_lock:
-        _resume_claims.discard(task_id_str)
 
     # 加载上下文(与 run_dual_agent_audit 一致)
     # llm_client:agent2 评估;react_client:内置 react_agent(空时回退到 llm_config_id)
@@ -1651,17 +1666,22 @@ def resume_audit_with_message(
         if ua_enabled and not _round_has_tool_calls(db, task.id, start_round_idx):
             _finish_conversation_round(
                 task, db, rounds=len(react_summaries), mode="resume",
+                flow_gen=flow_gen,
             )
             normal_completed = True  # 正常完成:finally 不再兑底推 error
             return  # finally 块仍会执行清理
 
-        # 本轮 summary 落临时结果(替换上一次的临时/审查产出)
+        # 本轮 summary 落临时结果(按轮追加:仅替换本轮,跨轮知识点保留)
         _replace_interim_results(db, task, start_round_idx, summary)
 
         # ===== 单 agent 模式:agent2 已禁用,执行完直接收尾(无审查) =====
         if not ua_enabled:
             logger.info(f"[task={task.id}] resume 单 agent 模式(agent2 已禁用)")
-            _finish_resume(task, db, react_summaries, react_client=react_client)
+            _finish_resume(
+                task, db, react_summaries,
+                react_client=react_client, flow_gen=flow_gen,
+                round_idx=start_round_idx,
+            )
             normal_completed = True  # 正常完成:finally 不再兑底推 error(见 finally 注释)
             return  # finally 块仍会执行清理
 
@@ -1698,22 +1718,21 @@ def resume_audit_with_message(
         normal_completed = True
 
         # ---------- 后台审查(同一线程;失败只影响 review_status) ----------
-        review_ev = _mark_review_started(task.id)
-        try:
-            _run_background_review(
-                task, db,
-                user_intent=effective_intent,
-                react_summaries=react_summaries,
-                scenario_id=task.scenario,
-                llm_client=llm_client,
-                agent_policy=agent_policy,
-                task_id_str=task_id_str,
-                react_client=react_client,
-            )
-        finally:
-            # 审查收尾:有排队追问 → 总线保持打开并自动 resume;
-            # 无 → 推 done + 关闭总线(原行为)
-            _finalize_review(task, review_ev)
+        # 老审查(若未结束)与本流并行:各自落库自己轮次,done/finish 由
+        # 最后活跃流的 _end_event_scope 统一收尾。
+        # _run_background_review 永不抛异常(内部全兜底),无需 try 包裹
+        _run_background_review(
+            task, db,
+            user_intent=effective_intent,
+            react_summaries=react_summaries,
+            scenario_id=task.scenario,
+            llm_client=llm_client,
+            agent_policy=agent_policy,
+            task_id_str=task_id_str,
+            react_client=react_client,
+            flow_gen=flow_gen,
+            round_idx=start_round_idx,
+        )
 
     except Exception as e:
         err_stage = "重试执行失败" if retry else "重启执行失败"
@@ -1743,26 +1762,12 @@ def resume_audit_with_message(
             save_repo_tree_artifact(task, db, task_id_str)
         except Exception as diff_err:
             logger.warning(f"[task={task.id}] 失败时捕获工作区产物失败(忽略): {diff_err}")
+        # 事件活跃期收尾移交 finally 统一处理:error 事件必须在
+        # finish_task 之前推送(总线关闭后 publish 会被静默丢弃)
     finally:
-        # 清理资源(与 run_dual_agent_audit 对齐)
-        for cleanup_fn, name in [
-            (clear_pause_state, "暂停状态"),
-            (clear_skip_state, "跳过预克隆标志"),
-            (clear_user_messages, "用户消息队列"),
-            (clear_pending_verify_action, "验证待授权状态"),
-        ]:
-            try:
-                cleanup_fn(task.id)
-            except Exception as cleanup_err:
-                logger.warning(f"[task={task.id}] 清理{name}失败: {cleanup_err}")
-        try:
-            sandbox_tools.mark_task_completed(task_id_str)
-        except Exception as cleanup_err:
-            logger.warning(f"[task={task.id}] 标记任务完成失败: {cleanup_err}")
         # 推送终止事件
-        # done 事件已在 _finish_resume 中提前推送(在归纳记忆/git diff 之前),正常路径
-        # 也已同步调用 finish_task(提前标记总线结束,消除与 reset_task_bus 的竞态)。
-        # 此处仅兑底:异常路径(本轮未正常完成)推送 error 事件 + 标记总线结束。
+        # done 事件已在各收尾点经 _end_event_scope 推送(正常路径)。
+        # 此处仅兑底:异常路径(本轮未正常完成)推送 error 事件。
         # 判定必须用内存标志 normal_completed,不能用 task.status ——
         # 本轮完成后用户又发新追问会把状态改回 RUNNING,按状态判定会误推 error
         # 并重新标记总线结束,导致新 resume 线程事件全被静默丢弃。
@@ -1772,11 +1777,33 @@ def resume_audit_with_message(
                 f"[task={task.id}] resume finally 兑底推送 error 事件 "
                 f"(status={task.status.value}, error_message={task.error_message!r})"
             )
+            # error 无条件推送(并行流失败也须通知前端);必须在 end-scope 之前
+            # (总线关闭后 publish 会被静默丢弃,前端将永远收不到错误横幅)
             publish(task.id, "error", {
                 "status": "failed",
                 "error_message": task.error_message or "未知错误(无异常详情,请查看服务日志)",
             })
-            finish_task(task.id)
+        # 无条件收尾(幂等):正常路径已在各收尾点 end 过(discard 无副作用),
+        # 此处兜底 ① 异常路径的 scope 注销 ② "正常完成后仍抛异常"的边角泄漏。
+        # 若此时尚有并行流在跑则静默返回,不动总线
+        _end_event_scope(task.id, flow_gen)
+        # ---- 状态清理组:仅当本任务无活跃流时执行 ----
+        # (老审查与本流并行时,不得清掉并行流正在用的运行时状态。
+        #  必须在 end-scope 之后:异常路径下自身 scope 尚未注销,
+        #  先查会被误判"并行中"而永久跳过清理)
+        if not _has_active_scope(task.id):
+            for cleanup_fn, name in [
+                (clear_pause_state, "暂停状态"),
+                (clear_skip_state, "跳过预克隆标志"),
+                (clear_user_messages, "用户消息队列"),
+                (clear_pending_verify_action, "验证待授权状态"),
+                (clear_pending_command_confirm, "命令待确认状态"),
+                (sandbox_tools.mark_task_completed, "沙箱完成标记"),
+            ]:
+                try:
+                    cleanup_fn(task_id_str)
+                except Exception as cleanup_err:
+                    logger.warning(f"[task={task.id}] 清理{name}失败: {cleanup_err}")
 
 
 # ============================================================
@@ -1860,13 +1887,15 @@ def _err_detail(e: Exception) -> str:
 
 def _finish_resume(
     task: Task, db: Session, react_summaries: list[dict],
-    react_client: LLMClient | None = None,
+    react_client: LLMClient | None = None, *, flow_gen: int, round_idx: int,
 ) -> None:
     """resume 收尾(单 agent 模式):标记状态 + 终止事件
 
     仅单 agent 模式(agent2 已禁用)使用:无 agent2 评估可展示,
     不写总结对话。该路径结果已由调用方落库(_replace_interim_results),
     后续后台审查路径不走此函数(由 _run_background_review 负责收尾)。
+    done/finish 经 _end_event_scope 统一判定(并行流在跑时不关总线)。
+    round_idx = 本流 agent1 执行轮(预压缩轮次,显式传入防 len 推导错位)。
     """
     task.status = TaskStatus.COMPLETED
     task.current_stage = "重启执行完成"
@@ -1876,16 +1905,11 @@ def _finish_resume(
     # 领域事件:任务完成(resume/重试续跑路径)
     emit(TASK_COMPLETED, task.id, mode="resume", rounds=len(react_summaries))
 
-    # 提前推送 done 事件:results 已落库,让前端立即拉取展示
-    # (归纳记忆和 git diff 是后台兑底任务,不阻塞前端结果清单展示)
-    publish(task.id, "done", {"status": "completed"})
-    # 立即标记总线结束(不等 resume 线程 finally):与 run_dual_agent_audit 同理,
-    # 消除"用户再发新追问触发的 reset_task_bus 被旧线程 finally 的 finish_task 重新覆盖"
-    # 竞态 —— 否则新 resume 线程 publish 全被丢弃(对话/状态事件丢失、任务卡死)。
-    finish_task(task.id)
+    # 事件活跃期收尾:推 done + 关总线(仅当无并行流)
+    _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
 
     # 预压缩早期历史:用户下一轮追问直接命中缓存(失败兜底)
-    _precompress_history_safely(task, db, len(react_summaries), react_client)
+    _precompress_history_safely(task, db, round_idx, react_client)
 
     # 重启完成:自动归纳写入长期记忆(失败兑底,不影响;client 用默认,归纳是简单任务)
     try:

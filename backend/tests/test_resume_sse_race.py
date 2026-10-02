@@ -7,9 +7,12 @@
 
 修复组合:
 1. API 端点(completed 发消息 / failed 重试)启动后台线程前同步把状态改为
-   RUNNING 落库,消除 SSE 快照读到旧状态的窗口;
+   RUNNING 落库,消除 SSE 快照读到旧状态的窗口(同时关闭双发竞态:
+   并发第二条消息看到 RUNNING → 按运行中语义入队);
 2. SSE 端点快照为 COMPLETED/FAILED 时,若事件总线已被 reset_task_bus
-   (说明新执行已启动),不推终止事件,走正常订阅分支。
+   (说明新执行已启动),不推终止事件,走正常订阅分支;
+3. completed 追问直达 agent1(不等老审查):老审查在跑(总线打开)→
+   不重置总线,SSE 不断线;上一轮已收尾(总线结束)→ 重置后再启动。
 """
 import uuid
 from unittest.mock import MagicMock
@@ -131,7 +134,11 @@ def _mk_db_and_task(status: TaskStatus):
 
 def _patch_endpoint_env(monkeypatch):
     """屏蔽端点副作用:总线/推送/日志/线程/resume 启动。"""
-    monkeypatch.setattr(tasks_module, "reset_task_bus", lambda *a, **k: None)
+    resets = []
+    monkeypatch.setattr(
+        tasks_module, "reset_task_bus",
+        lambda tid, *a, **k: resets.append(tid),
+    )
     published = []
     monkeypatch.setattr(
         tasks_module, "publish",
@@ -145,14 +152,15 @@ def _patch_endpoint_env(monkeypatch):
     )
     _FakeThread.instances = []
     monkeypatch.setattr(tasks_module.threading, "Thread", _FakeThread)
-    return launched, published
+    return launched, published, resets
 
 
 def test_submit_message_completed_syncs_running(monkeypatch):
-    """completed 追问(无审查在跑=immediate):返回响应前同步落库 RUNNING,
-    再启动 resume 线程(经 orchestrator.launch_resume_thread)。"""
+    """completed 追问(上一轮已完全收尾):返回响应前同步落库 RUNNING +
+    重置总线(清除旧 done 历史),再启动 resume(scope 同步注册)。"""
     db, task, task_id = _mk_db_and_task(TaskStatus.COMPLETED)
-    launched, _ = _patch_endpoint_env(monkeypatch)
+    launched, _, resets = _patch_endpoint_env(monkeypatch)
+    monkeypatch.setattr(tasks_module, "is_task_finished", lambda tid: True)
 
     resp = tasks_module.submit_task_message(
         task_id, SendMessageRequest(content="追加检查依赖漏洞"), db, None,
@@ -161,6 +169,8 @@ def test_submit_message_completed_syncs_running(monkeypatch):
     # 状态已同步为 RUNNING(消除 SSE 快照读到 COMPLETED 的窗口)
     assert task.status == TaskStatus.RUNNING
     assert task.current_stage == "用户追加消息,重启执行"
+    # 上一轮已收尾 → 重置总线(前端重连不因历史 done 立即关闭)
+    assert resets == [task_id]
     # resume 已启动且响应 accepted
     assert len(launched) == 1
     args, kwargs = launched[0]
@@ -168,13 +178,12 @@ def test_submit_message_completed_syncs_running(monkeypatch):
     assert args[1] == "追加检查依赖漏洞"
     assert kwargs.get("upload_ids") is None
     assert resp.accepted is True
-    assert resp.queued_for_review is False
 
 
 def test_submit_message_running_no_thread(monkeypatch):
     """running 追问:只入队,不启动 resume 线程、不改状态。"""
     db, task, task_id = _mk_db_and_task(TaskStatus.RUNNING)
-    launched, _ = _patch_endpoint_env(monkeypatch)
+    launched, _, _ = _patch_endpoint_env(monkeypatch)
 
     resp = tasks_module.submit_task_message(
         task_id, SendMessageRequest(content="补充要求"), db, None,
@@ -185,57 +194,55 @@ def test_submit_message_running_no_thread(monkeypatch):
     assert resp.accepted is True
 
 
-def test_submit_message_during_review_queued(monkeypatch):
-    """核查中追问(审查仍在跑=queued):立即返回 queued_for_review=True,
-    不阻塞、不改状态、不启动 resume —— 消息已落库并实时推送。"""
+def test_submit_message_during_review_starts_immediately(monkeypatch):
+    """核查中追问(老审查仍在跑,总线打开):不重置总线(SSE 不断线、
+    历史保留),直接启动新一轮 resume + 同步置 RUNNING ——
+    追问直达 agent1,不等老审查。"""
     db, task, task_id = _mk_db_and_task(TaskStatus.COMPLETED)
-    launched, published = _patch_endpoint_env(monkeypatch)
-    monkeypatch.setattr(
-        tasks_module, "register_pending_resume",
-        lambda *a, **k: "queued",
-    )
+    launched, published, resets = _patch_endpoint_env(monkeypatch)
+    monkeypatch.setattr(tasks_module, "is_task_finished", lambda tid: False)
 
     resp = tasks_module.submit_task_message(
         task_id, SendMessageRequest(content="深挖一下"), db, None,
     )
 
     assert resp.accepted is True
-    assert resp.queued_for_review is True
-    assert "排队" in (resp.message or "")
-    # 不启动 resume、不改状态(审查仍占着任务)
-    assert len(launched) == 0
-    assert task.status == TaskStatus.COMPLETED
-    # 消息事件已推送(审查期间总线打开,前端实时看到追问)
+    assert "已启动新一轮执行" in (resp.message or "")
+    assert resets == []  # 审查在跑(总线打开)→ 不重置
+    assert len(launched) == 1  # 立即启动新轮(不等老审查)
+    assert task.status == TaskStatus.RUNNING  # 同步置 RUNNING(关双发竞态)
+    # 消息事件已推送(经现有总线,前端实时看到追问)
     assert any(e == "conversation" for e, _ in published)
     # 消息已落库
     assert db.add.call_count == 1
     assert db.commit.call_count >= 1
 
 
-def test_submit_message_claim_window_enqueues(monkeypatch):
-    """queued resume 已接管(claim 窗口=enqueue):按运行中语义入队,
-    不启动第二个 resume(防并发双跑)。"""
+def test_submit_message_second_message_enqueues(monkeypatch):
+    """同步置 RUNNING 后到达的第二条消息:按运行中语义入队
+    (由新轮 agent1 迭代边界消费),不启动第二个 resume(防并发双跑)。"""
     db, task, task_id = _mk_db_and_task(TaskStatus.COMPLETED)
-    launched, _ = _patch_endpoint_env(monkeypatch)
-    monkeypatch.setattr(
-        tasks_module, "register_pending_resume",
-        lambda *a, **k: "enqueue",
+    launched, _, _ = _patch_endpoint_env(monkeypatch)
+    monkeypatch.setattr(tasks_module, "is_task_finished", lambda tid: True)
+
+    resp1 = tasks_module.submit_task_message(
+        task_id, SendMessageRequest(content="第一条"), db, None,
     )
+    assert resp1.accepted is True
+
+    # 第一条已同步把状态置 RUNNING:第二条看到 RUNNING → 入队语义
     pushed = []
     monkeypatch.setattr(
         tasks_module, "push_user_message",
         lambda *a, **k: pushed.append((a, k)),
     )
-
-    resp = tasks_module.submit_task_message(
-        task_id, SendMessageRequest(content="再补一条"), db, None,
+    resp2 = tasks_module.submit_task_message(
+        task_id, SendMessageRequest(content="第二条"), db, None,
     )
 
-    assert resp.accepted is True
-    assert resp.queued_for_review is False
-    assert len(pushed) == 1  # 入队(由新一轮 react_agent 迭代边界消费)
-    assert len(launched) == 0  # 不再启动 resume
-    assert task.status == TaskStatus.COMPLETED  # 状态未动
+    assert resp2.accepted is True
+    assert len(pushed) == 1  # 入队(由新轮 react_agent 迭代边界消费)
+    assert len(launched) == 1  # 只有第一条启动了 resume(无双跑)
 
 
 def test_retry_syncs_running(monkeypatch):
@@ -283,9 +290,14 @@ def _mk_background_crash_env(monkeypatch, module, main_fn_name):
     monkeypatch.setattr(module, main_fn_name, lambda *a, **k: (_ for _ in ()).throw(RuntimeError("早期崩溃")))
     monkeypatch.setattr(module, "clear_pause_state", lambda *a, **k: None)
     events = []
-    monkeypatch.setattr(module, "publish", lambda tid, etype, data: events.append((etype, data)))
     finished = []
-    monkeypatch.setattr(module, "finish_task", lambda tid: finished.append(tid))
+    monkeypatch.setattr(module, "publish", lambda tid, etype, data: events.append((etype, data)))
+    # 兜底收尾(_end_event_scope / force_cleanup_event_scopes)在 orchestrator
+    # 命名空间内调用 publish/finish_task(两个包装器的总线关闭都经它)
+    monkeypatch.setattr(orchestrator, "publish",
+                        lambda tid, etype, data=None: events.append((etype, data)))
+    monkeypatch.setattr(orchestrator, "finish_task",
+                        lambda tid: finished.append(tid))
     return task, db, events, finished
 
 

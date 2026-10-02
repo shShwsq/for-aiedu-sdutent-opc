@@ -29,8 +29,8 @@ from sqlalchemy.orm import Session
 
 from app.agents.orchestrator import (
     _err_detail,
+    force_cleanup_event_scopes,
     launch_resume_thread,
-    register_pending_resume,
     resume_audit_with_message,
     retry_failed_task,
     run_dual_agent_audit,
@@ -39,7 +39,6 @@ from app.agents.react_agent import build_first_round_question
 from app.database import SessionLocal, get_db
 from app.deps import get_optional_user, get_optional_user_sse
 from app.event_bus import (
-    finish_task,
     is_task_finished,
     publish,
     reset_task_bus,
@@ -594,11 +593,9 @@ def submit_task_message(
     按 task.status 分发:
     - running / paused:消息入队(user_messages.push_user_message),
       react_agent 在下一迭代边界 drain 出来注入 LLM 上下文
-    - completed:原子路由(register_pending_resume,不再阻塞等待审查):
-      - 审查仍在核查 → 消息排队(queued_for_review=True),审查结束后
-        由审查线程自动启动新一轮 resume(总线保持打开,SSE 不断线)
-      - queued resume 已接管(状态翻转窗口)→ 按运行中语义入队
-      - 无审查在跑 → 立即启动新的协作 round(resume_audit_with_message)
+    - completed:立即启动新一轮执行(追问直达 agent1,不等老审查)——
+      老审查(若仍在跑)与新轮 agent1 并行,各自落库自己轮次的知识点;
+      done/finish 由最后活跃流统一收尾(orchestrator 事件活跃期机制)
     - pending / failed:拒绝(任务未启动或已失败)
 
     消息统一落库为 Conversation(role=user, type=message):
@@ -724,55 +721,29 @@ def submit_task_message(
         )
 
     if task.status == TaskStatus.COMPLETED:
-        # 完成态原子路由(替代旧的 wait_for_review 同步阻塞等待):
-        # - queued:后台审查仍在核查 → 消息排队,审查结束后由审查线程
-        #   _finalize_review 自动启动 resume(事件总线保持打开,前端
-        #   SSE 不断线,新轮事件继续实时送达)。接口立即返回,不再阻塞
-        # - enqueue:queued resume 已接管(状态翻转窗口)→ 按运行中语义入队
-        # - immediate:无审查在跑 → 原 immediate resume 行为
-        route = register_pending_resume(task.id, content, followup_ids or None)
-        if route == "queued":
-            # 审查期间总线保持打开,消息事件实时送达;
-            # 附件先累积进 params(沙箱回收后的重放依据,与立即路径一致)
-            _publish_user_message()
-            _accumulate_followup_uploads()
-            db.commit()
-            return SendMessageResponse(
-                accepted=True,
-                queued_for_review=True,
-                message="检查助手仍在核查中,消息已排队,核查结束后自动处理",
-            )
-        if route == "enqueue":
-            _publish_user_message()
-            push_user_message(
-                task.id, content,
-                message_id=str(conv.id),
-                created_at=conv.created_at.isoformat() if conv.created_at else "",
-                upload_ids=followup_ids or None,
-            )
-            return SendMessageResponse(
-                accepted=True,
-                message="消息已加入队列,智能体将在下一迭代处理",
-            )
-
-        # immediate:审查已结束(事件总线已被 finish_task 标记 _finished=True,
-        # 后续 publish 会被静默丢弃)。重启审计前先重置总线(清除 _finished +
-        # _history 含旧 done 事件),让新事件能推送、前端重连 SSE 不会立即关闭。
-        reset_task_bus(task.id)
+        # 追问直达 agent1(不等老审查):老审查(若仍在跑)与新轮 agent1
+        # 并行,各自落库自己轮次的知识点;done/finish 由最后活跃流收尾
+        # (orchestrator._end_event_scope)。
+        # 总线:上一轮已完全收尾(is_task_finished,含历史 done 事件)→
+        # 重置,让新事件能推送、前端重连 SSE 不会因历史 done 立即关闭;
+        # 老审查仍在跑(总线打开)→ 不重置,SSE 不断线、历史事件保留。
+        if is_task_finished(task.id):
+            reset_task_bus(task.id)
         _publish_user_message()
 
         # 同步将状态改为 RUNNING 落库后再启动后台线程:
-        # 消除 SSE 端点快照读到 COMPLETED 的竞态窗口 —— 否则前端重连 SSE 时,
-        # stream_task_events 会按旧快照直接推 done 关闭连接,后续
-        # conversation/status 等事件虽进历史缓存却无人接收(需刷新页面才恢复)。
-        # resume_audit_with_message 开头会再设置一次,幂等无冲突。
+        # ① 消除 SSE 端点快照读到 COMPLETED 的竞态窗口(否则前端重连时,
+        #   stream_task_events 按旧快照直接推 done 关闭连接,需刷新才恢复)
+        # ② 关闭双发竞态窗口:并发第二条消息看到 RUNNING → 走运行中入队,
+        #   由新轮 agent1 在迭代边界消费(resume_audit_with_message 开头
+        #   会再设置一次状态,幂等无冲突)
         task.status = TaskStatus.RUNNING
         task.current_stage = "用户追加消息,重启执行"
         _accumulate_followup_uploads()
         db.commit()
 
-        # 启动新的协作 round(后台线程)
-        # resume_audit_with_message 会把 task.status 保持 RUNNING
+        # 启动新的协作 round(后台线程;scope 在线程启动前同步注册,
+        # 老审查收尾不会误推 done 关总线)
         launch_resume_thread(str(task_id), content, upload_ids=followup_ids or None)
         return SendMessageResponse(
             accepted=True,
@@ -904,19 +875,21 @@ def _run_retry_in_background(task_id: str) -> None:
                 task.error_message = str(e)[:1000]
                 task.current_stage = "重试执行失败"
                 db.commit()
-                # 兜底推送终止事件 + 标记总线结束:防止 SSE 订阅者因线程
-                # 在进入 resume 主 try 块前崩溃收不到 error 而永久挂起
+                # 兜底推送终止事件:防止 SSE 订阅者因线程在进入
+                # resume 主 try 块前崩溃收不到 error 而永久挂起
                 publish(task.id, "error", {
                     "status": "failed",
                     "error_message": str(e)[:1000],
                 })
-                finish_task(task.id)
         except Exception:
             pass
+        # 强制清空事件活跃期:retry 链路可能在崩溃前注册了 scope
+        # (resume 前置段异常上抛)——泄漏会让该任务之后所有流被误判
+        # "并行中"(永不推 done、SSE 永久悬挂)。先推 error 后清理。
+        # retry 场景无并行流,强制清空安全(见函数注释)
+        force_cleanup_event_scopes(task_id)
     finally:
         db.close()
-        # 清理 in-memory 暂停状态(防止任务结束但状态卡住)
-        clear_pause_state(task_id)
 
 
 # ============================================================
@@ -1900,8 +1873,6 @@ def _run_task_in_background(task_id: str) -> None:
             pass
     finally:
         db.close()
-        # 清理 in-memory 暂停状态(防止任务结束但状态卡住)
-        clear_pause_state(task_id)
 
 
 # ============================================================

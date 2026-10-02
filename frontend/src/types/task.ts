@@ -520,10 +520,4 @@ export interface SendMessageResponse {
   accepted: boolean
   /** 提示信息(展示给用户) */
   message?: string
-  /**
-   * True=检查助手仍在核查中,消息已排队,核查结束后由后端自动启动
-   * 新一轮。前端保持 SSE 连接与当前展示(不切到"已启动新一轮"的
-   * 乐观态),新一轮事件经现有 SSE 连接继续送达
-   */
-  queued_for_review?: boolean
 }

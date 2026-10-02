@@ -2097,19 +2097,21 @@ function truncateInput(s: string, max = 40): string {
 /**
  * 用户消息发送成功后的处理
  *
- * - completed 态:后端已启动 resume 线程(状态 → RUNNING),需重连 SSE
- *   接收新一轮的事件。用户消息的 conversation 事件已由后端在 reset_task_bus
- *   后 publish,会通过 SSE 历史补播送达。
+ * - completed 态:后端已同步置 RUNNING 并启动 resume 线程(追问直达
+ *   agent1,不等老审查 —— 老审查与新轮并行,由最后活跃流收尾)。
+ *   本地同步状态 + 重连 SSE(老审查在跑时总线本就打开,重连经历史
+ *   补播无缝衔接;上一轮已收尾时后端已 reset,重连接收新事件)。
  * - running / paused 态:SSE 已连接,conversation 事件由 onConversation 自动接收,
  *   无需额外处理。
  */
 function handleMessageSent(_resp: SendMessageResponse): void {
   if (task.value?.status === 'completed') {
-    // 后端 resume 线程已把状态改回 RUNNING,本地同步 + 重连 SSE
+    // 后端端点已把状态同步改为 RUNNING,本地同步 + 重连 SSE
     task.value.status = 'running'
     task.value.current_stage = '用户追加消息,重启执行'
-    // 重置审查状态:新一轮 agent1 执行 → 后台审查尚未开始,
-    // 旧值(done/failed)会误导侧栏 badge(等后端事件再更新)
+    // 重置审查状态:新一轮 agent1 执行 → 新一轮审查尚未开始,
+    // 旧值(done/failed)会误导侧栏 badge(老审查的 review_done
+    // 事件到达时会再更新;并行期间 badge 可能有短暂抖动)
     task.value.review_status = null
     // 标记 resume 窗口:onDone 若在窗口内触发,需校验是否竞态误推
     resumingRef.value = true
@@ -2127,9 +2129,9 @@ function handleMessageError(message: string): void {
  * 侧栏"建议深挖":把检查助手的建议文本作为用户消息发出
  *
  * 任务已 COMPLETED(agent1 结束即完成),后端走 resume 链路:
- * agent1 追加执行一轮 → 新一轮后台审查。发送成功后同 handleMessageSent
- * 的 completed 分支(置 running + 标记 resume 窗口 + 重连 SSE)。
- * 审查仍在进行时后端返回 accepted=false(检查助手仍在核查中),提示稍后再试。
+ * agent1 追加执行一轮 → 新一轮后台审查(老审查若仍在跑则并行,
+ * 不阻塞)。发送成功后同 handleMessageSent 的 completed 分支
+ * (置 running + 标记 resume 窗口 + 重连 SSE)。
  */
 async function handleSuggestionDig(text: string): Promise<void> {
   if (!task.value?.id) return
@@ -2142,7 +2144,7 @@ async function handleSuggestionDig(text: string): Promise<void> {
     if (resp.accepted) {
       handleMessageSent(resp)
     } else {
-      error.value = resp.message || '检查助手仍在核查中,请稍后再试'
+      error.value = resp.message || '消息发送失败,请稍后再试'
     }
   } catch (err) {
     error.value = extractErrorMessage(err)

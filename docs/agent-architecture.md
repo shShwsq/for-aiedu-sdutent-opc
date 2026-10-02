@@ -63,12 +63,13 @@
 
 - **agent1 单轮执行**:初始运行只有 1 轮 agent1(无 agent2 初始评估,agent1 直接按用户意图执行)→ 返回 `summary`
 - **agent1 结束即任务完成**:summary 落库为临时 Result,`task.status=COMPLETED`、`review_status=running`,推 `agent1_done`(事件总线保持打开)。用户感知的"任务完成"以 agent1 结束为准
-- **agent2 后台审查**:在同一后台线程内单次完整核查(只读工具核对 / verify / check_reference),整理重点与知识点(`results + grouping`)替换临时结果,发现缺口输出"建议深挖方向"(`suggestions`,0-3 条);审查完成 `review_status=done` → 推 `review_done`,再由 `_finalize_review` 收尾:无排队追问 → 推 `done` → `finish_task`;有排队追问(核查中用户消息)→ 总线保持打开并自动 resume 新一轮。agent2 只审不改
-- **纯对话轮跳过审查**:本轮 agent1 无任何工具调用(`_round_has_tool_calls` 查 Conversation 无 `role=agent1, type=tool_call` 记录;builtin 与 CLI 执行器均按此落库)→ 判定为纯对话轮,`_finish_conversation_round` 直接收尾(推 `agent1_done` → `done` → `finish_task`),跳过审查/结果替换/练习题/记忆归纳,保留既有结果与审查状态。不进入 `review_running`,后续追问走 immediate resume(无需排队)
+- **agent2 后台审查**:在同一后台线程内单次完整核查(只读工具核对 / verify / check_reference),整理重点与知识点(`results + grouping`)替换**本轮**临时 Result(知识点按轮追加:仅删本轮 `round_idx`,跨轮保留),发现缺口输出"建议深挖方向"(`suggestions`,0-3 条);审查完成 `review_status=done` → 推 `review_done`,再经 `_end_event_scope`(事件活跃期)收尾:自己是最后活跃流 → 推 `done` → `finish_task`;仍有并行流在跑 → 总线保持打开。agent2 只审不改
+- **纯对话轮跳过审查**:本轮 agent1 无任何工具调用(`_round_has_tool_calls` 查 Conversation 无 `role=agent1, type=tool_call` 记录;builtin 与 CLI 执行器均按此落库)→ 判定为纯对话轮,`_finish_conversation_round` 直接收尾(推 `agent1_done`,done/finish 经 `_end_event_scope` 统一判定),跳过审查/结果替换/练习题/记忆归纳,保留既有结果与审查状态
 - **审查失败/降级**:保留 agent1 summary 临时结果,`review_status=failed`,落警告对话,仍推 `review_done(review_status=failed)` → `done`;任务状态不回滚(审查失败 ≠ 任务失败)
 - **无"协作总轮次"设置**:初始运行单轮,多轮协作由用户驱动(resume)。原 `AgentPolicy.max_rounds` 已移除(启动迁移 `migrate_agent_policy_drop_max_rounds_column` 幂等 DROP 老库列)
 - **单 agent 退化**:协作策略页关闭 Agent 2(`agent2_enabled=false`)后退化为单 agent 模式——agent1 跑 1 轮直接产出结果,无后台审查,`review_status` 保持 `NULL`
-- **resume(用户驱动多轮)**:用户追加消息 / 点击建议「深挖」触发。**核查中追问异步排队**:`register_pending_resume` 原子路由——审查仍在跑时消息排队(`queued_for_review=True` 立即返回,不阻塞),审查线程结束时 `_finalize_review` 自动合并排队消息(多条 `\n\n` 连接、附件去重)启动 resume,事件总线保持打开(前端 SSE 不断线);queued resume 已接管的状态翻转窗口内新消息按运行中语义入队;无审查在跑时立即 resume。用户消息**原文直接交给 agent1** 跑一轮(不经 agent2 转述,agent1 跨轮历史由 `_build_history_messages` 以结构化 messages 注入,用户追问原文作为独立 user 消息;plan 状态从 `task.params["_plan"]` 跨轮续接),结束后按轮次类型分流:纯对话轮直接收尾,分析轮再次后台审查。每次 resume = agent1 一轮 + (分析轮)后台审查
+- **resume(用户驱动多轮)**:用户追加消息 / 点击建议「深挖」触发。**追问直达 agent1,不等老审查**:端点同步置 `RUNNING` 落库(消除 SSE 快照竞态 + 并发第二条消息按运行中语义入队,防双跑)后启动 resume;老审查(若仍在跑)与新轮 agent1 **并行**——各自落库自己轮次的知识点,`done`/`finish` 仅由最后活跃流推送(事件活跃期 scope 机制,`_begin_event_scope`/`_end_event_scope`,世代号单调递增,下游链仅最新流执行);总线:老审查在跑(打开)→ 不重置(SSE 不断线),上一轮已收尾 → 重置后启动。用户消息**原文直接交给 agent1** 跑一轮(不经 agent2 转述,agent1 跨轮历史由 `_build_history_messages` 以结构化 messages 注入,用户追问原文作为独立 user 消息;plan 状态从 `task.params["_plan"]` 跨轮续接),结束后按轮次类型分流:纯对话轮直接收尾,分析轮再次后台审查。每次 resume = agent1 一轮 + (分析轮)后台审查
+- **并行已知限制**(接受的设计取舍):① 老审查的只读核查/PoC 与新轮 agent1 共享同一任务沙箱——新轮改文件时老审查读到的可能是"移动靶",PoC 与 agent1 命令可能争抢端口/进程,老审查结论可信度下降;② `review_status` 单字段在并行窗口内可能被老审查的收尾值(`done`/`failed`)短暂覆盖新轮的 `running`(侧栏 badge 短暂抖动,新轮审查结束自愈);③ `task.params["_grouping"]` 每轮覆盖,历史轮知识点的分组声明以最新轮为准
 - **review_status 状态模型**:`NULL`(未审查:单 agent / 老任务)/ `running`(审查中)/ `done`(完成)/ `failed`(失败,任务仍 COMPLETED)。启动迁移 `migrate_stale_review_status` 把遗留 `running` 置 `failed`(后端重启后审查线程已死)
 
 ### 1.3 交付物来源与上传链路(uploads → orchestrator)
@@ -719,7 +720,7 @@ list of `{label, header_name, header_value}`：
 | 交互类型 | 触发条件 | 传递方式 |
 |---------|---------|---------|
 | **运行中追加消息** | 用户在对话界面输入框发消息 | API 端点落库 `Conversation(role=user, type=message)` + 推 SSE；react_agent 每个迭代开头 `drain_user_messages` 注入 `messages` |
-| **完成后重启(resume)** | 任务 COMPLETED 后用户追加消息 / 点击建议「深挖」 | **原子路由 `register_pending_resume`**:审查进行中 → 消息排队(`queued_for_review=True` 立即返回),审查线程 `_finalize_review` 自动合并启动 resume(总线保持打开,SSE 不断线);queued resume 接管窗口内新消息按运行中入队;无审查 → 立即 `resume_audit_with_message`:用户消息原文直传 agent1 跑一轮(不经 agent2 转述) → 按轮次类型分流(纯对话轮直接收尾,分析轮再次后台审查)。多轮由用户驱动 |
+| **完成后重启(resume)** | 任务 COMPLETED 后用户追加消息 / 点击建议「深挖」 | 端点同步置 `RUNNING` 落库 + 启动 `resume_audit_with_message`(**追问直达 agent1,不等老审查**:老审查与新轮并行,done/finish 由最后活跃流收尾;总线:老审查在跑 → 不重置 SSE 不断线,上一轮已收尾 → 重置后启动;并发第二条消息按运行中语义入队,防双跑)。用户消息原文直传 agent1 跑一轮(不经 agent2 转述) → 按轮次类型分流(纯对话轮直接收尾,分析轮再次后台审查)。多轮由用户驱动 |
 
 ### 7.4 事件流（event_bus）
 

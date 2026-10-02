@@ -357,15 +357,14 @@ def _mk_completed_task(params=None):
     return task
 
 
-def _patch_router(monkeypatch, route="immediate", max_files=10):
+def _patch_router(monkeypatch, max_files=10):
     """屏蔽路由副作用,记录 launch_resume_thread 调用"""
     monkeypatch.setattr(settings, "UPLOAD_MAX_FILES_PER_MESSAGE", max_files)
     monkeypatch.setattr(tasks_router, "perf_log", lambda *a, **k: None)
     monkeypatch.setattr(tasks_router, "publish", lambda *a, **k: None)
     monkeypatch.setattr(tasks_router, "reset_task_bus", lambda *a, **k: None)
-    monkeypatch.setattr(
-        tasks_router, "register_pending_resume", lambda *a, **k: route,
-    )
+    # 上一轮已收尾(mock task 无总线记录 → is_task_finished=True → 走重置+启动)
+    monkeypatch.setattr(tasks_router, "is_task_finished", lambda tid: True)
     monkeypatch.setattr(
         tasks_router, "validate_upload_for_task",
         lambda uid, user_id: {
@@ -390,7 +389,7 @@ def _mk_db(task):
 
 def test_submit_message_completed_accumulates_and_launches(monkeypatch):
     """completed 追问带附件:累积进 params.followup_upload_ids 并透传给 resume 线程"""
-    launch_calls = _patch_router(monkeypatch, route="immediate")
+    launch_calls = _patch_router(monkeypatch)
     task = _mk_completed_task(params={"repo_url": "https://github.com/a/b"})
     req = SendMessageRequest(content="再看这个", upload_ids=["u1", "u2"])
 
@@ -405,7 +404,7 @@ def test_submit_message_completed_accumulates_and_launches(monkeypatch):
 
 def test_submit_message_completed_dedups_upload_ids(monkeypatch):
     """completed 追问附件去重保序"""
-    _patch_router(monkeypatch, route="immediate")
+    _patch_router(monkeypatch)
     task = _mk_completed_task(params={"followup_upload_ids": ["u0"]})
     req = SendMessageRequest(content="继续", upload_ids=["u1", "u1", "u2"])
 
@@ -417,7 +416,7 @@ def test_submit_message_completed_dedups_upload_ids(monkeypatch):
 
 def test_submit_message_completed_exceeds_limit_422(monkeypatch):
     """completed 追问附件超上限 → 422,不启动 resume"""
-    launch_calls = _patch_router(monkeypatch, route="immediate", max_files=1)
+    launch_calls = _patch_router(monkeypatch, max_files=1)
     task = _mk_completed_task()
     req = SendMessageRequest(content="超量", upload_ids=["u1", "u2"])
 
@@ -430,7 +429,7 @@ def test_submit_message_completed_exceeds_limit_422(monkeypatch):
 
 def test_submit_message_completed_no_attachments_keeps_params(monkeypatch):
     """completed 追问无附件:params 不新增 followup_upload_ids,resume upload_ids=None"""
-    launch_calls = _patch_router(monkeypatch, route="immediate")
+    launch_calls = _patch_router(monkeypatch)
     task = _mk_completed_task(params={"repo_url": "https://github.com/a/b"})
     req = SendMessageRequest(content="纯文字追问")
 

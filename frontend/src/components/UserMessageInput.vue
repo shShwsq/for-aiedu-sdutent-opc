@@ -37,8 +37,6 @@ const textareaRef = ref<HTMLTextAreaElement | null>(null)
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const sending = ref(false)
 const localError = ref('')
-/** 中性提示(非错误):核查中追问排队成功,等待自动处理 */
-const localHint = ref('')
 
 /**
  * 附件状态:选择即上传(uploadTaskFile),成功后计入可发送。
@@ -110,7 +108,6 @@ function autoResize(): void {
 
 function handleInput(): void {
   localError.value = ''
-  localHint.value = ''
   autoResize()
 }
 
@@ -210,10 +207,6 @@ async function handleSend(): Promise<void> {
     if (resp.accepted) {
       text.value = ''
       attachments.value = [] // 清空附件(含 error 项)
-      // 核查中排队:中性提示(非错误)——新一轮由后端审查结束后自动启动
-      localHint.value = resp.queued_for_review
-        ? '检查助手仍在核查中,消息已排队,核查结束后自动处理'
-        : ''
       emit('sent', resp)
       // 清空后重置高度 + 重新聚焦
       await nextTick()
@@ -340,7 +333,6 @@ async function handleSend(): Promise<void> {
       </button>
     </div>
     <p v-if="localError" class="msg-input-error">{{ localError }}</p>
-    <p v-else-if="localHint" class="msg-input-hint">{{ localHint }}</p>
   </div>
 </template>
 
@@ -545,14 +537,6 @@ async function handleSend(): Promise<void> {
 .msg-input-error {
   font-size: var(--fs-xs);
   color: var(--color-danger);
-  margin: 0;
-  padding: 0 var(--space-2);
-}
-
-/* 中性提示(核查中排队成功,非错误) */
-.msg-input-hint {
-  font-size: var(--fs-xs);
-  color: var(--color-info, var(--color-text-secondary));
   margin: 0;
   padding: 0 var(--space-2);
 }

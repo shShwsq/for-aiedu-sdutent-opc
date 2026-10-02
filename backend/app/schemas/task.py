@@ -210,9 +210,8 @@ class SendMessageRequest(BaseModel):
     用途:用户在任务运行中/暂停中/完成后追加指令或补充要求。
     后端按 task.status 分发:
     - running/paused:消息入队,react_agent 下一迭代注入 LLM 上下文
-    - completed:原子路由(register_pending_resume)—— 审查仍在核查时
-      消息排队(queued_for_review=True),审查结束后自动 resume;
-      无审查在跑时立即启动新一轮(resume_audit_with_message)
+    - completed:立即启动新一轮执行(追问直达 agent1,不等老审查;
+      老审查与新轮 agent1 并行,done/finish 由最后活跃流统一收尾)
     """
 
     content: str = Field(min_length=1, max_length=8000)
@@ -226,10 +225,6 @@ class SendMessageResponse(BaseModel):
 
     accepted: bool
     message: str = ""
-    # True=检查助手仍在核查中,消息已排队,核查结束后自动 resume。
-    # 前端据此保持 SSE 连接与当前展示(不切到"已启动新一轮"的乐观态),
-    # 新一轮由后端审查线程自动启动,事件经现有 SSE 连接继续送达
-    queued_for_review: bool = False
 
 
 # ============================================================
