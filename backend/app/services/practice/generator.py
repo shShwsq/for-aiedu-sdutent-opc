@@ -1,19 +1,21 @@
-"""题目生成:把审计任务的真实发现(Result)改编为客观练习题
+"""题目生成:把审查任务的真实发现(Result)改编为客观练习题
 
 流程:
 1. 取任务 Results(上限 max_findings 条,防 LLM 成本失控)
 2. 逐条 finding 调 LLM 生成 1~3 题:
-   - system prompt 按用户学习主题切换(security/architecture/coding)
-   - 提示词强制题目必须阅读真实代码才能作答(禁止常识题);
+   - system prompt 按发现内容自动匹配的主题切换
+     (security/architecture/coding/contract;规则先行 + LLM 批量兜底,
+     不再读用户级 learning_topic 设置)
+   - 提示词强制题目必须阅读真实材料(代码或文书原文)才能作答(禁止常识题);
      工作区可用时挂只读迷你工具循环(read_file / search_code / find_files),
-     要求出题前先读源码并记录 source_file/source_lines;
+     要求出题前先读材料并记录 source_file/source_lines;
      沙箱已清理且用户开启「出题前恢复工作区」时先重新 clone 恢复
 3. json_repair 容错解析 + 字段校验,失败重试 1 次,仍失败丢弃该 finding;
    工作区可用时无 code_snippet 的题判为不合格,带质量反馈重试 1 次后丢弃
 4. 致命错误快速失败:模型 401/403(额度耗尽/Key 失效)等不可重试错误
    立即中止剩余 finding,抛 PracticeGenerateError 由 job 层展示原因
 5. 知识点 get_or_create(优先 CWE 编号)+ 同用户 sha256 去重
-6. 落库为 draft(记录出题时主题与源码定位),前端预览确认后转 active
+6. 落库为 draft(记录出题时实际匹配的主题与源码定位),前端预览确认后转 active
 
 出题模型解析:task.llm_config_id > 用户级默认出题模型
 (practice_settings.default_llm_config_id) > env 默认,逐级回退;
@@ -23,6 +25,7 @@
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -32,10 +35,11 @@ from sqlalchemy.orm import Session
 import openai
 from app.llm.client import LLMClient
 from app.models.practice import (
-    DEFAULT_LEARNING_TOPIC,
     LEARNING_TOPIC_ARCHITECTURE,
     LEARNING_TOPIC_CODING,
+    LEARNING_TOPIC_CONTRACT,
     LEARNING_TOPIC_SECURITY,
+    LEARNING_TOPICS,
     THINKING_MODE_OFF,
     THINKING_MODE_ON,
     KnowledgePoint,
@@ -114,53 +118,72 @@ _CODING_TOPIC_HEAD = """你是一名通用编码能力培训出题专家。基�
 - 语言特性正确用法与工程最佳实践(测试、命名、API 设计)
 - knowledge_key 用英文短标识(如 "null_safety"、"exception_handling"、"n_plus_one_query")"""
 
+_CONTRACT_TOPIC_HEAD = """你是一名合同文书培训出题专家。基于给定的真实文书审查发现(合同/协议类条款),改编出考察条款判断力的客观题。
+
+## 出题视角
+- 条款不利识别:以下哪一句条款对你不利、哪条最值得警惕
+- 权责对等判断:单方面义务、责任与权利是否失衡
+- 付款与违约:付款条件模糊、违约金畸高或缺失的后果
+- 知识产权归属:成果归属、署名权、竞业限制的影响
+- 霸王条款识别:任意解除权、单方变更权、过度免责
+- knowledge_key 用英文短标识(如 "payment_terms"、"ip_ownership"、"unfair_clause")
+
+## 材料规则(文书题特有)
+- code_snippet 字段放**条款原文**(不是代码),截取与发现相关的完整句子
+- languages 固定给空数组 []
+- source_file 为文书文件路径(工作区内相对路径),source_lines 不适用时给 null"""
+
 _TOPIC_PROMPT_HEADS = {
     LEARNING_TOPIC_SECURITY: _SECURITY_TOPIC_HEAD,
     LEARNING_TOPIC_ARCHITECTURE: _ARCHITECTURE_TOPIC_HEAD,
     LEARNING_TOPIC_CODING: _CODING_TOPIC_HEAD,
+    LEARNING_TOPIC_CONTRACT: _CONTRACT_TOPIC_HEAD,
 }
 
 # 工作区可用时注入的工具说明段(工具实际可用与否与 sandbox 存活状态一致)
-_TOOL_SECTION = """## 源码查阅工具(仓库已 clone,必须使用)
-出题前必须先调工具查阅真实源码,禁止跳过直接出题:
-- read_file(file_path, max_lines?, offset?):读仓库文件(带行号,分页)
-- search_code(pattern, file_glob?, output_mode?):正则搜索代码;
+_TOOL_SECTION = """## 材料查阅工具(工作区已就绪,必须使用)
+出题前必须先调工具查阅真实材料(源码或文书原文),禁止跳过直接出题:
+- read_file(file_path, max_lines?, offset?):读工作区文件(带行号,分页)
+- search_code(pattern, file_glob?, output_mode?):正则搜索文件内容;
   output_mode="files_with_matches" 可快速定位含关键词的文件
-- find_files(pattern):按 glob 递归查文件路径(如 **/*.py)
+- find_files(pattern):按 glob 递归查文件路径(如 **/*.py 或 **/*.txt)
 要求:
-1. 每道题出题前至少 read_file 一次相关源文件,确认代码真实存在
-2. 真实代码题(origin=repo):题干与 code_snippet 必须引用读到的真实源码,
-   不得虚构,并给出 source_file(仓库内相对路径)与
+1. 每道题出题前至少 read_file 一次相关文件,确认材料真实存在
+2. 真实材料题(origin=repo):题干与 code_snippet 必须引用读到的真实内容,
+   不得虚构,并给出 source_file(工作区内相对路径)与
    source_lines(行区间如 "120-150" 或单行号 "42",取自 read_file 结果)
-3. 改编题(origin=synthetic):先读原代码确认问题形态,再原创虚构代码,
+3. 改编题(origin=synthetic):先读原文件确认问题形态,再原创虚构材料,
    不给 source_file/source_lines
-确实在仓库中找不到相关代码时,才退回基于发现描述出题(此时不给 source_file)。"""
+确实在工作区中找不到相关文件时,才退回基于发现描述出题(此时不给 source_file)。"""
 
-# 三主题共享的输出规则段
+# 各主题共享的输出规则段(代码/文书材料双轨)
 _COMMON_RULES = """## 通用要求
 1. 出 1~3 道题,题型限定:
-   - single_choice(单选):如「该代码片段存在哪种问题」「正确的改进方式是」
+   - single_choice(单选):如「该材料存在哪种问题」「正确的处理方式是」
    - true_false(判断):选项固定为 ["正确", "错误"],题干为一个可判定真伪的陈述
-2. 题目必须阅读代码才能作答:题干要落到具体代码细节(函数名、调用关系、
-   变量/字面量、分支逻辑等),禁止不看代码也能答对的通用概念题、常识题
-3. 代码片段单独放 code_snippet,必须自包含:含必要的函数签名、导入与上下文,
-   脱离原仓库也能读懂;题干不得依赖仓库特有路径、内部业务命名才可作答
-4. 出题形式由你自主决定,鼓励真实代码题与改编题混合:
-   - origin="repo"(真实代码题):基于发现中的真实代码/场景出题
-   - origin="synthetic"(改编题):原创一段含同类漏洞/问题的完整虚构代码,
-     业务场景与命名与原仓库完全不同,题干不得提及原仓库;考察用户把知识
-     泛化应用到新代码的能力
+2. 题目必须阅读材料才能作答:题干要落到具体材料细节(代码:函数名/调用关系/
+   变量/分支逻辑;文书:具体条款原文的措辞与限定),禁止不看材料也能答对的
+   通用概念题、常识题
+3. 材料片段单独放 code_snippet,必须自包含:代码题含必要的函数签名、导入与
+   上下文,文书题放相关条款的完整原句,脱离原文也能读懂;题干不得依赖
+   特有路径、内部命名才可作答
+4. 出题形式由你自主决定,鼓励真实材料题与改编题混合:
+   - origin="repo"(真实材料题):基于发现中的真实材料出题
+   - origin="synthetic"(改编题):原创一段含同类问题的完整虚构材料,
+     业务场景与命名与原项目完全不同,题干不得提及原项目;考察用户把知识
+     泛化应用到新材料的能力
 5. 干扰项要有迷惑性但明确错误,正确答案唯一
 6. explanation 讲清原理与改进要点,100 字以内
-7. difficulty 评估难度(1-5 整数):1=概念识别,3=需理解代码逻辑,5=需深入细节
-8. knowledge_name:知识点中文展示名(如 "SQL 注入")
-9. languages:该题涉及的全部编程语言,小写短名数组(如 ["python", "sql"])
+7. difficulty 评估难度(1-5 整数):1=概念识别,3=需理解材料逻辑,5=需深入细节
+8. knowledge_name:知识点中文展示名(如 "SQL 注入"、"付款条件模糊")
+9. languages:该题涉及的编程语言,小写短名数组(如 ["python", "sql"]);
+   文书类题目固定给空数组 []
 10. 元信息中若标注 verified: false 或判定为误报的发现,不要出题,直接返回空数组 []
 
 只输出 JSON 数组,不要任何其他文字。每个元素结构:
 {"qtype": "single_choice|true_false", "origin": "repo|synthetic",
  "stem": "...", "code_snippet": "...",
- "source_file": "仓库内相对路径"或null, "source_lines": "120-150"或null,
+ "source_file": "工作区内相对路径"或null, "source_lines": "120-150"或null,
  "options": ["...", "..."], "answer_idx": 0, "explanation": "...",
  "difficulty": 3, "knowledge_key": "...", "knowledge_name": "...",
  "languages": ["python", "sql"]}"""
@@ -174,6 +197,126 @@ def build_system_prompt(topic: str, workspace_available: bool) -> str:
         sections.append(_TOOL_SECTION)
     sections.append(_COMMON_RULES)
     return "\n\n".join(sections)
+
+
+# ============================================================
+# 主题自动匹配:规则先行 + LLM 批量兜底(不再是用户级设置)
+# ============================================================
+
+# metadata 值里的 CWE 编号模式(如 "CWE-89")
+_CWE_PATTERN = re.compile(r"CWE-\d+", re.IGNORECASE)
+
+_TOPIC_CLASSIFY_SYSTEM = """你是审查发现的主题分类器。对给定的每条发现,判断它最适合改编成哪种主题的练习题:
+- security:安全漏洞(注入、硬编码凭证、越权、SSRF、配置泄露等)
+- architecture:架构设计问题(分层、耦合、模块边界、设计模式、技术选型)
+- coding:通用代码质量问题(bug、边界条件、异常处理、性能、可读性、测试)
+- contract:合同文书问题(条款不利、权责失衡、付款违约、知识产权、霸王条款)
+
+只输出 JSON 数组,不要任何其他文字。每个元素:
+{"id": <发现序号,原样返回>, "topic": "security|architecture|coding|contract", "reason": "一句话理由"}"""
+
+
+def _match_topic_by_rule(task: Task, meta: dict | None) -> str | None:
+    """规则匹配单条发现的主题;判不定返回 None(交 LLM 批量分类)
+
+    只保留两条强规则,避免误伤:
+    1. 文书审核场景 → 全部 contract(场景级强信号)
+    2. metadata 带 CWE 编号(键名含 cwe 或值匹配 CWE-\\d)→ security
+    其余(如"知识点提炼"类发现常无 file_path,无法凭元信息区分代码/文书)
+    统一交 LLM 按内容判断。
+    """
+    # 场景强信号:文书审核任务全部按合同文书出题
+    if (task.scenario or "") == "document_review":
+        return LEARNING_TOPIC_CONTRACT
+    for k, v in (meta or {}).items():
+        if "cwe" in str(k).lower():
+            return LEARNING_TOPIC_SECURITY
+        if v and _CWE_PATTERN.search(str(v)):
+            return LEARNING_TOPIC_SECURITY
+    return None
+
+
+def _classify_topics_with_llm(
+    client: LLMClient, pending: list[tuple[int, Result]], task_id: str,
+) -> dict[int, str]:
+    """把规则未定的 findings 一次批量送 LLM 分类,返回 {序号: topic}
+
+    任何异常由调用方捕获降级;输出解析容错,个别条目非法只跳过该条。
+    """
+    items = []
+    for idx, f in pending:
+        items.append({
+            "id": idx,
+            "title": (f.title or "")[:200],
+            "content": (f.content or "")[:400],
+        })
+    user_prompt = (
+        "以下是待分类的发现列表(JSON 数组):\n"
+        + json.dumps(items, ensure_ascii=False)
+        + "\n请对每条判断出题主题,按系统要求的格式输出。"
+    )
+    messages: list[dict] = [
+        {"role": "system", "content": _TOPIC_CLASSIFY_SYSTEM},
+        {"role": "user", "content": user_prompt},
+    ]
+    content, _ = _stream_one_round(client, messages, None)
+    parsed = json.loads(repair_json(content))
+    result: dict[int, str] = {}
+    if isinstance(parsed, list):
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            try:
+                i = int(item.get("id"))
+            except (TypeError, ValueError):
+                continue
+            t = str(item.get("topic") or "").strip()
+            if t in LEARNING_TOPICS:
+                result[i] = t
+    return result
+
+
+def _match_finding_topics(
+    task: Task, findings: list[Result], client: LLMClient,
+) -> dict:
+    """逐 finding 匹配出题主题:规则先行,判不定的批量送 LLM 分类
+
+    返回 {finding.id: topic}。LLM 分类失败/条目缺失时降级 security
+    (原用户级默认主题,保证出题不中断)。异常静默降级,不阻断出题主流程。
+    """
+    topics: dict = {}
+    pending: list[tuple[int, Result]] = []
+    for idx, f in enumerate(findings):
+        t = _match_topic_by_rule(task, f.metadata_ or {})
+        if t:
+            topics[f.id] = t
+        else:
+            pending.append((idx, f))
+
+    if pending:
+        try:
+            classified = _classify_topics_with_llm(client, pending, str(task.id))
+        except Exception as e:
+            logger.warning(
+                "[practice] task=%s 主题 LLM 分类失败,全部降级 security: %s",
+                task.id, e,
+            )
+            classified = {}
+        for idx, f in pending:
+            topics[f.id] = classified.get(idx) or LEARNING_TOPIC_SECURITY
+
+    # 兜底:理论上不会缺,防御性补齐
+    for f in findings:
+        topics.setdefault(f.id, LEARNING_TOPIC_SECURITY)
+    return topics
+
+
+def _topic_stats(topic_map: dict) -> str:
+    """主题分布统计(日志用),如 "security:3,contract:2" """
+    counts: dict[str, int] = {}
+    for t in topic_map.values():
+        counts[t] = counts.get(t, 0) + 1
+    return ",".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "none"
 
 
 # ============================================================
@@ -727,7 +870,7 @@ def _parse_llm_questions(content: str, finding_meta: dict, finding_id=None) -> l
     return questions[:MAX_QUESTIONS_PER_FINDING]
 
 
-_FINDING_TEMPLATE = """以下是代码审计任务的一条真实发现:
+_FINDING_TEMPLATE = """以下是审查任务的一条真实发现(代码审计或文书审核):
 
 【标题】{title}
 
@@ -776,11 +919,11 @@ def _select_findings(
     return (marked + rest)[:max_findings]
 
 
-# 工作区可用但生成的题目全部缺代码上下文时,追加到 user prompt 重试的质量反馈
+# 工作区可用但生成的题目全部缺材料上下文时,追加到 user prompt 重试的质量反馈
 _NO_CODE_FEEDBACK = (
-    "\n\n【质量反馈】上一轮生成的题目缺少真实代码上下文,不看代码也能作答,不合格。"
-    "请先用源码查阅工具(read_file 等)读取相关源文件,再基于实际源码重新出题:"
-    "题干必须落到具体代码细节,每题必须带 code_snippet,并给出 source_file 与 source_lines。"
+    "\n\n【质量反馈】上一轮生成的题目缺少真实材料上下文,不看材料也能作答,不合格。"
+    "请先用材料查阅工具(read_file 等)读取相关文件,再基于实际材料重新出题:"
+    "题干必须落到具体材料细节,每题必须带 code_snippet,并给出 source_file 与 source_lines。"
 )
 
 
@@ -803,21 +946,17 @@ def generate_questions_for_task(
     if client is None:
         client = resolve_llm_client(db, task)
 
-    # 用户练习设置:学习主题决定提示词;是否允许出题前恢复工作区;
-    # 思考模式覆盖出题模型的思考开关
+    # 用户练习设置:是否允许出题前恢复工作区;思考模式覆盖出题模型的思考开关
+    # (学习主题已改为出题时按 finding 内容自动匹配,不再读取用户设置)
     settings_row = db.query(PracticeSettings).filter(
         PracticeSettings.user_id == user_id
     ).first()
     _apply_thinking_mode(client, settings_row)
-    topic = (
-        settings_row.learning_topic if settings_row else DEFAULT_LEARNING_TOPIC
-    )
 
     # 工作区:存活 → 挂工具循环;已清理 → 按设置尝试重新 clone
     # (restore 事件经 event_callback 推出题进度侧栏展示克隆进度)
     ws_info = _ensure_workspace(db, task, settings_row, event_callback=event_callback)
     repo_path = (ws_info or {}).get("repo_path") or ""
-    system_prompt = build_system_prompt(topic, workspace_available=bool(repo_path))
     task_id_str = str(task.id)
 
     # 选题:agent2 标记的学习点(practice_worthy)优先,不足补未标记的;
@@ -825,11 +964,19 @@ def generate_questions_for_task(
     findings = _select_findings(db, task, max_findings)
     total_findings = len(findings)
 
-    # 出题起始快照:模型/主题/工作区/发现数(排查无题产出时的第一手上下文)
+    # 主题自动匹配:规则先行 + LLM 批量兜底(每任务至多一次分类调用)
+    topic_map = _match_finding_topics(task, findings, client)
+    # 预构建各主题的 system prompt(工作区可用性统一判定)
+    system_prompts = {
+        t: build_system_prompt(t, workspace_available=bool(repo_path))
+        for t in set(topic_map.values())
+    }
+
+    # 出题起始快照:模型/主题分布/工作区/发现数(排查无题产出时的第一手上下文)
     logger.info(
-        "[practice] 开始出题 task=%s user=%s model=%s topic=%s workspace=%s findings=%d",
-        task.id, user_id, getattr(client, "model", "?"), topic,
-        bool(repo_path), total_findings,
+        "[practice] 开始出题 task=%s user=%s model=%s topics=%s workspace=%s findings=%d",
+        task.id, user_id, getattr(client, "model", "?"),
+        _topic_stats(topic_map), bool(repo_path), total_findings,
     )
 
     # 已有 dedup_hash(同用户),避免重复入库
@@ -841,9 +988,11 @@ def generate_questions_for_task(
 
     created: list[Question] = []
     skipped = 0
-    fatal_reason = ""  # 非空表示遇到不可重试致命错误,需中止并冒泡原因
+    fatal_reason = ""  # 非空表示遇到不可重试致命错误,需中止原因冒泡
     for idx, finding in enumerate(findings):
         meta = finding.metadata_ or {}
+        topic = topic_map[finding.id]
+        system_prompt = system_prompts[topic]
         if event_callback:
             try:
                 event_callback("finding", {
@@ -953,7 +1102,7 @@ def generate_questions_for_task(
                 difficulty=q["difficulty"],
                 status=QuestionStatus.DRAFT,
                 dedup_hash=dedup_hash,
-                learning_topic=topic,
+                learning_topic=topic,  # 该题实际匹配的出题主题
                 origin=q["origin"],
                 source_file=q["source_file"],
                 source_lines=q["source_lines"],

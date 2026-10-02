@@ -242,16 +242,20 @@ class Attempt(Base):
 
 
 # ============================================================
-# 学习主题(出题提示词按主题切换;用户级默认存 practice_settings,
-# 题目落库时记录出题当时的主题,便于后续按主题筛选/组卷)
+# 学习主题(出题提示词按主题切换;题目落库时记录出题实际采用的主题,
+# 便于后续按主题筛选/组卷)。
+# 主题在出题时按 finding 内容自动匹配(规则先行 + LLM 兜底),
+# 不再是用户级设置;practice_settings.learning_topic 列保留但已不读写。
 # ============================================================
 LEARNING_TOPIC_SECURITY = "security"          # 网络安全
 LEARNING_TOPIC_ARCHITECTURE = "architecture"  # 架构设计
 LEARNING_TOPIC_CODING = "coding"              # 通用代码能力
+LEARNING_TOPIC_CONTRACT = "contract"          # 合同文书
 LEARNING_TOPICS = (
     LEARNING_TOPIC_SECURITY,
     LEARNING_TOPIC_ARCHITECTURE,
     LEARNING_TOPIC_CODING,
+    LEARNING_TOPIC_CONTRACT,
 )
 DEFAULT_LEARNING_TOPIC = LEARNING_TOPIC_SECURITY
 
@@ -272,7 +276,7 @@ class PracticeSettings(Base):
 
     - auto_generate_practice:任务完成后是否自动生成练习题 draft
       (默认开启;产出仍需用户预览确认才转 active)
-    - learning_topic:当前希望学习的主题(出题提示词按此切换)
+    - learning_topic:(已废弃,列保留不迁移)出题主题现按 finding 自动匹配
     - restore_workspace_for_practice:出题前沙箱已清理时,
       是否重新 clone 仓库恢复工作区(供出题工具循环读源码)
     - default_llm_config_id:用户级默认出题模型(UserLLMConfig 中某条配置的 id),
@@ -302,7 +306,7 @@ class PracticeSettings(Base):
     auto_generate_practice: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="true", default=True
     )
-    # 当前学习主题(security/architecture/coding,默认 security)
+    # (已废弃,列保留不迁移)历史用户级学习主题;出题主题现按 finding 自动匹配
     learning_topic: Mapped[str] = mapped_column(
         String(32), nullable=False,
         server_default=DEFAULT_LEARNING_TOPIC, default=DEFAULT_LEARNING_TOPIC,

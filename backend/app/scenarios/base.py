@@ -40,6 +40,19 @@ class ScenarioTemplate(Protocol):
         ...
 
 
+# 场景别名:旧场景 id → 现行场景 id。
+# 场景合并/更名后,老任务记录里仍存旧 id(agent_policy 场景匹配、
+# 用户上传到旧场景目录的 skill 等),统一经 resolve_scenario_id 转换。
+SCENARIO_ALIASES: dict[str, str] = {
+    "code_security_audit": "code_review",  # 代码安全审计已并入代码审核
+}
+
+
+def resolve_scenario_id(scenario_id: str) -> str:
+    """把旧场景 id 解析为现行 id(无别名时原样返回)"""
+    return SCENARIO_ALIASES.get(scenario_id, scenario_id)
+
+
 # 场景模板注册表
 SCENARIOS: dict[str, "ScenarioTemplate"] = {}
 
@@ -50,7 +63,8 @@ def register_scenario(scenario: "ScenarioTemplate") -> None:
 
 
 def get_scenario(scenario_id: str) -> "ScenarioTemplate":
-    """获取场景模板,不存在则报错"""
+    """获取场景模板,不存在则报错(旧 id 经别名转换)"""
+    scenario_id = resolve_scenario_id(scenario_id)
     if scenario_id not in SCENARIOS:
         raise ValueError(
             f"未知场景: {scenario_id},已注册: {list(SCENARIOS.keys())}"

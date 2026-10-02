@@ -5,7 +5,7 @@
 ### 1.1 产品定位
 双智能体协作的代码分析平台,核心是 **agent1(执行智能体,前端「AI助手」)执行 + agent2(质检智能体,前端「检查助手」)后台审查(核查优先、建议深挖兜底)** 的协作模式,在单 ReAct 架构之上叠加结果审视能力。
 
-**场景降级后的定位变更**:系统不再绑定安全审计场景。agent2 按任务意图自行确定审查维度,prompt 通用化,工具全部开放,结果结构通用化。安全审计仅作为预设场景模板(快捷提示词 + 推荐 skill)之一,另含代码审查等场景。
+**场景降级后的定位变更**:系统不再绑定单一安全审计场景。agent2 按任务意图自行确定审查维度,prompt 通用化,工具全部开放,结果结构通用化。当前提供三个预设场景模板(快捷提示词 + 推荐 skill):通用 / 代码审核 / 文书审核。
 
 ### 1.2 核心架构
 ```
@@ -52,19 +52,21 @@
 不再承担:checklist(已随覆盖度清单功能移除,agent2 自行确定审查维度)、prompt(改为通用)、工具白名单(改为全部开放)、结果 schema(改为通用化)。
 
 ### 2.2 当前支持场景
-**场景一:代码安全审计**(`code_security_audit`)
-- 预设提示词:关注注入类、认证授权、反序列化、SSRF、配置泄露、XSS、路径穿越等
-- 推荐 skill:check_sql_injection / check_hardcoded_secrets / check_ssrf
+**场景一:通用**(`general`)
+- 无预设提示词,用户自行描述任务;无推荐 skill(前端语义为全部可用)
 
-**场景二:代码审查**(`code_review`)
-- 预设提示词:关注代码质量、可读性、正确性、性能等
-- 推荐 skill:review_concurrency(并发安全)/ review_error_handling(错误处理)/ review_test_quality(测试质量)
+**场景二:代码审核**(`code_review`)
+- 预设提示词:审查代码交付物敢不敢上线,关注安全漏洞(注入/硬编码凭证/认证授权/SSRF/配置泄露)、隐性成本(失控 API 调用/死循环烧钱)、可维护性(可读性/边界条件/异常处理/并发)、上线可行性
+- 推荐 skill:check_sql_injection / check_hardcoded_secrets / check_ssrf / review_error_handling / review_concurrency / review_test_quality
+- 说明:原「代码安全审计」(`code_security_audit`)已并入本场景,旧 id 经 `SCENARIO_ALIASES` 别名兼容(老任务/旧链接仍可达)
 
-**场景三:通用**(`general`)
-- 无预设提示词,用户自行描述任务
+**场景三:文书审核**(`document_review`)
+- 预设提示词:审核合同/协议文书敢不敢签,关注权责对等、付款与违约、知识产权归属、常见霸王条款,逐条定位到具体条款
+- 推荐 skill:无(前端语义为全部可用)
+- 说明:当前仅支持 txt/md 纯文本格式(docx/pdf 无解析),description 已引导用户上传文本格式
 
 ### 2.3 场景扩展预留
-用户在前端选择场景,后端加载对应预设提示词与推荐 skill。审查维度由 agent2 按用户意图自行确定,不依赖场景定义。
+用户在前端选择场景,后端加载对应预设提示词与推荐 skill。审查维度由 agent2 按用户意图自行确定,不依赖场景定义。场景合并/更名后,旧 id 经 `app/scenarios/base.py` 的 `SCENARIO_ALIASES` + `resolve_scenario_id()` 统一解析(get_scenario、agent_policy 场景默认、skills 路由入口均经别名转换)。
 
 ---
 
@@ -91,11 +93,11 @@ agent2 是**幕后质检者**(agent1 是台前回答者):其核查过程与知�
 ### 3.3 审查维度确定原则
 **变更说明**:覆盖度清单(第 0 轮生成 + 用户编辑确认)机制已移除,agent2 在评估时自行确定维度。
 
-- 根据用户意图自适应:安全审计任务覆盖安全维度(注入/认证/反序列化等),代码审查任务覆盖质量维度(可读性/正确性/性能等),其他任务按语义生成
+- 根据用户意图自适应:代码审核任务覆盖安全漏洞/隐性成本/可维护性/能否交付上线等维度,文书审核任务覆盖权责对等/付款违约/知识产权/霸王条款等维度,其他任务按语义生成
 - 维度应覆盖该任务类型的主要风险点,不遗漏重要类别
 - 维度 id 用英文下划线命名(如 injection / readability),name 用中文
 
-以下为安全审计场景的**参考维度**(agent2 实际按任务语义调整):
+以下为代码审核场景的**参考维度**(agent2 实际按任务语义调整):
 
 | 维度 | 必查子项(示例) | 高风险语言 |
 |------|------------------|------------|
@@ -514,10 +516,11 @@ Result(任务结果项,通用)
   - 系统内置:`GET /skills`(列出全部,含内置 + 各用户自己的)+ `POST /skills/reload`(管理员重新扫描)
   - 用户上传:`POST /skills/upload`(zip,含 `SKILL.md`)+ `DELETE /skills/{scenario_id}/{skill_name}`(只能删自己的)+ `PUT /skills/{scenario_id}/{skill_name}/SKILL.md`(在线编辑自己的 SKILL.md,热保存)
 - **react_agent 调用**:通过 `list_skills` 工具查看可用 skill(内置 + 当前用户上传的),通过 `skill` 工具加载指定 skill 的 body 到上下文,LLM 按其指引执行
-- **首版技能清单**(场景降级后按 scenario 组织,用户创建任务时可选 `allowed_skills` 过滤):
-  - `code_security_audit/check_sql_injection`(注入类)
-  - `code_security_audit/check_hardcoded_secrets`(硬编码密钥)
-  - `code_security_audit/check_ssrf`(SSRF)
+- **首版技能清单**(场景降级后按 scenario 组织,用户创建任务时可选 `allowed_skills` 过滤;均挂在 `code_review` 场景下):
+  - `code_review/check_sql_injection`(注入类)
+  - `code_review/check_hardcoded_secrets`(硬编码密钥)
+  - `code_review/check_ssrf`(SSRF)
+  - `code_review/review_error_handling`(错误处理)/ `code_review/review_concurrency`(并发安全)/ `code_review/review_test_quality`(测试质量)
 - **用户上传 skill 限制**(`backend/app/config.py`):
   - zip 最大:`SKILL_MAX_ZIP_SIZE_MB=50`
   - 解压后最大:`SKILL_MAX_EXTRACT_SIZE_MB=200`
@@ -731,7 +734,7 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 | `auto_generate.py` | 任务完成自动出题(受用户级偏好 `auto_generate_practice` 控制) |
 | `jobs.py` | 出题异步 job(后台线程,进度经 SSE 推送) |
 
-**三主题提示词**:网络安全 / 架构设计 / 通用代码能力(`practice_settings.topic`),不同主题仅影响 system prompt,生成流程不变。
+**四主题提示词(出题时自动匹配)**:网络安全 / 架构设计 / 通用代码能力 / 合同文书。主题不再是用户级设置,而是出题时逐 finding 自动匹配(规则先行:文书审核场景→contract、metadata 带 CWE→security;其余一次批量送 LLM 分类,失败降级 security)。不同主题仅影响 system prompt,生成流程不变;题目落库时 `Question.learning_topic` 记录实际采用主题。
 
 **出题上下文增强**:
 - **选题优先级**:agent2 标记的学习点(`metadata.practice_worthy=true`)优先且保持标记顺序,不足 `max_findings` 再按 created_at 补未标记的;无标记(单 agent 模式 / 老任务)行为与按 created_at 取前 N 条一致,向后兼容。含 `learning_note` 的发现注入出题提示,引导题目聚焦值得学的点

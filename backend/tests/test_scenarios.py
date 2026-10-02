@@ -1,0 +1,75 @@
+"""场景模板注册表测试:三场景齐全 + 旧 id 别名兼容。
+
+场景降级为纯快捷模板(preset_prompt + recommended_skills)。本测试锚定:
+- 注册表恰好含 general / code_review / document_review 三场景
+- code_security_audit 经别名解析到 code_review(resolve_scenario_id / get_scenario)
+- list_scenarios 输出结构供前端消费
+- 代码审核推荐合并后 6 个 skill;文书审核/通用无推荐 skill
+"""
+import pytest
+
+# 导入触发注册(register_scenario 在模块加载时执行)
+from app.scenarios import code_review, document_review, general  # noqa: F401
+from app.scenarios.base import (
+    SCENARIO_ALIASES,
+    get_scenario,
+    list_scenarios,
+    resolve_scenario_id,
+)
+
+
+def test_three_scenarios_registered():
+    """注册表恰好三场景:通用 / 代码审核 / 文书审核。"""
+    ids = {s["id"] for s in list_scenarios()}
+    assert ids == {"general", "code_review", "document_review"}
+
+
+def test_old_security_audit_id_resolves_to_code_review():
+    """旧 id code_security_audit 经别名解析到 code_review(老任务/skill 仍可达)。"""
+    assert resolve_scenario_id("code_security_audit") == "code_review"
+    assert SCENARIO_ALIASES["code_security_audit"] == "code_review"
+    # get_scenario 对旧 id 同样命中,不抛未知场景
+    assert get_scenario("code_security_audit").id == "code_review"
+
+
+def test_resolve_unknown_id_passthrough():
+    """无别名的 id 原样返回。"""
+    assert resolve_scenario_id("general") == "general"
+
+
+def test_unknown_scenario_raises():
+    with pytest.raises(ValueError):
+        get_scenario("not_a_scenario")
+
+
+def test_code_review_recommended_skills_merged():
+    """代码审核:合并安全审计后共 6 个 skill。"""
+    s = get_scenario("code_review")
+    assert s.name == "代码审核"
+    assert set(s.recommended_skills) == {
+        "check_sql_injection", "check_hardcoded_secrets", "check_ssrf",
+        "review_error_handling", "review_concurrency", "review_test_quality",
+    }
+
+
+def test_document_review_no_recommended_skills():
+    """文书审核:无推荐 skill(前端语义为全部可用),但有预设提示词。"""
+    s = get_scenario("document_review")
+    assert s.name == "文书审核"
+    assert s.recommended_skills == []
+    assert s.preset_prompt
+
+
+def test_general_scenario_empty_preset():
+    """通用场景:不预填提示词、无推荐 skill。"""
+    s = get_scenario("general")
+    assert s.preset_prompt == ""
+    assert s.recommended_skills == []
+
+
+def test_list_scenarios_shape():
+    """list_scenarios 每项含前端消费所需的固定字段。"""
+    for item in list_scenarios():
+        assert set(item) == {
+            "id", "name", "description", "preset_prompt", "recommended_skills",
+        }

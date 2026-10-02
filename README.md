@@ -16,10 +16,10 @@ Agent 1 starts executing directly on the user's task description; the task is ma
 - **Dual-agent collaboration**: Agent 1 executor (`react_agent` or an external CLI, shown as "AI Assistant") completes the task on finish, then Agent 2 inspector (verify-first background review, reference checking and learning-point tagging, shown as "Inspector") produces key knowledge points and suggested deep-dive directions; multiple rounds are user-driven (follow-up messages / clicking a suggestion), and disabling Agent 2 degrades to single-agent mode
 - **Executor abstraction layer**: Pluggable executors — built-in react_agent / Qoder CLI / DeepSeek Harness CLI (dsh) / Codex CLI — unified via the ACP protocol
 - **Deliverable uploads**: The task creation page offers three deliverable source tabs — Git repository / upload ZIP / upload single file. `upload_id` and `repo_url` are mutually exclusive; the task description is required in upload mode; ZIPs are protected against zip-slip with size limits. Uploading is optional — plain-text tasks work without one
-- **Scenario templating**: Security audit, code review, etc. as quick templates (preset prompts + recommended skills); the inspector defines its own review dimensions per task
+- **Scenario templating**: General, code review, and document review as quick templates (preset prompts + recommended skills); the inspector defines its own review dimensions per task
 - **Sandbox isolation**: Containerized execution based on [OpenSandbox](https://github.com/opensandbox/opensandbox); all tool calls run in an isolated environment
 - **Multi Git platform**: Unified abstraction layer supporting GitHub / Gitee — OAuth login + private repo binding + automatic cloning (Gitee access tokens auto-refresh via refresh_token)
-- **Practice questions & adaptive drills**: Turn real task findings into LLM-generated objective questions (security / architecture / general code ability topics), with SM-2 spaced repetition, weak-point reinforcement, and difficulty-matched session composition
+- **Practice questions & adaptive drills**: Turn real task findings into LLM-generated objective questions (security / architecture / general code ability / contract topics, auto-matched per finding at generation time), with SM-2 spaced repetition, weak-point reinforcement, and difficulty-matched session composition
 - **Streaming output**: Reasoning, tool calls, and plan checklists pushed to the frontend in real time
 - **Skill system**: Loadable expert SKILL.md directives, selectively enabled per task
 
@@ -44,7 +44,7 @@ SecondLook/
 │   │   ├── models/           # SQLAlchemy data models (incl. practice / agent_policy / task_artifact)
 │   │   ├── routers/          # API routes (auth / tasks / git_provider / uploads / practice / ...)
 │   │   ├── sandbox/          # OpenSandbox client wrapper
-│   │   ├── scenarios/        # Scenario templates (security audit / code review / general)
+│   │   ├── scenarios/        # Scenario templates (general / code review / document review)
 │   │   ├── schemas/          # Pydantic request/response models
 │   │   ├── services/         # Practice engine (SM-2 / selector / generator) + memory / workspace diff
 │   │   ├── skills/           # Skill loader + skill registry

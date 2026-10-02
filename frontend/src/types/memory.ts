@@ -22,8 +22,6 @@ export interface UserPreferenceOut {
   agent_policy: SaveAgentPolicyRequest | null
   /** 任务完成后是否自动生成练习题 draft(默认开;产出仍需预览确认) */
   auto_generate_practice: boolean
-  /** 当前学习主题(出题提示词按此切换) */
-  learning_topic: LearningTopic
   /** 出题前沙箱已清理时是否重新 clone 恢复工作区(默认关) */
   restore_workspace_for_practice: boolean
   /** 用户级默认出题模型(UserLLMConfig 配置 id;null=未设置,回退任务级/env 默认) */
@@ -36,9 +34,6 @@ export interface UserPreferenceOut {
   updated_at: string | null
 }
 
-/** 学习主题(出题视角切换) */
-export type LearningTopic = 'security' | 'architecture' | 'coding'
-
 /** 出题思考模式(覆盖出题模型配置的思考开关) */
 export type PracticeThinkingMode = 'follow' | 'on' | 'off'
 
@@ -49,13 +44,13 @@ export interface SaveUserPreferenceRequest {
 
 /** 保存练习设置请求(PUT /memory/preferences/practice body)
  *
- * learning_topic / restore_workspace_for_practice / default_llm_config_id /
+ * restore_workspace_for_practice / default_llm_config_id /
  * force_default_llm / thinking_mode_for_practice 可选,不传表示本次不修改
  * (后端 None 语义);default_llm_config_id 传空串表示清空(回退任务级/env 默认)。
+ * (learning_topic 已移除:出题主题改为按发现内容自动匹配)
  */
 export interface SavePracticeSettingsRequest {
   auto_generate_practice: boolean
-  learning_topic?: LearningTopic
   restore_workspace_for_practice?: boolean
   default_llm_config_id?: string | null
   force_default_llm?: boolean

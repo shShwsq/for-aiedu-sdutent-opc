@@ -130,7 +130,8 @@ class Settings(BaseSettings):
     # ---- 引用复核(check_reference,agent2 用)----
     # 场景命中且任务级 _agent_policy 未显式设置 allow_verify 时,自动开启
     # PoC 验证开关(实际跑 PoC 仍需任务配 test_env_url)。逗号分隔场景 id。
-    VERIFY_DEFAULT_SCENARIOS: str = "code_security_audit"
+    # (原 code_security_audit 已并入 code_review,旧 id 经别名同样命中)
+    VERIFY_DEFAULT_SCENARIOS: str = "code_review"
     # 引用复核抓取超时(秒,单跳 socket 级)
     REFERENCE_CHECK_TIMEOUT: int = 15
     # 引用复核响应体读取上限(字符,超出截断)

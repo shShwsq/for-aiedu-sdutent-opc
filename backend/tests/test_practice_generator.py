@@ -317,9 +317,10 @@ def _gen_db(finding_count=1, findings=None):
     return db
 
 
-def _gen_task():
+def _gen_task(scenario=None):
     return SimpleNamespace(
         id="t1", params={"repo_url": "https://example.com/r.git"},
+        scenario=scenario,
     )
 
 
@@ -464,6 +465,7 @@ def test_build_system_prompt_topic_switch():
     assert "网络安全培训出题专家" in build_system_prompt("security", False)
     assert "架构培训出题专家" in build_system_prompt("architecture", False)
     assert "通用编码能力培训出题专家" in build_system_prompt("coding", False)
+    assert "合同文书培训出题专家" in build_system_prompt("contract", False)
 
 
 def test_build_system_prompt_unknown_topic_falls_back_security():
@@ -471,22 +473,22 @@ def test_build_system_prompt_unknown_topic_falls_back_security():
 
 
 def test_build_system_prompt_tool_section_only_with_workspace():
-    assert "源码查阅工具" in build_system_prompt("security", True)
-    assert "源码查阅工具" not in build_system_prompt("security", False)
+    assert "材料查阅工具" in build_system_prompt("security", True)
+    assert "材料查阅工具" not in build_system_prompt("security", False)
 
 
 def test_build_system_prompt_common_rules_always_present():
-    for topic in ("security", "architecture", "coding"):
+    for topic in ("security", "architecture", "coding", "contract"):
         prompt = build_system_prompt(topic, True)
         assert "只输出 JSON 数组" in prompt
         assert "verified: false" in prompt  # 误报发现不出题提示
 
 
-def test_build_system_prompt_requires_code_reading_questions():
-    """通用规则强制题目必须阅读代码才能作答(禁常识题)"""
-    for topic in ("security", "architecture", "coding"):
+def test_build_system_prompt_requires_material_reading_questions():
+    """通用规则强制题目必须阅读材料(代码或条款原文)才能作答(禁常识题)"""
+    for topic in ("security", "architecture", "coding", "contract"):
         prompt = build_system_prompt(topic, False)
-        assert "必须阅读代码才能作答" in prompt
+        assert "必须阅读材料才能作答" in prompt
         assert "常识题" in prompt
 
 
@@ -501,11 +503,102 @@ def test_build_system_prompt_generalization_and_synthetic():
 
 
 def test_build_system_prompt_workspace_requires_source_location():
-    """工作区可用时:强制先读源码 + 输出要求 source_file/source_lines"""
+    """工作区可用时:强制先读材料 + 输出要求 source_file/source_lines"""
     prompt = build_system_prompt("security", True)
     assert "必须使用" in prompt  # 工具段从可选变强制
     assert "source_file" in prompt
     assert "source_lines" in prompt
+
+
+# ============================================================
+# 主题自动匹配(规则先行 + LLM 批量兜底;不再是用户级设置)
+# ============================================================
+
+
+def _plain_finding(fid, title="发现", meta=None):
+    """构造一条无 CWE 的 finding(规则判不定,交 LLM 分类)"""
+    return SimpleNamespace(
+        id=fid, title=title, content="若干描述", metadata_=meta or {},
+    )
+
+
+def test_match_topic_by_rule_document_review_scenario():
+    """文书审核场景 → 全部 contract(场景强信号,优先于 CWE)"""
+    task = _gen_task(scenario="document_review")
+    assert gen._match_topic_by_rule(task, {"cwe": "CWE-89"}) == "contract"
+    assert gen._match_topic_by_rule(task, {}) == "contract"
+
+
+def test_match_topic_by_rule_cwe_key_or_value():
+    """metadata 键名含 cwe 或值匹配 CWE-\\d → security"""
+    task = _gen_task(scenario="code_review")
+    assert gen._match_topic_by_rule(task, {"cwe": "89"}) == "security"
+    assert gen._match_topic_by_rule(task, {"ref": "见 CWE-79 说明"}) == "security"
+
+
+def test_match_topic_by_rule_undetermined_returns_none():
+    """无场景强信号且无 CWE → None(交 LLM 分类)"""
+    task = _gen_task(scenario="code_review")
+    assert gen._match_topic_by_rule(task, {"file_path": "a.py"}) is None
+    assert gen._match_topic_by_rule(task, {}) is None
+
+
+def test_match_finding_topics_rule_hits_skip_llm(monkeypatch):
+    """规则全部命中时不触发 LLM 分类调用"""
+    calls = []
+    monkeypatch.setattr(
+        gen, "_classify_topics_with_llm",
+        lambda *a, **k: calls.append(1) or {},
+    )
+    findings = [_mk_finding("a"), _mk_finding("b")]  # 均带 cwe → security
+    out = gen._match_finding_topics(_gen_task(), findings, MagicMock())
+    assert out == {"a": "security", "b": "security"}
+    assert not calls
+
+
+def test_match_finding_topics_llm_classifies_pending(monkeypatch):
+    """规则未定的 finding 批量送 LLM,按序号回填主题"""
+    findings = [
+        _plain_finding("p0", title="付款条件模糊"),
+        _plain_finding("p1", title="SQL 注入风险"),
+    ]
+
+    def fake_classify(client, pending, task_id):
+        return {
+            idx: ("contract" if "付款" in f.title else "security")
+            for idx, f in pending
+        }
+
+    monkeypatch.setattr(gen, "_classify_topics_with_llm", fake_classify)
+    out = gen._match_finding_topics(
+        _gen_task(scenario="code_review"), findings, MagicMock(),
+    )
+    assert out == {"p0": "contract", "p1": "security"}
+
+
+def test_match_finding_topics_llm_failure_degrades_security(monkeypatch):
+    """LLM 分类抛异常 → 全部降级 security,不阻断出题"""
+    def boom(*a, **k):
+        raise RuntimeError("llm down")
+
+    monkeypatch.setattr(gen, "_classify_topics_with_llm", boom)
+    findings = [_plain_finding("x")]
+    out = gen._match_finding_topics(_gen_task(), findings, MagicMock())
+    assert out == {"x": "security"}
+
+
+def test_question_learning_topic_records_matched(monkeypatch):
+    """文书审核场景出题:Question.learning_topic 落库为实际匹配主题 contract"""
+    import json
+
+    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
+    monkeypatch.setattr(
+        gen, "_call_llm", lambda *a, **k: json.dumps([_raw()], ensure_ascii=False),
+    )
+    created, _ = gen.generate_questions_for_task(
+        _gen_db(), _gen_task(scenario="document_review"), "u1", client=MagicMock(),
+    )
+    assert created and created[0].learning_topic == "contract"
 
 
 # ============================================================

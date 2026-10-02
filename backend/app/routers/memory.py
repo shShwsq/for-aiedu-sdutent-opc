@@ -28,7 +28,6 @@ from app.database import get_db
 from app.deps import get_current_user
 from app.models.agent_policy import AgentPolicy
 from app.models.practice import (
-    DEFAULT_LEARNING_TOPIC,
     DEFAULT_THINKING_MODE,
     PracticeSettings,
 )
@@ -99,12 +98,13 @@ def save_practice_settings(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> UserPreferenceOut:
-    """保存/更新练习设置(自动生成开关 / 学习主题 / 出题前恢复工作区 / 默认出题模型 / 思考模式)
+    """保存/更新练习设置(自动生成开关 / 出题前恢复工作区 / 默认出题模型 / 思考模式)
 
     存于 practice_settings 独立表(1:1),get_or_create:无行时自动创建。
-    learning_topic / restore_workspace_for_practice / default_llm_config_id /
+    restore_workspace_for_practice / default_llm_config_id /
     force_default_llm / thinking_mode_for_practice 可选:传 None 表示不修改;
     default_llm_config_id 传空串表示清空。
+    (learning_topic 已移除:出题主题按发现内容自动匹配)
     """
     # 默认出题模型归属校验:必须是当前用户已保存的 LLM 配置
     if req.default_llm_config_id:
@@ -132,8 +132,6 @@ def save_practice_settings(
         db.add(row)
     else:
         row.auto_generate_practice = req.auto_generate_practice
-    if req.learning_topic is not None:
-        row.learning_topic = req.learning_topic
     if req.restore_workspace_for_practice is not None:
         row.restore_workspace_for_practice = req.restore_workspace_for_practice
     if req.default_llm_config_id is not None:
@@ -145,10 +143,10 @@ def save_practice_settings(
     db.commit()
     db.refresh(row)
     logger.info(
-        "用户 %s 更新练习设置: auto_generate_practice=%s learning_topic=%s "
+        "用户 %s 更新练习设置: auto_generate_practice=%s "
         "restore_workspace=%s default_llm_config_id=%s force_default_llm=%s thinking_mode=%s",
         current_user.id, req.auto_generate_practice,
-        req.learning_topic, req.restore_workspace_for_practice,
+        req.restore_workspace_for_practice,
         row.default_llm_config_id, row.force_default_llm,
         row.thinking_mode_for_practice,
     )
@@ -327,7 +325,7 @@ def _build_preference_out(
 
     - user_profile 来自 user_preferences(可能无行)
     - agent_policy 来自 agent_policies 独立表(可能无行 → None,前端用系统默认)
-    - auto_generate_practice / learning_topic / restore_workspace_for_practice /
+    - auto_generate_practice / restore_workspace_for_practice /
       default_llm_config_id / force_default_llm / thinking_mode_for_practice
       来自 practice_settings 独立表(可能无行 → 用默认值)
     - updated_at 取各行中较新的(哪边最后保存,就算最后更新)
@@ -360,7 +358,6 @@ def _build_preference_out(
         user_profile=pref_row.user_profile if pref_row else "",
         agent_policy=policy_row.to_dict() if policy_row else None,
         auto_generate_practice=settings_row.auto_generate_practice if settings_row else True,
-        learning_topic=settings_row.learning_topic if settings_row else DEFAULT_LEARNING_TOPIC,
         restore_workspace_for_practice=(
             settings_row.restore_workspace_for_practice if settings_row else False
         ),

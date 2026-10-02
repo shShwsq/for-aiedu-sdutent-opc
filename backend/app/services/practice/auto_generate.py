@@ -27,8 +27,8 @@ def _has_structured_findings(db: Session, task_id) -> bool:
     """任务的 Results 中是否存在带元信息的结构化发现
 
     判定标准:metadata 为非空 dict(安全场景含 cwe/severity,
-    代码审查等场景含 category/file_path 等;出题提示词按用户
-    学习主题适配,不再限定只认 cwe/severity)。
+    代码审核等场景含 category/file_path 等,文书场景含条款定位;
+    出题主题按发现内容自动匹配,不限定只认 cwe/severity)。
     """
     results = db.query(Result.metadata_).filter(Result.task_id == task_id).all()
     for (meta,) in results:

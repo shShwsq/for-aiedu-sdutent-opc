@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from app.config import settings
 from app.deps import get_current_user, get_optional_user
 from app.models.user import User
+from app.scenarios.base import resolve_scenario_id
 from app.skills import loader as skill_loader
 from app.skills.loader import (
     DEFAULT_SKILLS_ROOT,
@@ -263,7 +264,12 @@ def list_scenario_skills(
     scenario_id: str,
     current_user: User | None = Depends(get_optional_user),
 ) -> list[SkillSummaryResponse]:
-    """列出某场景的 skill(他人的私有场景返回空列表,不泄露存在性)"""
+    """列出某场景的 skill(他人的私有场景返回空列表,不泄露存在性)
+
+    旧场景 id 经别名解析(如 code_security_audit → code_review),
+    使老任务/旧链接仍能查到合并后的 skill。
+    """
+    scenario_id = resolve_scenario_id(scenario_id)
     owner = scenario_owner_id(scenario_id)
     if owner is not None and owner != (current_user.id if current_user else None):
         return []
@@ -278,6 +284,7 @@ def get_skill_detail(
     current_user: User | None = Depends(get_optional_user),
 ) -> SkillResponse:
     """查看 skill 详情(含 body)"""
+    scenario_id = resolve_scenario_id(scenario_id)
     skill = skill_loader.REGISTRY.get(scenario_id, skill_name)
     if not skill:
         raise HTTPException(
@@ -298,6 +305,7 @@ def list_skill_files(
     current_user: User | None = Depends(get_optional_user),
 ) -> SkillFileListResponse:
     """列出 skill 目录内的文件(供管理界面文件列表)"""
+    scenario_id = resolve_scenario_id(scenario_id)
     skill = skill_loader.REGISTRY.get(scenario_id, skill_name)
     if not skill:
         raise HTTPException(
@@ -319,6 +327,7 @@ def read_skill_file(
     current_user: User | None = Depends(get_optional_user),
 ) -> SkillFileContentResponse:
     """读取 skill 目录内单个文件的文本内容(供管理界面文件预览/编辑)"""
+    scenario_id = resolve_scenario_id(scenario_id)
     skill = skill_loader.REGISTRY.get(scenario_id, skill_name)
     if not skill:
         raise HTTPException(

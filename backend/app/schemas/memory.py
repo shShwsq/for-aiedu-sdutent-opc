@@ -18,9 +18,6 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from app.models.practice import (
-    LEARNING_TOPIC_ARCHITECTURE,
-    LEARNING_TOPIC_CODING,
-    LEARNING_TOPIC_SECURITY,
     THINKING_MODE_FOLLOW,
     THINKING_MODE_OFF,
     THINKING_MODE_ON,
@@ -37,8 +34,6 @@ class UserPreferenceOut(BaseModel):
     agent_policy: dict[str, Any] | None = None
     # 任务完成后是否自动生成练习题 draft(默认开)
     auto_generate_practice: bool = True
-    # 当前学习主题(出题提示词按此切换,默认 security)
-    learning_topic: str = "security"
     # 出题前沙箱已清理时是否重新 clone 恢复工作区(默认关)
     restore_workspace_for_practice: bool = False
     # 用户级默认出题模型(UserLLMConfig 配置 id;None=未设置,回退任务级/env 默认)
@@ -64,8 +59,6 @@ class SavePracticeSettingsRequest(BaseModel):
 
     - auto_generate_practice:任务完成后是否自动生成练习题 draft
       (产出仍需用户在预览对话框确认才转 active)
-    - learning_topic:当前学习主题(security/architecture/coding),
-      出题提示词按此切换;None 表示本次不修改
     - restore_workspace_for_practice:出题前沙箱已清理时是否重新 clone
       恢复工作区;None 表示本次不修改
     - default_llm_config_id:用户级默认出题模型(UserLLMConfig 配置 id);
@@ -74,14 +67,11 @@ class SavePracticeSettingsRequest(BaseModel):
       None 表示本次不修改
     - thinking_mode_for_practice:出题思考模式覆盖(follow/on/off);
       None 表示本次不修改
+
+    (learning_topic 已移除:出题主题现按发现内容自动匹配)
     """
 
     auto_generate_practice: bool = True
-    learning_topic: Literal[
-        LEARNING_TOPIC_SECURITY,
-        LEARNING_TOPIC_ARCHITECTURE,
-        LEARNING_TOPIC_CODING,
-    ] | None = None
     restore_workspace_for_practice: bool | None = None
     default_llm_config_id: str | None = Field(default=None, max_length=36)
     force_default_llm: bool | None = None

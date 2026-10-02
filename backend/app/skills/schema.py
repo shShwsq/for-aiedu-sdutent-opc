@@ -16,7 +16,7 @@ class ParsedSkill(BaseModel):
     字段:
         name: skill 唯一标识(来自 frontmatter)
         description: 简短说明(来自 frontmatter,给 LLM 选 skill 时看)
-        scenario_id: 所属场景(从目录路径推断,如 code_security_audit)
+        scenario_id: 所属场景(从目录路径推断,如 code_review)
         skill_dir: skill 目录的绝对路径(可能含附加资源,如规则文件)
         body: SKILL.md 正文(frontmatter 之后的 Markdown 指令,LLM 执行时看)
         source_path: SKILL.md 绝对路径(管理 API 用)

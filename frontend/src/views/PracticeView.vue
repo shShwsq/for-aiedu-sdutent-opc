@@ -169,11 +169,11 @@ function showToast(msg: string, type: 'success' | 'error'): void {
 }
 
 // ============================================================
-// 练习设置弹窗(自动生成开关 / 学习主题 / 出题前恢复工作区 / 思考模式 / 默认出题模型,切换即保存)
+// 练习设置弹窗(自动生成开关 / 出题前恢复工作区 / 思考模式 / 默认出题模型,切换即保存)
+// (学习主题设置已移除:出题时按发现内容自动匹配主题)
 // ============================================================
 const settingsOpen = ref(false)
 const autoGenPractice = ref(true)
-const learningTopic = ref<'security' | 'architecture' | 'coding'>('security')
 const restoreWorkspace = ref(false)
 /** 出题思考模式(follow=跟随模型配置/on=强制开/off=强制关) */
 const thinkingMode = ref<PracticeThinkingMode>('follow')
@@ -190,7 +190,6 @@ async function loadPracticeSettings(): Promise<void> {
   try {
     const pref = await getPreferences()
     autoGenPractice.value = pref.auto_generate_practice
-    learningTopic.value = pref.learning_topic
     restoreWorkspace.value = pref.restore_workspace_for_practice
     thinkingMode.value = pref.thinking_mode_for_practice
     defaultModelId.value = pref.default_llm_config_id ?? ''
@@ -215,27 +214,6 @@ async function togglePracticeAuto(): Promise<void> {
     const latest = await savePracticeSettings({ auto_generate_practice: next })
     autoGenPractice.value = latest.auto_generate_practice
     showToast(next ? '已开启自动生成练习题' : '已关闭自动生成练习题', 'success')
-  } catch (err) {
-    settingsError.value = extractErrorMessage(err)
-  } finally {
-    autoGenLoading.value = false
-  }
-}
-
-/** 切换学习主题(出题提示词按主题切换出题视角) */
-async function selectTopic(topic: 'security' | 'architecture' | 'coding'): Promise<void> {
-  if (autoGenLoading.value || topic === learningTopic.value) return
-  autoGenLoading.value = true
-  settingsError.value = ''
-  try {
-    const latest = await savePracticeSettings({
-      auto_generate_practice: autoGenPractice.value,
-      learning_topic: topic,
-    })
-    learningTopic.value = latest.learning_topic
-    const label = topic === 'security' ? '网络安全'
-      : topic === 'architecture' ? '架构设计' : '通用代码能力'
-    showToast(`学习主题已切换为「${label}」`, 'success')
   } catch (err) {
     settingsError.value = extractErrorMessage(err)
   } finally {
@@ -1070,7 +1048,6 @@ onBeforeUnmount(() => {
     <PracticeSettingsDialog
       :open="settingsOpen"
       :auto-generate="autoGenPractice"
-      :learning-topic="learningTopic"
       :restore-workspace="restoreWorkspace"
       :thinking-mode="thinkingMode"
       :default-model-id="defaultModelId"
@@ -1080,7 +1057,6 @@ onBeforeUnmount(() => {
       :clearing="clearing"
       :error="settingsError"
       @toggle="togglePracticeAuto"
-      @topic="selectTopic"
       @toggle-restore="toggleRestoreWorkspace"
       @thinking="selectThinkingMode"
       @model="selectModel"

@@ -16,10 +16,10 @@ AI助手 直接按用户的任务描述开始执行,执行完即标记任务完�
 - **双智能体协作**:Agent 1 执行智能体(`react_agent` 或外部 CLI,前端显示「AI助手」)执行完即完成任务,Agent 2 质检智能体(核查优先的后台审查 + 引用复核 + 学习点标记,前端显示「检查助手」)随后产出重点知识点与建议深挖方向;多轮由用户驱动(追加消息 / 点建议深挖),关闭 Agent 2 退化为单 agent 模式
 - **执行器抽象层**:内置 react_agent / Qoder CLI / DeepSeek Harness CLI(dsh)/ Codex CLI 等可插拔执行器,通过 ACP 协议统一通信
 - **交付物上传**:任务创建页交付物来源三 Tab —— Git 仓库 / 上传 ZIP / 上传单文件;`upload_id` 与 `repo_url` 后端互斥,上传模式下任务说明必填,ZIP 有 zip-slip 防护与大小限制;上传为可选,不传时为纯文本任务
-- **场景模板化**:安全审计、代码审查等场景作为快捷模板(预设提示词 + 推荐 skill),审查维度由检查助手按任务意图自行确定
+- **场景模板化**:通用 / 代码审核 / 文书审核三场景作为快捷模板(预设提示词 + 推荐 skill),审查维度由检查助手按任务意图自行确定
 - **沙箱隔离**:基于 [OpenSandbox](https://github.com/opensandbox/opensandbox) 的容器化执行,工具调用在隔离环境完成
 - **多 Git 平台**:统一抽象层支持 GitHub / Gitee,OAuth 登录 + 私有仓库绑定 + 自动克隆(Gitee 令牌经 refresh_token 自动续期)
-- **练习题生成与自适应练习**:把任务真实发现经 LLM 改编为客观题(网络安全 / 架构设计 / 通用代码能力三主题),SM-2 遗忘曲线排期,结合薄弱点强化与难度匹配即时组卷
+- **练习题生成与自适应练习**:把任务真实发现经 LLM 改编为客观题(网络安全 / 架构设计 / 通用代码能力 / 合同文书四主题,出题时按发现内容自动匹配),SM-2 遗忘曲线排期,结合薄弱点强化与难度匹配即时组卷
 - **流式输出**:思考过程、工具调用、计划清单实时推送到前端
 - **技能系统**:可加载专家 SKILL.md 指令,按任务选择性启用
 
@@ -44,7 +44,7 @@ SecondLook/
 │   │   ├── models/           # SQLAlchemy 数据模型(含 practice / agent_policy / task_artifact)
 │   │   ├── routers/          # API 路由(auth / tasks / git_provider / uploads / practice / ...)
 │   │   ├── sandbox/          # OpenSandbox 客户端封装
-│   │   ├── scenarios/        # 场景模板(安全审计 / 代码审查 / 通用)
+│   │   ├── scenarios/        # 场景模板(通用 / 代码审核 / 文书审核)
 │   │   ├── schemas/          # Pydantic 请求/响应模型
 │   │   ├── services/         # 练习引擎(SM-2 / selector / generator)+ 记忆 / 工作区 diff
 │   │   ├── skills/           # 技能加载器 + skill 注册表

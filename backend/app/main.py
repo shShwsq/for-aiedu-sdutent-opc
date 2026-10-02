@@ -54,7 +54,7 @@ except Exception:  # 日志落盘失败不影响应用启动
 # 导入场景模块,触发注册(general 放首位 → 前端新建任务默认选中"通用")
 from app.scenarios import general  # noqa: F401
 from app.scenarios import code_review  # noqa: F401
-from app.scenarios import security_audit  # noqa: F401
+from app.scenarios import document_review  # noqa: F401
 
 # 阶段 5:启动时扫描所有 SKILL.md,加载到进程级注册表
 from app.skills.loader import reload_registry

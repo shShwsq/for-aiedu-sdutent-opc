@@ -56,7 +56,7 @@
 - **题目生成(generator.py)**:任务 Results 一键生成客观题(单选/判断),LLM 逐条 finding 生成 1~3 题(漏洞识别 / 成因判断 / 修复选择),严格 JSON + 重试 + 字段校验 + sha256 去重,草稿确认制(draft → active)。
 - **SM-2 遗忘曲线(sm2.py)**:答对 quality=4 / 答错 quality=1,EF 与间隔序列(1 → 6 → 前值×EF)标准实现,`due_at` 驱动到期复习。
 - **综合选题(selector.py)**:到期复习优先 > 薄弱点强化 > 难度匹配 > 新知识引入的加权打分,含同知识点 ≤60%、复习题占比 ≥50%、冷启动取难度 ≤2 新题等约束。
-- **三主题出题**:网络安全 / 架构设计 / 通用代码能力三套提示词;沙箱未销毁时注入源码 + 迷你工具循环(read_file/search_code/find_files)增强质量;沙箱过期可重新拉取工作区(默认关)。
+- **四主题出题(自动匹配)**:网络安全 / 架构设计 / 通用代码能力 / 合同文书四套提示词;主题不再是用户级设置,而是出题时逐 finding 自动匹配(规则先行 + LLM 一次批量兜底,失败降级 security);沙箱未销毁时注入材料(源码或文书原文) + 迷你工具循环(read_file/search_code/find_files)增强质量;沙箱过期可重新拉取工作区(默认关)。
 - **出题模型三级解析**:task 级 > 用户级默认(`practice_settings.default_llm_config_id`)> env 默认;思考模式三态覆盖(follow/on/off)。
 - **异步 job + SSE**:出题后台线程执行,`/practice/generate/{job_id}/stream` 推送进度;出题日志落盘 `logs/practice_generate.log`。
 - **前端**:PracticeView(练习首页 / 会话答题 / 统计趋势 / 题库管理)、出题进度侧栏、生成确认弹窗、练习设置弹窗;`PRACTICE_ENABLED` 功能开关前后端联动。
@@ -402,7 +402,7 @@ uvicorn app.main:app --reload
 - 题目生成(generator.py):任务 Results 逐条调 LLM 生成客观题(单选/判断),严格 JSON + 重试 + 字段校验 + 去重,草稿确认制
 - SM-2 遗忘曲线(sm2.py)+ 难度评估与能力估计(difficulty.py)
 - 综合选题(selector.py):到期复习优先 > 薄弱点强化 > 难度匹配 > 新知识引入
-- 三主题提示词(网络安全 / 架构设计 / 通用代码能力)+ 源码注入 + 迷你工具循环 + 工作区恢复
+- 四主题提示词(网络安全 / 架构设计 / 通用代码能力 / 合同文书,出题时自动匹配)+ 材料注入 + 迷你工具循环 + 工作区恢复
 - 出题模型三级解析(task > 用户级默认 > env)+ 思考模式三态覆盖
 - 异步出题 job + SSE 进度 + 出题日志落盘;任务完成自动出题(auto_generate)
 - 前端 PracticeView(练习 / 统计 / 题库管理)+ 出题进度侧栏 + 设置弹窗;`PRACTICE_ENABLED` 开关

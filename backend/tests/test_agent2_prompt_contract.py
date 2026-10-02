@@ -77,3 +77,14 @@ def test_review_prompt_reference_and_verify_sections_kept():
     assert "引用复核" in AGENT2_REVIEW_PROMPT
     assert "动态验证" in AGENT2_REVIEW_PROMPT
     assert "check_reference" in AGENT2_REVIEW_PROMPT
+
+
+def test_review_prompt_material_wording_generalized():
+    """去代码化措辞:核实依据/只读核查/定位泛化为“源码或文书原文”,
+    审查维度与新场景命名(代码审核/文书审核)对齐。"""
+    assert "真实依据(源码或原文引用)" in AGENT2_REVIEW_PROMPT
+    assert "核对工作区文件(源码或文书原文)" in AGENT2_REVIEW_PROMPT
+    assert "代码审核任务" in AGENT2_REVIEW_PROMPT
+    assert "文书审核任务" in AGENT2_REVIEW_PROMPT
+    # 旧的纯代码措辞已移除
+    assert "真实源码依据" not in AGENT2_REVIEW_PROMPT

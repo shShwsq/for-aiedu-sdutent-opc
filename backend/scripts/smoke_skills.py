@@ -144,8 +144,8 @@ def main():
     r = requests.delete(f"{BASE}/skills/{scenario}/smoke_test_skill", headers=bob_h)
     check("bob 删除他人 skill 403", r.status_code == 403, f"({r.status_code})")
 
-    # 8. alice 删除内置 skill → 403
-    r = requests.delete(f"{BASE}/skills/code_security_audit/check_ssrf", headers=alice_h)
+    # 8. alice 删除内置 skill → 403(check_ssrf 已随场景合并迁到 code_review)
+    r = requests.delete(f"{BASE}/skills/code_review/check_ssrf", headers=alice_h)
     check("删除内置 skill 403", r.status_code == 403, f"({r.status_code})")
 
     # 9. alice 删除自己的 skill → 204

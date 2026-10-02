@@ -69,7 +69,9 @@ def resolve_agent_policy(task: Task, db: Session) -> dict[str, Any]:
 
     # 场景默认:安全类任务自动开启 PoC 验证开关
     # (用户显式保存过策略会覆盖此值,任务级覆盖再覆盖用户级)
-    if (task.scenario or "") in verify_default_scenarios():
+    # 场景 id 经别名解析,老任务存的旧 id(如 code_security_audit)同样命中
+    from app.scenarios.base import resolve_scenario_id
+    if resolve_scenario_id(task.scenario or "") in verify_default_scenarios():
         defaults["allow_verify"] = True
 
     # 加载用户级默认(若用户已登录且保存过协作策略)

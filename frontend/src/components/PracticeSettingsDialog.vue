@@ -3,28 +3,26 @@
  * 练习设置弹窗
  *
  * 复用 PasswordDialog 的视觉语言(mask + card + header/body/footer)。
- * 五项设置(均为全局生效,切换/选中即保存):
+ * 四项设置(均为全局生效,切换/选中即保存):
  * - 自动生成练习题开关(产出的候选题仍需在任务详情页预览确认才入库)
- * - 学习主题:出题提示词按主题切换出题视角(网络安全/架构设计/通用代码能力)
  * - 出题前恢复工作区:沙箱已清理时重新 clone 仓库,供出题时查阅源码
  * - 出题思考模式:覆盖出题模型的思考开关(跟随配置/强制开/强制关)
  * - 默认出题模型:用户级默认(任务级配置优先,未设置则回退 env 默认);
  *   可开「始终用默认出题模型」忽略任务级配置
+ * (学习主题设置已移除:出题时按发现内容自动匹配主题)
  *
  * emit 由父组件调 API 持久化并 toast,父组件更新 props 后弹窗内状态同步。
  */
 import { computed, ref, watch } from 'vue'
 
 import type { LLMConfigItemOut } from '@/types/model_configs'
-import type { LearningTopic, PracticeThinkingMode } from '@/types/memory'
+import type { PracticeThinkingMode } from '@/types/memory'
 
 const props = defineProps<{
   /** 是否显示 */
   open: boolean
   /** 自动生成练习题当前开关状态 */
   autoGenerate: boolean
-  /** 当前学习主题 */
-  learningTopic: LearningTopic
   /** 出题前恢复工作区开关状态 */
   restoreWorkspace: boolean
   /** 出题思考模式(follow=跟随模型配置/on=强制开/off=强制关) */
@@ -45,7 +43,6 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'toggle'): void
-  (e: 'topic', topic: LearningTopic): void
   (e: 'toggle-restore'): void
   (e: 'thinking', mode: PracticeThinkingMode): void
   (e: 'model', configId: string): void
@@ -81,13 +78,6 @@ watch(
   },
 )
 
-/** 主题选项(与后端 LEARNING_TOPICS 对齐) */
-const TOPIC_OPTIONS: Array<{ value: LearningTopic; label: string; desc: string }> = [
-  { value: 'security', label: '网络安全', desc: '漏洞识别、成因判断、修复方式' },
-  { value: 'architecture', label: '架构设计', desc: '模块边界、设计模式、选型权衡' },
-  { value: 'coding', label: '通用代码能力', desc: 'bug 识别、代码坏味道、最佳实践' },
-]
-
 /** 思考模式选项(与后端 THINKING_MODES 对齐) */
 const THINKING_OPTIONS: Array<{ value: PracticeThinkingMode; label: string; desc: string }> = [
   { value: 'follow', label: '跟随模型配置', desc: '使用出题模型配置自身的思考开关(默认)' },
@@ -98,11 +88,6 @@ const THINKING_OPTIONS: Array<{ value: PracticeThinkingMode; label: string; desc
 function handleToggle(loading: boolean): void {
   if (loading) return
   emit('toggle')
-}
-
-function handleTopic(loading: boolean, topic: LearningTopic, current: LearningTopic): void {
-  if (loading || topic === current) return
-  emit('topic', topic)
 }
 
 function handleToggleRestore(loading: boolean): void {
@@ -173,32 +158,6 @@ function handleCancel(loading: boolean): void {
               >
                 <span class="switch-thumb" />
               </button>
-            </div>
-
-            <!-- 学习主题:出题提示词按主题切换出题视角,选中即保存 -->
-            <div class="setting-block">
-              <span class="setting-title">学习主题</span>
-              <span class="setting-desc">出题时按主题切换出题视角,生成贴合当前学习目标的题目</span>
-              <div class="topic-list" role="radiogroup" aria-label="学习主题">
-                <button
-                  v-for="opt in TOPIC_OPTIONS"
-                  :key="opt.value"
-                  type="button"
-                  role="radio"
-                  :aria-checked="learningTopic === opt.value"
-                  :class="['topic-option', { 'topic-active': learningTopic === opt.value }]"
-                  :disabled="busy"
-                  @click="handleTopic(busy, opt.value, learningTopic)"
-                >
-                  <span class="topic-radio">
-                    <span v-if="learningTopic === opt.value" class="topic-radio-dot" />
-                  </span>
-                  <span class="topic-text">
-                    <span class="topic-label">{{ opt.label }}</span>
-                    <span class="topic-desc">{{ opt.desc }}</span>
-                  </span>
-                </button>
-              </div>
             </div>
 
             <div class="setting-row" @click="handleToggleRestore(busy)">
@@ -500,7 +459,7 @@ function handleCancel(loading: boolean): void {
   line-height: var(--lh-relaxed);
 }
 
-/* ---- 学习主题 ---- */
+/* ---- 单选设置块(思考模式等) ---- */
 .setting-block {
   display: flex;
   flex-direction: column;
