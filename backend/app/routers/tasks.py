@@ -599,10 +599,12 @@ def submit_task_message(
     - pending / failed:拒绝(任务未启动或已失败)
 
     消息统一落库为 Conversation(role=user, type=message):
-    - 运行中/暂停中:round_idx = 当前最大 round(react_agent 下一迭代边界注入)
+    - 运行中/暂停中:round_idx = 当前最大 round(react_agent 下一迭代边界注入);
+      推送 user_message_pending 事件(输入框上方待处理条目,TRAE 式),
+      消费时刻由 react_agent 补推 conversation 事件进入对话流
     - 完成后:round_idx = 当前最大 round + 1(归入即将开始的新轮,
-      与 resume 的分析评估/首轮 react 执行共享轮号,消息位于轮首与回应连续展示)
-    并推送 SSE conversation 事件,前端实时追加到对话流。
+      与 resume 的分析评估/首轮 react 执行共享轮号,消息位于轮首与回应连续展示);
+      立即推送 conversation 事件进入对话流
     """
     task = db.get(Task, task_id)
     if not task:
@@ -680,9 +682,9 @@ def submit_task_message(
     db.commit()
     db.refresh(conv)
 
-    def _publish_user_message() -> None:
-        """推送用户消息 conversation 事件(SSE 实时追加到对话流)"""
-        publish(task.id, "conversation", {
+    def _publish_user_message(event_type: str = "conversation") -> None:
+        """推送用户消息事件(conversation=入流;user_message_pending=待处理)"""
+        publish(task.id, event_type, {
             "id": str(conv.id),
             "round_idx": conv.round_idx,
             "role": conv.role,
@@ -707,7 +709,10 @@ def submit_task_message(
 
     # 状态分发
     if task.status in (TaskStatus.RUNNING, TaskStatus.PAUSED):
-        _publish_user_message()
+        # 待处理事件(不入对话流):消息以 pending 状态展示在输入框上方
+        # (TRAE 式),agent1 消费(drain)时才由 react_agent 推 conversation
+        # 事件进入对话流 —— 避免插在 agent1 执行中的对话中间
+        _publish_user_message(event_type="user_message_pending")
         # 入队,react_agent 下一迭代 drain
         push_user_message(
             task.id, content,

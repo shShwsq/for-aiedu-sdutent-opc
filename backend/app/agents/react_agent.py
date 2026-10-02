@@ -410,11 +410,39 @@ def run_react_agent(
 
         # 用户补充消息检查点:drain 队列,若有则注入到 LLM 上下文
         # 用户在对话界面输入框发的消息(运行中/暂停中场景),已由 API 端点
-        # 落库为 Conversation(role=user, type=message)并推送 SSE,
-        # 这里只把它注入到当前 LLM 上下文 messages,让模型在下一迭代看到。
+        # 落库为 Conversation(role=user, type=message)。发送时仅推
+        # user_message_pending 事件(输入框上方待处理条目,TRAE 式),
+        # 消费时刻在此补推 conversation 事件 —— 消息在 agent 实际处理的
+        # 位置进入对话流,而非插在执行中的对话中间。
         # 多条消息合并为一条 user 消息(按时间顺序),避免上下文碎片化。
         pending_user_msgs = drain_user_messages(task.id)
         if pending_user_msgs:
+            # 补推 conversation 事件(待处理条目 → 对话流;失败仅记录)
+            try:
+                _msg_ids = [
+                    uuid.UUID(m["message_id"])
+                    for m in pending_user_msgs if m.get("message_id")
+                ]
+                _drained_convs = (
+                    db.query(Conversation)
+                    .filter(Conversation.id.in_(_msg_ids))
+                    .all()
+                ) if _msg_ids else []
+                for c in _drained_convs:
+                    publish(task.id, "conversation", {
+                        "id": str(c.id),
+                        "round_idx": c.round_idx,
+                        "role": c.role,
+                        "type": c.type,
+                        "content": c.content,
+                        "reasoning": c.reasoning,
+                        "attachments": c.attachments,
+                        "created_at": c.created_at.isoformat() if c.created_at else None,
+                    })
+            except Exception as _pub_err:
+                logger.warning(
+                    f"[task={task.id}] 消费消息入流事件推送失败(忽略): {_pub_err}"
+                )
             # 本批消息附带的上传文件:传输进工作区 followup_uploads/(不重定向
             # repo_path),并把目录级提示并入注入文本,让模型感知新文件。
             # 传输失败 catch+log,不中断本轮(文字消息照常注入)。

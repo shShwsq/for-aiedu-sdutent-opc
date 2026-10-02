@@ -79,6 +79,12 @@ const error = ref('')
 let eventSource: EventSource | null = null
 /** 刚发起 resume/retry 的窗口标志:onDone 触发时校验是否竞态误推用 */
 const resumingRef = ref(false)
+/**
+ * 运行中发送、尚未被 agent1 消费的用户补充消息(TRAE 式待处理条目,
+ * 展示在输入框上方)。消费时收到同 id 的 conversation 事件 → 转入对话流。
+ * SSE 历史补播可重建(刷新后快照里它在流中,pending 事件到达时移出)
+ */
+const pendingUserMessages = ref<Conversation[]>([])
 /** 组件已卸载标志(onDone 异步窗口内防止泄漏新 SSE 连接) */
 let unmountedFlag = false
 /** 对话流容器引用,用于自动滚动到底部 */
@@ -572,8 +578,34 @@ function connectSSE(taskId: string): void {
         task.value.current_stage = data.current_stage
       }
     },
+    onUserMessagePending: (data) => {
+      if (!task.value) return
+      // 刷新场景:快照里该消息已在对话流中(落库即入快照),移出改为待处理条目
+      const idx = task.value.conversations.findIndex((c) => c.id === data.id)
+      if (idx !== -1) task.value.conversations.splice(idx, 1)
+      // 去重加入(SSE 历史补播 + 实时事件可能重复到达)
+      if (!pendingUserMessages.value.some((m) => m.id === data.id)) {
+        pendingUserMessages.value.push({
+          id: data.id,
+          round_idx: data.round_idx,
+          role: data.role,
+          type: data.type,
+          content: data.content,
+          reasoning: data.reasoning ?? null,
+          tool_call_id: null,
+          attachments: data.attachments ?? null,
+          created_at: data.created_at || new Date().toISOString(),
+        })
+      }
+    },
     onConversation: (data) => {
       if (!task.value) return
+      // 用户补充消息被 agent1 消费(drain 注入):待处理条目转入对话流
+      if (data.role === 'user' && data.type === 'message') {
+        pendingUserMessages.value = pendingUserMessages.value.filter(
+          (m) => m.id !== data.id,
+        )
+      }
       // 追加到对话列表
       // 注意:agent1 的 type=thinking 不走 SSE 推送(已在流式卡片展示),
       // 这里收到的都是其他类型(工具调用/结果/提交/用户指令/agent2 评估等)
@@ -715,9 +747,10 @@ function connectSSE(taskId: string): void {
       } catch (err) {
         console.error('拉取最终结果失败:', err)
       }
-      // 清除克隆进度条(任务结束)
+      // 清除克隆进度条(任务结束)+ 待处理条目(队列已被后端清理)
       cloneProgress.value = null
       skipClonePending.value = false
+      pendingUserMessages.value = []
       // 任务完成时后端刚写入工作区 diff,重拉一次展示(失败兜底,静默)
       void loadArtifact(taskId)
     },
@@ -735,9 +768,10 @@ function connectSSE(taskId: string): void {
         task.value.status = 'failed'
         task.value.error_message = data.error_message || '执行失败'
       }
-      // 清除克隆进度条(任务失败)
+      // 清除克隆进度条(任务失败)+ 待处理条目(队列已被后端清理)
       cloneProgress.value = null
       skipClonePending.value = false
+      pendingUserMessages.value = []
     },
   })
 }
@@ -1007,6 +1041,8 @@ function resetTaskState(): void {
   historyReasoningExpanded.clear()
   // 重置 resume 窗口标志(防止跨任务误触发 onDone 校验)
   resumingRef.value = false
+  // 清空待处理消息条目(旧任务的)
+  pendingUserMessages.value = []
   // 重置任务视图态
   task.value = null
   loading.value = true
@@ -2703,6 +2739,35 @@ function toggleResult(id: string): void {
         @saved="handleRuntimeConfigSaved"
       />
 
+      <!-- 运行中发送的待处理消息(TRAE 式:输入框上方待处理条目,
+           agent1 消费时经 conversation 事件转入对话流) -->
+      <div
+        v-if="task && (task.status === 'running' || task.status === 'paused') && pendingUserMessages.length"
+        class="pending-messages"
+      >
+        <div
+          v-for="msg in pendingUserMessages"
+          :key="msg.id"
+          class="pending-message-chip"
+          :title="msg.content"
+        >
+          <svg
+            class="pending-message-icon"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <circle cx="12" cy="12" r="10" />
+            <polyline points="12 6 12 12 16 14" />
+          </svg>
+          <span class="pending-message-text">{{ truncateInput(msg.content, 60) }}</span>
+          <span class="pending-message-tag">待处理</span>
+        </div>
+      </div>
+
       <!-- 用户补充消息输入框(running/paused/completed 可见,pending 隐藏) -->
       <UserMessageInput
         v-if="task && (task.status === 'running' || task.status === 'paused' || task.status === 'completed')"
@@ -3359,6 +3424,49 @@ function toggleResult(id: string): void {
   padding: var(--space-3);
   box-shadow: var(--shadow-md);
   background: var(--color-danger-light);
+}
+
+/* 运行中发送的待处理消息(TRAE 式:输入框上方待处理条目) */
+.pending-messages {
+  width: 94%;
+  margin: 0 auto var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.pending-message-chip {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-1) var(--space-2);
+  background: var(--color-bg-secondary, var(--color-bg));
+  color: var(--color-text-secondary);
+  font-size: var(--fs-xs);
+}
+
+.pending-message-icon {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
+.pending-message-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-message-tag {
+  flex-shrink: 0;
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  opacity: 0.75;
 }
 
 .retry-bar-text {

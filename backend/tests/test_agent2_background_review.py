@@ -548,6 +548,17 @@ def test_leftover_messages_auto_resume_new_round(monkeypatch):
     latest = MagicMock()
     latest.round_idx = 2
     db.query.return_value.filter.return_value.order_by.return_value.first.return_value = latest
+    # 挪轮后回查的遗留消息记录(接管时刻补推 conversation 入流)
+    moved_a, moved_b = MagicMock(), MagicMock()
+    moved_a.id, moved_b.id = "moved-a", "moved-b"
+    moved_a.content, moved_b.content = "第一条遗留", "第二条遗留"
+    for mv in (moved_a, moved_b):
+        mv.round_idx = 3
+        mv.role = "user"
+        mv.type = "message"
+        mv.reasoning = None
+        mv.attachments = None
+    db.query.return_value.filter.return_value.all.return_value = [moved_a, moved_b]
 
     m1, m2 = str(uuid.uuid4()), str(uuid.uuid4())
     try:
@@ -571,6 +582,12 @@ def test_leftover_messages_auto_resume_new_round(monkeypatch):
         u_args, u_kwargs = update_mock.call_args
         assert u_args[0] == {"round_idx": 3}
         assert u_kwargs.get("synchronize_session") is False
+        # 接管时刻补推 conversation 事件(消息进入新轮首的对话流,
+        # 前端待处理条目随之清除;审查结论卡也走 conversation,按 role=user 过滤)
+        user_conv_events = [
+            c for c in rec.events("conversation") if c[2].get("role") == "user"
+        ]
+        assert [c[2]["content"] for c in user_conv_events] == ["第一条遗留", "第二条遗留"]
         # 附件累积进 params(沙箱回收后的重放依据)
         assert task.params["followup_upload_ids"] == ["u1", "u2", "u3"]
         # 审查照常完成(review_done),但新流活跃 → 不推 done/finish

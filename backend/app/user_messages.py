@@ -2,8 +2,9 @@
 
 场景:用户在对话界面下方的输入框主动发消息(非 agent2 提问弹窗的回答)。
 后端按 task.status 分发:
-- running / paused:消息入队,react_agent 在下一迭代边界 drain 出来,
-  作为新的 user 消息注入 LLM 上下文(即时介入当前 round)
+- running / paused:消息入队(端点推 user_message_pending 事件,前端以
+  "待处理"条目展示在输入框上方,TRAE 式),react_agent 在下一迭代边界
+  drain 出来注入 LLM 上下文,并在消费时刻补推 conversation 事件入流
 - completed:不入队,由 API 端点直接启动新的协作 round
   (resume_audit_with_message,消息直达 agent1,不等老审查)
 

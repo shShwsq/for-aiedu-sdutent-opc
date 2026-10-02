@@ -181,9 +181,11 @@ def test_submit_message_completed_syncs_running(monkeypatch):
 
 
 def test_submit_message_running_no_thread(monkeypatch):
-    """running 追问:只入队,不启动 resume 线程、不改状态。"""
+    """running 追问:只入队,不启动 resume 线程、不改状态;
+    推 user_message_pending(输入框上方待处理条目)而非 conversation
+    (消费时刻才由 react_agent 补推入流)。"""
     db, task, task_id = _mk_db_and_task(TaskStatus.RUNNING)
-    launched, _, _ = _patch_endpoint_env(monkeypatch)
+    launched, published, _ = _patch_endpoint_env(monkeypatch)
 
     resp = tasks_module.submit_task_message(
         task_id, SendMessageRequest(content="补充要求"), db, None,
@@ -192,6 +194,9 @@ def test_submit_message_running_no_thread(monkeypatch):
     assert len(launched) == 0
     assert task.status == TaskStatus.RUNNING  # 原样保持
     assert resp.accepted is True
+    # 待处理事件(不入对话流)
+    assert any(e == "user_message_pending" for e, _ in published)
+    assert not any(e == "conversation" for e, _ in published)
 
 
 def test_submit_message_during_review_starts_immediately(monkeypatch):

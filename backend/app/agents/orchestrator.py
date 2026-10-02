@@ -831,6 +831,30 @@ def _auto_resume_leftover_messages(task: Task, db: Session, task_id_str: str) ->
                 Conversation.id.in_(msg_uuids)
             ).update({"round_idx": new_round}, synchronize_session=False)
             db.commit()
+            # 补推 conversation 事件:发送时仅推了 user_message_pending
+            # (输入框上方待处理条目),接管时刻让消息进入对话流(新轮首)
+            # —— 前端待处理条目随之清除(失败仅记录)
+            try:
+                moved_convs = (
+                    db.query(Conversation)
+                    .filter(Conversation.id.in_(msg_uuids))
+                    .all()
+                )
+                for c in moved_convs:
+                    publish(task.id, "conversation", {
+                        "id": str(c.id),
+                        "round_idx": c.round_idx,
+                        "role": c.role,
+                        "type": c.type,
+                        "content": c.content,
+                        "reasoning": c.reasoning,
+                        "attachments": c.attachments,
+                        "created_at": c.created_at.isoformat() if c.created_at else None,
+                    })
+            except Exception as pub_err:
+                logger.warning(
+                    f"[task={task.id}] 遗留消息入流事件推送失败(忽略): {pub_err}"
+                )
         # 附件累积进 params(沙箱回收后的重放依据,与端点立即路径一致)
         merged_uploads: list[str] = []
         for m in leftover:

@@ -225,6 +225,7 @@ export type SSEEventType =
   | 'connected'
   | 'conversation'
   | 'conversation_update'
+  | 'user_message_pending'
   | 'status'
   | 'thinking_delta'
   | 'clone_progress'
@@ -271,6 +272,13 @@ export interface ConversationUpdateEventData {
   id: string
   content: string
 }
+
+/**
+ * user_message_pending 事件 data:运行中发送的用户补充消息(已落库、已入队,
+ * 尚未被 agent1 消费)。前端以"待处理"条目展示在输入框上方(TRAE 式),
+ * 消费时收到同 id 的 conversation 事件 → 条目转入对话流
+ */
+export type UserMessagePendingEventData = ConversationEventData
 
 /** status 事件 data */
 export interface StatusEventData {

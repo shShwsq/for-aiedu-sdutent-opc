@@ -303,10 +303,24 @@ def test_react_agent_exit_guard_continues_on_pending(monkeypatch):
     monkeypatch.setattr(react_agent, "get_all_tools", lambda: [])
     monkeypatch.setattr(react_agent, "wait_if_paused", lambda *a, **k: None)
     monkeypatch.setattr(react_agent, "perf_log", lambda *a, **k: None)
-    monkeypatch.setattr(react_agent, "publish", lambda *a, **k: None)
+    published = []
+    monkeypatch.setattr(
+        react_agent, "publish",
+        lambda t, etype, data=None: published.append((etype, data)),
+    )
     monkeypatch.setattr(
         react_agent, "_add_conversation", lambda *a, **k: MagicMock(id="c"),
     )
+    # drain 发布时按 message_id 回查 Conversation(mock 返回对应记录)
+    drained_conv = MagicMock()
+    drained_conv.id = "drained-conv-id"
+    drained_conv.round_idx = 1
+    drained_conv.role = "user"
+    drained_conv.type = "message"
+    drained_conv.content = "看这个新要求"
+    drained_conv.reasoning = None
+    drained_conv.attachments = None
+    db.query.return_value.filter.return_value.all.return_value = [drained_conv]
 
     try:
         _results, summary, _plan = react_agent.run_react_agent(
@@ -324,6 +338,12 @@ def test_react_agent_exit_guard_continues_on_pending(monkeypatch):
             and "看这个新要求" in (m.get("content") or "")
         ]
         assert injected
+        # 消费时刻补推 conversation 事件:消息在 agent 实际处理的位置入流
+        # (发送时仅推 user_message_pending,由 API 端点负责)
+        conv_events = [d for e, d in published if e == "conversation"]
+        assert len(conv_events) == 1
+        assert conv_events[0]["content"] == "看这个新要求"
+        assert conv_events[0]["role"] == "user"
         # summary 为第二次的答案(含对用户消息的回应)
         assert summary == "第二个答案"
         # 队列已清空(无遗留)

@@ -729,7 +729,8 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 | 事件类型 | 触发者 | 用途 |
 |---------|--------|------|
 | `status` | orchestrator | 任务状态变更（status + current_stage） |
-| `conversation` | orchestrator / react_agent / CLI agent / verifier_agent | 新对话记录（thinking / tool_call / tool_result / evaluation / question / summary / error；verifier 落库带 `verify=true`） |
+| `conversation` | orchestrator / react_agent / CLI agent / verifier_agent | 新对话记录（thinking / tool_call / tool_result / evaluation / question / summary / error；verifier 落库带 `verify=true`）。用户补充消息在**被 agent1 消费(drain)的时刻**由 react_agent 补推（遗留接管时由 `_auto_resume_leftover_messages` 补推），在 agent 实际处理的位置入流 |
+| `user_message_pending` | tasks API 端点 | 运行中/暂停中发送的用户补充消息（已落库入队、未被消费）：前端以"待处理"条目展示在输入框上方（TRAE 式），消费时经同 id 的 `conversation` 事件转入对话流；事件入总线历史，刷新后经 SSE 补播重建待处理状态 |
 | `conversation_update` | CLI agent | 更新已有 conversation 的 content（节流推送，如工具调用参数增量） |
 | `thinking_delta` | agent2 / react_agent / CLI agent / verifier_agent | 流式思考增量（phase: start / reasoning / content / error / end；verifier 带 `role=agent2, verify=true`） |
 | `plan` | react_agent / CLI agent | plan 状态更新（round_idx + steps） |
