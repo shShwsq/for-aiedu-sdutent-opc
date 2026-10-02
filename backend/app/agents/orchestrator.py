@@ -62,7 +62,7 @@ from app.security import decrypt_secret
 from app.tools import sandbox_tools
 from app.tools.schema import set_current_git_tokens, set_current_task
 from app.agent_policy import resolve_agent_policy
-from app.user_messages import clear_user_messages
+from app.user_messages import clear_user_messages, drain_user_messages
 from app.user_interaction import clear_pending_command_confirm, clear_pending_verify_action
 
 logger = logging.getLogger(__name__)
@@ -390,6 +390,10 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
                 results_count=all_results_count,
             )
 
+            # 遗留用户消息自动续轮(先于终止 end-scope:有遗留时新流注册
+            # scope,下方 end-scope 看到活跃流不推 done,SSE 不断线)
+            _auto_resume_leftover_messages(task, db, task_id_str)
+
             # 事件活跃期收尾:推 done + 关总线(仅当无并行流;
             # 判定与推送在 _end_event_scope 锁内原子完成,消除竞态)
             _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
@@ -510,6 +514,11 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         # 任务本体已完成:finally 不再兜底推 error
         # (审查失败属于 review_status=failed,不是任务失败)
         normal_completed = True
+
+        # 遗留用户消息自动续轮(执行期间最后迭代之后到达、未被 drain 的):
+        # 挪到新轮并立即启动新一轮,与本轮后台审查并行(不等审查)——
+        # 新流先注册 scope,审查收尾的 end-scope 看到活跃流不推 done
+        _auto_resume_leftover_messages(task, db, task_id_str)
 
         # ---------- 后台审查(同一线程;失败只影响 review_status) ----------
         # 审查期间用户追问可并行启动新一轮 resume(不等审查):
@@ -697,6 +706,9 @@ def _finish_conversation_round(
     emit(TASK_COMPLETED, task.id, mode=mode, rounds=rounds)
     perf_log(task.id, "agent1_done", rounds=rounds, conversation_round=True)
     publish(task.id, "agent1_done", {"status": "completed"})
+    # 遗留用户消息自动续轮(先于终止 end-scope:有遗留时新流注册 scope,
+    # 下方 end-scope 看到活跃流不推 done,SSE 不断线)
+    _auto_resume_leftover_messages(task, db, str(task.id))
     _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
 
 
@@ -777,6 +789,77 @@ def _replace_interim_results(
         db.add(r)
     db.commit()
     return len(interim)
+
+
+def _auto_resume_leftover_messages(task: Task, db: Session, task_id_str: str) -> bool:
+    """轮结束后自动续跑遗留的用户补充消息(未被 react_agent drain 的)
+
+    遗留窗口:① 最后一次迭代 drain 之后到达(最终答案生成期间的消息由
+    react_agent 循环出口守卫同轮消化,此处兜底收尾阶段的漏网);② CLI
+    执行器(acp)本身无 drain 机制,执行期间的消息全部遗留 —— 若不在
+    此处处理,会在流结束的清理组被 clear_user_messages 静默丢弃
+    (前端已显示但 agent1 从未见过,即"发了没反应"缺陷)。
+
+    处理:遗留消息的 Conversation 从当前轮挪到新轮(round_idx=max+1,
+    避免与本轮临时结果/知识点撞轮号),多条合并(\n\n 连接、附件去重)
+    后 launch_resume_thread 自动开启新一轮。
+
+    调用时机:必须在流的终止 _end_event_scope 之前 —— 新流先注册
+    scope,本流收尾看到活跃流 → 不推 done/不关总线,前端 SSE 不断线,
+    新轮事件经现有连接无缝续达(与"核查中追问并行"同一语义)。
+
+    返回 True 表示已启动新一轮(调用方的终止事件让位给新流收尾)。
+    """
+    leftover = drain_user_messages(task.id)
+    if not leftover:
+        return False
+    try:
+        # 挪轮:遗留消息落库在当前轮(运行中入队语义),归入新轮首
+        # (与端点 completed 分支的 max+1 落轮规则一致)
+        latest = (
+            db.query(Conversation)
+            .filter(Conversation.task_id == task.id)
+            .order_by(Conversation.round_idx.desc())
+            .first()
+        )
+        new_round = (latest.round_idx + 1) if latest else 1
+        msg_uuids = [
+            uuid.UUID(m["message_id"]) for m in leftover if m.get("message_id")
+        ]
+        if msg_uuids:
+            db.query(Conversation).filter(
+                Conversation.id.in_(msg_uuids)
+            ).update({"round_idx": new_round}, synchronize_session=False)
+            db.commit()
+        # 附件累积进 params(沙箱回收后的重放依据,与端点立即路径一致)
+        merged_uploads: list[str] = []
+        for m in leftover:
+            for uid in (m.get("upload_ids") or []):
+                if uid and uid not in merged_uploads:
+                    merged_uploads.append(uid)
+        if merged_uploads:
+            existing = list((task.params or {}).get("followup_upload_ids") or [])
+            for uid in merged_uploads:
+                if uid not in existing:
+                    existing.append(uid)
+            task.params = {**(task.params or {}), "followup_upload_ids": existing}
+            db.commit()
+        merged = "\n\n".join(m.get("content") or "" for m in leftover).strip()
+        if not merged:
+            return False
+        logger.info(
+            f"[task={task.id}] 遗留用户消息 {len(leftover)} 条,"
+            f"自动开启新一轮处理(round={new_round})"
+        )
+        launch_resume_thread(
+            task_id_str, merged,
+            upload_ids=merged_uploads or None,
+        )
+        return True
+    except Exception as e:
+        # 兜底:自动续跑失败不阻塞本流收尾(与旧静默清理行为一致,仅记录)
+        logger.warning(f"[task={task.id}] 遗留消息自动续跑失败(忽略): {e}")
+        return False
 
 
 def _run_background_review(
@@ -1717,6 +1800,11 @@ def resume_audit_with_message(
         # 任务本体已完成:finally 不再兜底推 error(审查失败≠任务失败)
         normal_completed = True
 
+        # 遗留用户消息自动续轮(执行期间最后迭代之后到达、未被 drain 的):
+        # 挪到新轮并立即启动新一轮,与本轮后台审查并行(不等审查)——
+        # 新流先注册 scope,审查收尾的 end-scope 看到活跃流不推 done
+        _auto_resume_leftover_messages(task, db, task_id_str)
+
         # ---------- 后台审查(同一线程;失败只影响 review_status) ----------
         # 老审查(若未结束)与本流并行:各自落库自己轮次,done/finish 由
         # 最后活跃流的 _end_event_scope 统一收尾。
@@ -1905,6 +1993,9 @@ def _finish_resume(
     # 领域事件:任务完成(resume/重试续跑路径)
     emit(TASK_COMPLETED, task.id, mode="resume", rounds=len(react_summaries))
 
+    # 遗留用户消息自动续轮(先于终止 end-scope:有遗留时新流注册 scope,
+    # 下方 end-scope 看到活跃流不推 done,SSE 不断线)
+    _auto_resume_leftover_messages(task, db, str(task.id))
     # 事件活跃期收尾:推 done + 关总线(仅当无并行流)
     _end_event_scope(task.id, flow_gen, ("done", {"status": "completed"}))
 

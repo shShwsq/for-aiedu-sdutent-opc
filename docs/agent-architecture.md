@@ -719,7 +719,7 @@ list of `{label, header_name, header_value}`：
 
 | 交互类型 | 触发条件 | 传递方式 |
 |---------|---------|---------|
-| **运行中追加消息** | 用户在对话界面输入框发消息 | API 端点落库 `Conversation(role=user, type=message)` + 推 SSE；react_agent 每个迭代开头 `drain_user_messages` 注入 `messages` |
+| **运行中追加消息** | 用户在对话界面输入框发消息 | API 端点落库 `Conversation(role=user, type=message)` + 推 SSE；react_agent 每个迭代开头 `drain_user_messages` 注入 `messages`。**遗留兜底**(消息不被静默丢弃):① 循环出口守卫——最终答案生成期间到达的消息,react_agent 不退出循环,下一迭代注入同轮继续处理;② `_auto_resume_leftover_messages`——轮结束后仍遗留的消息(收尾窗口到达 / CLI 执行器无 drain 机制),挪到新轮(`round_idx=max+1`,避免与本轮知识点撞轮号)并自动启动新一轮,合并文本(`\n\n`)+ 去重附件 + 累积进 `params.followup_upload_ids`;调用点在终止 `_end_event_scope` 之前,新流注册 scope 后本流不推 done,SSE 不断线 |
 | **完成后重启(resume)** | 任务 COMPLETED 后用户追加消息 / 点击建议「深挖」 | 端点同步置 `RUNNING` 落库 + 启动 `resume_audit_with_message`(**追问直达 agent1,不等老审查**:老审查与新轮并行,done/finish 由最后活跃流收尾;总线:老审查在跑 → 不重置 SSE 不断线,上一轮已收尾 → 重置后启动;并发第二条消息按运行中语义入队,防双跑)。用户消息原文直传 agent1 跑一轮(不经 agent2 转述) → 按轮次类型分流(纯对话轮直接收尾,分析轮再次后台审查)。多轮由用户驱动 |
 
 ### 7.4 事件流（event_bus）

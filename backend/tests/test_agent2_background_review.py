@@ -13,6 +13,7 @@
 - 临时结果助手 _replace_interim_results:按轮清理后落单条
 """
 import json
+import uuid
 from unittest.mock import MagicMock
 
 import app.models.task_artifact  # noqa: F401  (mapper 依赖)
@@ -20,6 +21,7 @@ import app.models.user_git_binding  # noqa: F401
 
 import app.agents.orchestrator as orchestrator
 from app.models.task import Conversation, Result, TaskStatus
+from app.user_messages import clear_user_messages, push_user_message
 
 
 # ============================================================
@@ -497,11 +499,87 @@ def test_no_parallel_flow_publishes_done(monkeypatch):
 
     _patch_env(monkeypatch, executor, lambda *a, **k: _mk_review_result())
     rec = _EventRecorder(monkeypatch)
+    launched = []
 
-    orchestrator.run_dual_agent_audit(task, MagicMock())
+    def _fake_launch(tid, msg, upload_ids=None):
+        launched.append((tid, msg, upload_ids))
+
+    monkeypatch.setattr(orchestrator, "launch_resume_thread", _fake_launch)
+
+    try:
+        orchestrator.run_dual_agent_audit(task, MagicMock())
+    finally:
+        clear_user_messages(str(task.id))
 
     assert rec.index("review_done") < rec.index("done")  # done 照常
     assert rec.index("done") < rec.index(("finish",))    # finish 照常
+    assert launched == []  # 无遗留消息 → 不自动续轮
+
+
+# ============================================================
+# 遗留用户消息自动续轮:执行期间未被 drain 的消息不静默丢弃
+# ============================================================
+
+
+def test_leftover_messages_auto_resume_new_round(monkeypatch):
+    """执行期间遗留(未被 drain)的用户消息 → 轮结束自动挪到新轮并
+    launch_resume_thread(合并文本 + 去重附件 + 累积进 params);
+    新流注册 scope 后审查收尾不推 done/不关总线(SSE 不断线)。"""
+    task = _mk_task()
+    task.params = {}
+    executor = MagicMock()
+    executor.name = "builtin"
+    executor.run = MagicMock(return_value=([], "总结", []))
+
+    _patch_env(monkeypatch, executor, lambda *a, **k: _mk_review_result())
+    rec = _EventRecorder(monkeypatch)
+
+    launched = []
+
+    def _fake_launch(tid, msg, upload_ids=None):
+        # 模拟真实行为:线程启动前同步注册 scope(新流活跃)
+        orchestrator._begin_event_scope(tid)
+        launched.append((tid, msg, upload_ids))
+
+    monkeypatch.setattr(orchestrator, "launch_resume_thread", _fake_launch)
+
+    # db mock:最新 Conversation round_idx=2 → 遗留消息挪到新轮 3
+    db = MagicMock()
+    latest = MagicMock()
+    latest.round_idx = 2
+    db.query.return_value.filter.return_value.order_by.return_value.first.return_value = latest
+
+    m1, m2 = str(uuid.uuid4()), str(uuid.uuid4())
+    try:
+        push_user_message(
+            str(task.id), "第一条遗留",
+            message_id=m1, created_at="t1", upload_ids=["u1", "u2"],
+        )
+        push_user_message(
+            str(task.id), "第二条遗留",
+            message_id=m2, created_at="t2", upload_ids=["u2", "u3"],
+        )
+        orchestrator.run_dual_agent_audit(task, db)
+
+        # 自动续轮:合并文本(\n\n)+ 附件去重保序
+        assert launched == [
+            (str(task.id), "第一条遗留\n\n第二条遗留", ["u1", "u2", "u3"]),
+        ]
+        # 遗留消息的 Conversation 挪到新轮(round 2 → 3)
+        update_mock = db.query.return_value.filter.return_value.update
+        update_mock.assert_called_once()
+        u_args, u_kwargs = update_mock.call_args
+        assert u_args[0] == {"round_idx": 3}
+        assert u_kwargs.get("synchronize_session") is False
+        # 附件累积进 params(沙箱回收后的重放依据)
+        assert task.params["followup_upload_ids"] == ["u1", "u2", "u3"]
+        # 审查照常完成(review_done),但新流活跃 → 不推 done/finish
+        assert rec.events("review_done")
+        assert not rec.events("done")
+        assert rec.index(("finish",)) == -1
+    finally:
+        _clear_scopes(str(task.id))
+        clear_user_messages(str(task.id))
 
 
 def test_dual_audit_failure_error_before_finish(monkeypatch):

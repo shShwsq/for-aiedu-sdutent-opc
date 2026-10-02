@@ -4,8 +4,13 @@
 后端按 task.status 分发:
 - running / paused:消息入队,react_agent 在下一迭代边界 drain 出来,
   作为新的 user 消息注入 LLM 上下文(即时介入当前 round)
-- completed:不入队(任务已结束),由 API 端点直接启动新的协作 round
-  (resume_audit_with_message),先调 agent2 分析这条消息
+- completed:不入队,由 API 端点直接启动新的协作 round
+  (resume_audit_with_message,消息直达 agent1,不等老审查)
+
+遗留消息兜底(未被 drain 的入队消息不被静默丢弃):
+- react_agent 循环出口守卫:最终答案生成期间到达的消息 → 继续本轮处理
+- orchestrator._auto_resume_leftover_messages:轮结束后仍遗留的消息
+  (收尾窗口到达 / CLI 执行器无 drain 机制)→ 挪到新轮自动开启新一轮
 
 设计要点:
 - 与 user_interaction.py 的阻塞-唤醒机制(如验证动作授权)不同,这里是

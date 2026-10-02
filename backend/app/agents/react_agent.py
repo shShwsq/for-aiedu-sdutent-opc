@@ -30,7 +30,7 @@ from app.models.task import Conversation, Task
 from app.pause_controller import wait_if_paused
 from app.perf import perf_log
 from app.tools.schema import execute_tool, get_all_tools, set_current_task
-from app.user_messages import drain_user_messages
+from app.user_messages import drain_user_messages, has_pending_messages
 
 logger = logging.getLogger(__name__)
 
@@ -526,6 +526,15 @@ def run_react_agent(
         # finish_reason=length 是被 max_tokens 截断,模型没说完,不算主动结束
         # (降级处理:用现有 content 作 summary,记录 warning)
         if not tool_calls_full:
+            # 遗留消息守卫:最终答案生成期间(本迭代 drain 之后)到达的用户
+            # 消息 → 不结束,继续循环让下一迭代顶部 drain+注入 —— 模型在
+            # 同轮上下文里立刻看到消息并继续处理(而非留到队列无人消费)
+            if has_pending_messages(task.id):
+                logger.info(
+                    f"[task={task.id}] react_agent 最终答案后仍有用户补充消息,"
+                    f"继续本轮处理(迭代 {iteration} → {iteration + 1})"
+                )
+                continue
             if finish_reason == "length":
                 logger.warning(
                     f"[task={task.id}] react_agent 第 {round_idx} 轮/迭代 {iteration} "

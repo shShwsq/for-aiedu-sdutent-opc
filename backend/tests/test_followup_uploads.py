@@ -261,6 +261,119 @@ def test_format_injected_appends_attachment_note():
     assert text.endswith(note)
 
 
+# ============================================================
+# react_agent 循环出口守卫:最终答案期间到达的消息同轮继续处理
+# ============================================================
+
+
+def test_react_agent_exit_guard_continues_on_pending(monkeypatch):
+    """窗口 1 修复:最终答案生成期间(本迭代 drain 之后)到达的用户消息
+    → 循环不退出,下一迭代顶部 drain+注入,模型在同轮上下文里继续处理
+    (而非遗留队列、被流结束清理静默丢弃)。"""
+    import app.agents.react_agent as react_agent
+
+    tid = "task-guard-1"
+    task = MagicMock()
+    task.id = tid
+    task.params = {}
+    task.user_id = None
+    task.scenario = "general"
+    task.user_input = "初始任务"
+    db = MagicMock()
+    # 幂等落库查询返回非 None → 跳过 question 重复落库
+    db.query.return_value.filter.return_value.first.return_value = MagicMock()
+
+    clear_user_messages(tid)
+    llm_contexts: list[list] = []
+
+    def _fake_stream(client, task, db, round_idx, iteration, messages, tools):
+        llm_contexts.append(list(messages))
+        if len(llm_contexts) == 1:
+            # 第一次 LLM 调用期间:用户发来补充消息(drain 已过,留在队列)
+            push_user_message(
+                tid, "看这个新要求",
+                message_id=str(uuid.uuid4()),
+                created_at="2026-01-01T00:00:00",
+            )
+            return ("思考1", "第一个答案", [], "stop", "c1")
+        return ("思考2", "第二个答案", [], "stop", "c2")
+
+    monkeypatch.setattr(react_agent, "_stream_llm_response", _fake_stream)
+    monkeypatch.setattr(react_agent, "set_current_task", lambda *a, **k: None)
+    monkeypatch.setattr(react_agent, "get_all_tools", lambda: [])
+    monkeypatch.setattr(react_agent, "wait_if_paused", lambda *a, **k: None)
+    monkeypatch.setattr(react_agent, "perf_log", lambda *a, **k: None)
+    monkeypatch.setattr(react_agent, "publish", lambda *a, **k: None)
+    monkeypatch.setattr(
+        react_agent, "_add_conversation", lambda *a, **k: MagicMock(id="c"),
+    )
+
+    try:
+        _results, summary, _plan = react_agent.run_react_agent(
+            task, db, round_idx=1, followup_query=None,
+            client=MagicMock(), repo_context=None, previous_plan=None,
+        )
+
+        # LLM 被调两次:第一次出最终答案 → 守卫发现有 pending → 继续;
+        # 第二次处理用户消息后队列已空 → 正常退出
+        assert len(llm_contexts) == 2
+        # 第二次调用的上下文包含注入的用户消息(同轮继续,模型可见)
+        injected = [
+            m for m in llm_contexts[1]
+            if isinstance(m, dict) and m.get("role") == "user"
+            and "看这个新要求" in (m.get("content") or "")
+        ]
+        assert injected
+        # summary 为第二次的答案(含对用户消息的回应)
+        assert summary == "第二个答案"
+        # 队列已清空(无遗留)
+        assert drain_user_messages(tid) == []
+    finally:
+        clear_user_messages(tid)
+
+
+def test_react_agent_exit_guard_no_pending_exits(monkeypatch):
+    """无遗留消息 → 守卫不干预,单次最终答案即正常退出。"""
+    import app.agents.react_agent as react_agent
+
+    tid = "task-guard-2"
+    task = MagicMock()
+    task.id = tid
+    task.params = {}
+    task.user_id = None
+    task.scenario = "general"
+    task.user_input = "初始任务"
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = MagicMock()
+
+    clear_user_messages(tid)
+    calls = []
+
+    def _fake_stream(client, task, db, round_idx, iteration, messages, tools):
+        calls.append(iteration)
+        return ("思考", "最终答案", [], "stop", "c1")
+
+    monkeypatch.setattr(react_agent, "_stream_llm_response", _fake_stream)
+    monkeypatch.setattr(react_agent, "set_current_task", lambda *a, **k: None)
+    monkeypatch.setattr(react_agent, "get_all_tools", lambda: [])
+    monkeypatch.setattr(react_agent, "wait_if_paused", lambda *a, **k: None)
+    monkeypatch.setattr(react_agent, "perf_log", lambda *a, **k: None)
+    monkeypatch.setattr(react_agent, "publish", lambda *a, **k: None)
+    monkeypatch.setattr(
+        react_agent, "_add_conversation", lambda *a, **k: MagicMock(id="c"),
+    )
+
+    try:
+        _results, summary, _plan = react_agent.run_react_agent(
+            task, db, round_idx=1, followup_query=None,
+            client=MagicMock(), repo_context=None, previous_plan=None,
+        )
+        assert calls == [1]  # 单次调用即退出(守卫不干预)
+        assert summary == "最终答案"
+    finally:
+        clear_user_messages(tid)
+
+
 def test_format_injected_without_note_has_no_followup_hint():
     """无附件时注入文本不含 followup 提示"""
     text = _format_injected_user_messages([{"content": "纯文字追问"}])
