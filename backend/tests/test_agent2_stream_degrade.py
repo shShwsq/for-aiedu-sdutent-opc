@@ -21,7 +21,6 @@ import app.models.user_git_binding  # noqa: F401
 
 import app.agents.orchestrator as orchestrator
 import app.agents.agent2 as agent2
-import app.routers.tasks as tasks_module
 from app.models.task import TaskStatus
 
 
@@ -405,7 +404,8 @@ def test_err_detail_empty_message():
 
 
 def test_resume_background_except_typed_error_message(monkeypatch):
-    """tasks.py 后台线程 except:空消息异常 → error_message 补异常类型名。"""
+    """resume 后台线程 except:空消息异常 → error_message 补异常类型名。
+    (resume 线程体已迁至 orchestrator._run_resume_in_background)"""
     task_id = str(uuid.uuid4())
     task = MagicMock()
     task.id = uuid.UUID(task_id)
@@ -414,21 +414,21 @@ def test_resume_background_except_typed_error_message(monkeypatch):
     db = MagicMock()
     db.get.return_value = task
 
-    monkeypatch.setattr(tasks_module, "SessionLocal", lambda: db)
+    monkeypatch.setattr(orchestrator, "SessionLocal", lambda: db)
 
     def _boom(*a, **k):
         raise RuntimeError("")
 
-    monkeypatch.setattr(tasks_module, "resume_audit_with_message", _boom)
+    monkeypatch.setattr(orchestrator, "resume_audit_with_message", _boom)
     error_events = []
     monkeypatch.setattr(
-        tasks_module, "publish",
+        orchestrator, "publish",
         lambda tid, event, data: error_events.append(data) if event == "error" else None,
     )
-    monkeypatch.setattr(tasks_module, "finish_task", lambda *a, **k: None)
-    monkeypatch.setattr(tasks_module, "clear_pause_state", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "finish_task", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "clear_pause_state", lambda *a, **k: None)
 
-    tasks_module._run_resume_in_background(task_id, "消息")
+    orchestrator._run_resume_in_background(task_id, "消息")
 
     assert task.status == TaskStatus.FAILED
     assert task.error_message == "RuntimeError(无错误详情)"

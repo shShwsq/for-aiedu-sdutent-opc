@@ -15,6 +15,7 @@
 import { computed, nextTick, ref } from 'vue'
 
 import { sendTaskMessage } from '@/api/task'
+import { uploadTaskFile, type UploadResult } from '@/api/uploads'
 import { extractErrorMessage } from '@/utils/error'
 import { clientLog } from '@/utils/clientLog'
 import type { SendMessageResponse, TaskStatus } from '@/types/task'
@@ -33,17 +34,50 @@ const emit = defineEmits<{
 
 const text = ref('')
 const textareaRef = ref<HTMLTextAreaElement | null>(null)
+const fileInputRef = ref<HTMLInputElement | null>(null)
 const sending = ref(false)
 const localError = ref('')
+/** 中性提示(非错误):核查中追问排队成功,等待自动处理 */
+const localHint = ref('')
 
-/** 是否允许发送(运行中/暂停中/完成后可用,pending/failed 不可用) */
+/**
+ * 附件状态:选择即上传(uploadTaskFile),成功后计入可发送。
+ * uploading 项不计入可发送(避免发出未就绪的 upload_id);
+ * error 项保留展示供用户移除重选。
+ */
+interface PendingAttachment {
+  localId: string
+  filename: string
+  size: number
+  status: 'uploading' | 'done' | 'error'
+  upload_id?: string
+  error?: string
+}
+const attachments = ref<PendingAttachment[]>([])
+const uploadingCount = computed(
+  () => attachments.value.filter((a) => a.status === 'uploading').length,
+)
+const doneUploadIds = computed(() =>
+  attachments.value
+    .filter((a) => a.status === 'done' && a.upload_id)
+    .map((a) => a.upload_id as string),
+)
+
+/** 是否允许附件/发送(运行中/暂停中/完成后可用,pending/failed 不可用) */
+const canAttach = computed(
+  () =>
+    props.taskStatus === 'running' ||
+    props.taskStatus === 'paused' ||
+    props.taskStatus === 'completed',
+)
+
+/** 是否允许发送:文字必填 + 无上传中附件 + 状态可用 */
 const canSend = computed(
   () =>
     !sending.value &&
+    uploadingCount.value === 0 &&
     text.value.trim().length > 0 &&
-    (props.taskStatus === 'running' ||
-      props.taskStatus === 'paused' ||
-      props.taskStatus === 'completed'),
+    canAttach.value,
 )
 
 /** 占位提示文案(随任务状态变化) */
@@ -76,6 +110,7 @@ function autoResize(): void {
 
 function handleInput(): void {
   localError.value = ''
+  localHint.value = ''
   autoResize()
 }
 
@@ -87,6 +122,71 @@ function handleKeydown(e: KeyboardEvent): void {
   }
 }
 
+/** 字节数格式化(chip 展示用) */
+function formatSize(bytes: number): string {
+  if (!bytes) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  const i = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    units.length - 1,
+  )
+  return `${(bytes / Math.pow(1024, i)).toFixed(i ? 1 : 0)} ${units[i]}`
+}
+
+function triggerFileSelect(): void {
+  if (!canAttach.value || sending.value) return
+  fileInputRef.value?.click()
+}
+
+/** 选择文件 → 逐个上传(多选/多次追加);上传中即入 chip 列表 */
+async function handleFileChange(e: Event): Promise<void> {
+  const input = e.target as HTMLInputElement
+  const files = Array.from(input.files || [])
+  input.value = '' // 允许重复选同一文件
+  for (const file of files) {
+    void uploadOne(file)
+  }
+}
+
+async function uploadOne(file: File): Promise<void> {
+  const localId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  attachments.value.push({
+    localId,
+    filename: file.name,
+    size: file.size,
+    status: 'uploading',
+  })
+  try {
+    const res: UploadResult = await uploadTaskFile(file)
+    const idx = attachments.value.findIndex((a) => a.localId === localId)
+    if (idx >= 0) {
+      attachments.value[idx] = {
+        ...attachments.value[idx],
+        status: 'done',
+        upload_id: res.upload_id,
+      }
+    }
+  } catch (err) {
+    const msg = extractErrorMessage(err)
+    const idx = attachments.value.findIndex((a) => a.localId === localId)
+    if (idx >= 0) {
+      attachments.value[idx] = {
+        ...attachments.value[idx],
+        status: 'error',
+        error: msg,
+      }
+    }
+    clientLog(String(props.taskId), 'followup_upload_error', {
+      filename: file.name,
+      error: msg,
+    })
+  }
+}
+
+function removeAttachment(localId: string): void {
+  attachments.value = attachments.value.filter((a) => a.localId !== localId)
+}
+
 async function handleSend(): Promise<void> {
   if (!canSend.value) return
   const content = text.value.trim()
@@ -94,16 +194,26 @@ async function handleSend(): Promise<void> {
 
   sending.value = true
   localError.value = ''
+  const uploadIds = doneUploadIds.value
   try {
-    const resp = await sendTaskMessage(props.taskId, { content })
+    const resp = await sendTaskMessage(props.taskId, {
+      content,
+      upload_ids: uploadIds.length ? uploadIds : undefined,
+    })
     // [诊断] 消息发送结果:与后端 user_message 落库 / resume_start 对拍
     // (定位"消息已落库但前端提示失败"的响应丢失问题)
     clientLog(String(props.taskId), 'message_sent', {
       accepted: resp.accepted,
       message: resp.message,
+      attachment_count: uploadIds.length,
     })
     if (resp.accepted) {
       text.value = ''
+      attachments.value = [] // 清空附件(含 error 项)
+      // 核查中排队:中性提示(非错误)——新一轮由后端审查结束后自动启动
+      localHint.value = resp.queued_for_review
+        ? '检查助手仍在核查中,消息已排队,核查结束后自动处理'
+        : ''
       emit('sent', resp)
       // 清空后重置高度 + 重新聚焦
       await nextTick()
@@ -128,7 +238,74 @@ async function handleSend(): Promise<void> {
 
 <template>
   <div class="msg-input-wrapper">
+    <!-- 附件 chip 列表(上传中/成功/失败) -->
+    <div v-if="attachments.length" class="msg-attachments">
+      <div
+        v-for="att in attachments"
+        :key="att.localId"
+        class="msg-att-chip"
+        :class="{
+          'is-error': att.status === 'error',
+          'is-uploading': att.status === 'uploading',
+        }"
+        :title="att.status === 'error' ? att.error : att.filename"
+      >
+        <span v-if="att.status === 'uploading'" class="msg-att-spinner" />
+        <svg
+          v-else
+          class="msg-att-icon"
+          width="13"
+          height="13"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+          <polyline points="14 2 14 8 20 8" />
+        </svg>
+        <span class="msg-att-name">{{ att.filename }}</span>
+        <span class="msg-att-size">{{ formatSize(att.size) }}</span>
+        <button
+          class="msg-att-remove"
+          title="移除"
+          @click="removeAttachment(att.localId)"
+        >
+          ×
+        </button>
+      </div>
+    </div>
     <div class="msg-input-row">
+      <input
+        ref="fileInputRef"
+        type="file"
+        multiple
+        class="msg-file-input"
+        @change="handleFileChange"
+      />
+      <button
+        class="msg-attach-btn"
+        :disabled="!canAttach || sending"
+        :title="canAttach ? '添加附件' : '当前状态不可添加附件'"
+        @click="triggerFileSelect"
+      >
+        <svg
+          width="18"
+          height="18"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <path
+            d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"
+          />
+        </svg>
+      </button>
       <textarea
         ref="textareaRef"
         v-model="text"
@@ -163,6 +340,7 @@ async function handleSend(): Promise<void> {
       </button>
     </div>
     <p v-if="localError" class="msg-input-error">{{ localError }}</p>
+    <p v-else-if="localHint" class="msg-input-hint">{{ localHint }}</p>
   </div>
 </template>
 
@@ -259,9 +437,122 @@ async function handleSend(): Promise<void> {
   }
 }
 
+.msg-file-input {
+  display: none;
+}
+
+.msg-attach-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  color: var(--color-text-muted);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.msg-attach-btn:hover:not(:disabled) {
+  color: var(--color-primary);
+  background: var(--color-primary-light);
+}
+
+.msg-attach-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.msg-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.msg-att-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  padding: 4px 8px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-xs);
+  color: var(--color-text);
+}
+
+.msg-att-chip.is-error {
+  border-color: var(--color-danger);
+  color: var(--color-danger);
+}
+
+.msg-att-chip.is-uploading {
+  opacity: 0.7;
+}
+
+.msg-att-icon {
+  flex-shrink: 0;
+  color: var(--color-text-muted);
+}
+
+.msg-att-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg-att-size {
+  flex-shrink: 0;
+  color: var(--color-text-muted);
+}
+
+.msg-att-remove {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 50%;
+}
+
+.msg-att-remove:hover {
+  color: var(--color-danger);
+}
+
+.msg-att-spinner {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--color-border);
+  border-top-color: var(--color-primary);
+  border-radius: 50%;
+  animation: msg-send-spin 0.8s linear infinite;
+}
+
 .msg-input-error {
   font-size: var(--fs-xs);
   color: var(--color-danger);
+  margin: 0;
+  padding: 0 var(--space-2);
+}
+
+/* 中性提示(核查中排队成功,非错误) */
+.msg-input-hint {
+  font-size: var(--fs-xs);
+  color: var(--color-info, var(--color-text-secondary));
   margin: 0;
   padding: 0 var(--space-2);
 }
@@ -274,6 +565,11 @@ async function handleSend(): Promise<void> {
   }
 
   .msg-send-btn {
+    width: 40px;
+    height: 40px;
+  }
+
+  .msg-attach-btn {
     width: 40px;
     height: 40px;
   }

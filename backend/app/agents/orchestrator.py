@@ -33,6 +33,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
@@ -49,7 +50,8 @@ from app.domain_events import (
     TASK_STARTED,
     emit,
 )
-from app.event_bus import finish_task, publish
+from app.database import SessionLocal
+from app.event_bus import finish_task, is_task_finished, publish, reset_task_bus
 from app.llm.client import LLMClient
 from app.models.task import Conversation, Result, Task, TaskStatus
 from app.models.user import User
@@ -67,11 +69,19 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# 后台审查互斥:审查运行中,用户发消息 resume 前须等待审查结束
+# 后台审查互斥:审查运行中,用户追问排队、审查结束后自动 resume
 # ============================================================
 
-# task_id → 审查完成信号(审查开始时注册并清零,结束时置位)
+# task_id → 审查完成信号(审查开始时注册,审查结束时置位)
 _review_done_events: dict[str, threading.Event] = {}
+# task_id → 审查期间排队的用户追问(核查中发送的消息,审查结束后自动合并
+# 触发新一轮 resume;每项为 (消息文本, 附件 upload_ids),与
+# _review_done_events 同锁保证原子路由)
+_pending_resume_messages: dict[str, list[tuple[str, list[str] | None]]] = {}
+# queued resume 已接管、任务状态尚未翻转为 RUNNING 的窗口标记:
+# 该窗口内新到的消息按"运行中"语义入队(push_user_message),
+# 防止 immediate resume 与 queued resume 并发双跑同一任务
+_resume_claims: set[str] = set()
 _review_lock = threading.Lock()
 
 
@@ -84,24 +94,145 @@ def _mark_review_started(task_id) -> threading.Event:
     return ev
 
 
-def _mark_review_finished(task_id, ev: threading.Event) -> None:
-    """标记审查结束(唤醒所有等待者),并清理注册表"""
+def register_pending_resume(
+    task_id, content: str, upload_ids: list[str] | None = None,
+) -> str:
+    """completed 任务收到用户追问时的原子路由判定(供 API 端点调用)
+
+    返回三种路由:
+    - "queued":后台审查仍在进行 → 消息(含附件)登记排队,审查结束后
+      自动 resume(替代旧的 wait_for_review 同步阻塞:接口立即返回,
+      前端 SSE 不断线)
+    - "enqueue":queued resume 已接管(状态翻转窗口)→ 调用方按运行中
+      语义入队(push_user_message),由新一轮 react_agent 迭代边界消费
+    - "immediate":无审查在跑 → 调用方直接启动 resume(原行为)
+    """
     key = str(task_id)
-    ev.set()
+    with _review_lock:
+        if key in _resume_claims:
+            return "enqueue"
+        if key in _review_done_events:
+            _pending_resume_messages.setdefault(key, []).append(
+                (content, upload_ids)
+            )
+            return "queued"
+        return "immediate"
+
+
+def _seal_review(task_id) -> list[tuple[str, list[str] | None]]:
+    """审查结束的单一决策点(原子):注销审查信号 + 取走排队消息。
+
+    返回排队的用户追问列表(空 = 无 queued resume)。有消息时登记
+    _resume_claims(见该字段注释),由 resume 线程置 RUNNING 后清除。
+    """
+    key = str(task_id)
     with _review_lock:
         _review_done_events.pop(key, None)
+        pending = _pending_resume_messages.pop(key, [])
+        if pending:
+            _resume_claims.add(key)
+    return pending
 
 
-def wait_for_review(task_id, timeout: float = 120.0) -> bool:
-    """等待任务的后台审查结束(供 resume 前调用)
+def _finalize_review(task, review_ev: threading.Event) -> None:
+    """审查收尾(在审查线程 finally 中调用):
 
-    返回 True=审查已结束(或本就无审查在跑),False=超时仍在审查。
+    - 有排队追问(核查中用户消息):事件总线保持打开(不推 done /
+      finish_task),自动启动新一轮 resume —— 前端 SSE 不断线,
+      新轮的 status/conversation/thinking_delta 事件继续实时送达
+    - 无排队追问:推 done 终止事件 + finish_task 关闭总线(原行为)
     """
-    with _review_lock:
-        ev = _review_done_events.get(str(task_id))
-    if ev is None:
-        return True
-    return ev.wait(timeout)
+    pending = _seal_review(task.id)
+    try:
+        if pending:
+            message = "\n\n".join(item[0] for item in pending)
+            # 合并多排队消息的附件(去重保序)
+            merged_uploads: list[str] = []
+            for _, uids in pending:
+                for uid in (uids or []):
+                    if uid not in merged_uploads:
+                        merged_uploads.append(uid)
+            logger.info(
+                f"[task={task.id}] 审查结束,自动处理排队追问 {len(pending)} 条"
+            )
+            launch_resume_thread(
+                str(task.id), message,
+                upload_ids=merged_uploads or None, queued=True,
+            )
+        else:
+            publish(task.id, "done", {"status": "completed"})
+            finish_task(task.id)
+    except Exception:
+        # 兜底:自动 resume 启动失败时按正常完成收尾,防止 SSE 悬挂
+        logger.exception(f"[task={task.id}] 审查收尾异常(按完成收尾)")
+        try:
+            publish(task.id, "done", {"status": "completed"})
+            finish_task(task.id)
+        except Exception:
+            pass
+    finally:
+        review_ev.set()
+
+
+def launch_resume_thread(
+    task_id: str, user_message: str,
+    upload_ids: list[str] | None = None, queued: bool = False,
+) -> None:
+    """启动 resume 后台线程(用户追问驱动新一轮执行)
+
+    - queued=True(审查结束自动 resume):总线可能已被审查异常路径关闭,
+      先探测并重置;正常路径总线保持打开(前端 SSE 不断线)
+    - queued=False(API 端点 immediate 路径):端点已同步 reset 总线 +
+      置 RUNNING,此处直接启动线程
+    """
+    if queued and is_task_finished(task_id):
+        reset_task_bus(task_id)
+    thread = threading.Thread(
+        target=_run_resume_in_background,
+        args=(task_id, user_message, upload_ids),
+        daemon=True,
+        name=f"task-{task_id}-resume",
+    )
+    thread.start()
+
+
+def _run_resume_in_background(
+    task_id: str, user_message: str, upload_ids: list[str] | None = None,
+) -> None:
+    """后台线程执行重启审计(与 _run_task_in_background 对齐)
+
+    用独立的 DB session(线程安全),执行完毕后关闭。
+    """
+    db = SessionLocal()
+    try:
+        task = db.get(Task, uuid.UUID(task_id))
+        if not task:
+            logger.error(f"重启任务:task {task_id} 不存在")
+            return
+        resume_audit_with_message(task, db, user_message, upload_ids=upload_ids)
+    except Exception as e:
+        logger.exception(f"[task={task_id}] 重启后台执行失败")
+        # 兜底:确保 task 状态被标记为失败
+        try:
+            task = db.get(Task, uuid.UUID(task_id))
+            if task and task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                task.status = TaskStatus.FAILED
+                task.error_message = _err_detail(e)[:1000]
+                task.current_stage = "重启执行失败"
+                db.commit()
+                # 兜底推送终止事件 + 标记总线结束:防止 SSE 订阅者因线程
+                # 在主 try 块前崩溃收不到 error 而永久挂起
+                publish(task.id, "error", {
+                    "status": "failed",
+                    "error_message": _err_detail(e)[:1000],
+                })
+                finish_task(task.id)
+        except Exception:
+            pass
+    finally:
+        db.close()
+        # 清理 in-memory 暂停状态(防止任务结束但状态卡住)
+        clear_pause_state(task_id)
 
 
 def run_dual_agent_audit(task: Task, db: Session) -> None:
@@ -394,8 +525,9 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
                 react_client=react_client,
             )
         finally:
-            # 唤醒等待审查的 resume 请求(若有),并清理注册表
-            _mark_review_finished(task.id, review_ev)
+            # 审查收尾:有排队追问 → 总线保持打开并自动 resume;
+            # 无 → 推 done + 关闭总线(原行为)
+            _finalize_review(task, review_ev)
 
     except Exception as e:
         logger.exception(f"[task={task.id}] 双智能体协作失败")
@@ -558,7 +690,7 @@ def _finish_conversation_round(
     问答 —— 纯追问即回答,不为一次对话触发整条审查流水线。
 
     终止事件序列与单 agent 收尾同构:agent1_done → done → finish_task
-    (不进入 review_running,后续 resume 不受 wait_for_review 阻塞)。
+    (不进入 review_running,后续追问走 immediate resume,无需排队)。
     """
     task.status = TaskStatus.COMPLETED
     task.current_stage = "任务完成(本轮为纯对话,跳过审查)"
@@ -761,10 +893,10 @@ def _run_background_review(
         )
         perf_log(task.id, "review_done", review_status=task.review_status)
 
-        # 通知前端审查结束(侧栏 badge 更新 + 拉取最终结果),再推终止事件
+        # 通知前端审查结束(侧栏 badge 更新 + 拉取最终结果)。
+        # 终止事件(done/finish_task)不在此推:由 _finalize_review 统一决策 ——
+        # 审查期间有排队追问时总线保持打开,自动 resume 新一轮(不推 done)
         publish(task.id, "review_done", {"review_status": task.review_status})
-        publish(task.id, "done", {"status": "completed"})
-        finish_task(task.id)
 
         # ---- 下游链(依赖最终结果,必须在审查后)----
 
@@ -1373,9 +1505,11 @@ def resume_audit_with_message(
     用户消息本身已由 API 端点落库为 Conversation(role=user, type=message),
     本函数不重复落库。
 
-    注意:本函数由 API 端点在独立后台线程中调用(类似 _run_task_in_background),
-    与原执行线程互斥 —— API 层已保证 COMPLETED 任务的后台审查结束后才启动
-    resume(wait_for_review),消除了"审查线程与 resume 线程并发操作同一任务"的竞态。
+    注意:本函数在独立后台线程中调用(类似 _run_task_in_background),
+    与原执行线程互斥 —— 两条进入路径都保证审查结束后才启动 resume:
+    - immediate:API 端点路由判定无审查在跑时直接启动(register_pending_resume)
+    - queued:核查期间用户追问先排队,审查线程结束时由 _finalize_review
+      自动启动(_seal_review 原子决策,消除并发双跑竞态)
     """
     task_id_str = str(task.id)
 
@@ -1386,6 +1520,11 @@ def resume_audit_with_message(
     task.error_message = None  # 清除之前的错误信息(若有)
     db.commit()
     _publish_status(task)
+
+    # 状态已翻转为 RUNNING:解除 queued resume 的接管标记
+    # (此后新消息按 running 语义入队,不再走排队/立即 resume 路由)
+    with _review_lock:
+        _resume_claims.discard(task_id_str)
 
     # 加载上下文(与 run_dual_agent_audit 一致)
     # llm_client:agent2 评估;react_client:内置 react_agent(空时回退到 llm_config_id)
@@ -1572,7 +1711,9 @@ def resume_audit_with_message(
                 react_client=react_client,
             )
         finally:
-            _mark_review_finished(task.id, review_ev)
+            # 审查收尾:有排队追问 → 总线保持打开并自动 resume;
+            # 无 → 推 done + 关闭总线(原行为)
+            _finalize_review(task, review_ev)
 
     except Exception as e:
         err_stage = "重试执行失败" if retry else "重启执行失败"

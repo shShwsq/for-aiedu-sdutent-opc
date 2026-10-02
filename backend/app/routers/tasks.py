@@ -29,6 +29,8 @@ from sqlalchemy.orm import Session
 
 from app.agents.orchestrator import (
     _err_detail,
+    launch_resume_thread,
+    register_pending_resume,
     resume_audit_with_message,
     retry_failed_task,
     run_dual_agent_audit,
@@ -592,8 +594,11 @@ def submit_task_message(
     按 task.status 分发:
     - running / paused:消息入队(user_messages.push_user_message),
       react_agent 在下一迭代边界 drain 出来注入 LLM 上下文
-    - completed:启动新的协作 round(后台线程调 resume_audit_with_message),
-      先让 agent2 分析这条消息,再决定是否触发新一轮 react_agent 执行
+    - completed:原子路由(register_pending_resume,不再阻塞等待审查):
+      - 审查仍在核查 → 消息排队(queued_for_review=True),审查结束后
+        由审查线程自动启动新一轮 resume(总线保持打开,SSE 不断线)
+      - queued resume 已接管(状态翻转窗口)→ 按运行中语义入队
+      - 无审查在跑 → 立即启动新的协作 round(resume_audit_with_message)
     - pending / failed:拒绝(任务未启动或已失败)
 
     消息统一落库为 Conversation(role=user, type=message):
@@ -650,18 +655,6 @@ def submit_task_message(
                 "kind": meta.get("kind") or "file",
             })
 
-    # 后台审查互斥(agent1 结束即任务完成,但 agent2 审查可能仍在后台执行):
-    # resume 前先等待审查结束 —— 审查会写对话/结果并操作事件总线,与 resume
-    # 线程并发会产生竞态。超时友好拒绝(此时消息尚未落库,不留孤儿记录)。
-    if task.status == TaskStatus.COMPLETED:
-        from app.agents.orchestrator import wait_for_review
-        if not wait_for_review(task.id, timeout=120.0):
-            logger.warning(f"[task={task_id}] 审查仍在进行,拒绝本次消息")
-            return SendMessageResponse(
-                accepted=False,
-                message="检查助手仍在核查中,请稍后再试",
-            )
-
     # 用户消息归 round:
     # - 运行中/暂停中:归当前 round(react_agent 迭代边界注入,即时介入)
     # - 完成后:归 max+1 的新轮(该轮即 resume 的分析评估 + 首轮 react 执行,
@@ -690,25 +683,34 @@ def submit_task_message(
     db.commit()
     db.refresh(conv)
 
-    # 完成态任务:事件总线已被 finish_task 标记为 _finished=True,
-    # 后续 publish 会被静默丢弃。重启审计前先重置总线(清除 _finished +
-    # _history 含旧 done 事件),让新事件能推送、前端重连 SSE 不会立即关闭。
-    if task.status == TaskStatus.COMPLETED:
-        reset_task_bus(task.id)
+    def _publish_user_message() -> None:
+        """推送用户消息 conversation 事件(SSE 实时追加到对话流)"""
+        publish(task.id, "conversation", {
+            "id": str(conv.id),
+            "round_idx": conv.round_idx,
+            "role": conv.role,
+            "type": conv.type,
+            "content": conv.content,
+            "reasoning": conv.reasoning,
+            "attachments": conv.attachments,
+            "created_at": conv.created_at.isoformat() if conv.created_at else None,
+        })
 
-    publish(task.id, "conversation", {
-        "id": str(conv.id),
-        "round_idx": conv.round_idx,
-        "role": conv.role,
-        "type": conv.type,
-        "content": conv.content,
-        "reasoning": conv.reasoning,
-        "attachments": conv.attachments,
-        "created_at": conv.created_at.isoformat() if conv.created_at else None,
-    })
+    def _accumulate_followup_uploads() -> None:
+        """追问附件累积进 params.followup_upload_ids(非 JSONB 突变)"""
+        if not followup_ids:
+            return
+        new_params = dict(task.params or {})
+        existing = list(new_params.get("followup_upload_ids") or [])
+        for uid in followup_ids:
+            if uid not in existing:
+                existing.append(uid)
+        new_params["followup_upload_ids"] = existing
+        task.params = new_params
 
     # 状态分发
     if task.status in (TaskStatus.RUNNING, TaskStatus.PAUSED):
+        _publish_user_message()
         # 入队,react_agent 下一迭代 drain
         push_user_message(
             task.id, content,
@@ -722,7 +724,43 @@ def submit_task_message(
         )
 
     if task.status == TaskStatus.COMPLETED:
-        # (后台审查已在上方 wait_for_review 等待结束)
+        # 完成态原子路由(替代旧的 wait_for_review 同步阻塞等待):
+        # - queued:后台审查仍在核查 → 消息排队,审查结束后由审查线程
+        #   _finalize_review 自动启动 resume(事件总线保持打开,前端
+        #   SSE 不断线,新轮事件继续实时送达)。接口立即返回,不再阻塞
+        # - enqueue:queued resume 已接管(状态翻转窗口)→ 按运行中语义入队
+        # - immediate:无审查在跑 → 原 immediate resume 行为
+        route = register_pending_resume(task.id, content, followup_ids or None)
+        if route == "queued":
+            # 审查期间总线保持打开,消息事件实时送达;
+            # 附件先累积进 params(沙箱回收后的重放依据,与立即路径一致)
+            _publish_user_message()
+            _accumulate_followup_uploads()
+            db.commit()
+            return SendMessageResponse(
+                accepted=True,
+                queued_for_review=True,
+                message="检查助手仍在核查中,消息已排队,核查结束后自动处理",
+            )
+        if route == "enqueue":
+            _publish_user_message()
+            push_user_message(
+                task.id, content,
+                message_id=str(conv.id),
+                created_at=conv.created_at.isoformat() if conv.created_at else "",
+                upload_ids=followup_ids or None,
+            )
+            return SendMessageResponse(
+                accepted=True,
+                message="消息已加入队列,智能体将在下一迭代处理",
+            )
+
+        # immediate:审查已结束(事件总线已被 finish_task 标记 _finished=True,
+        # 后续 publish 会被静默丢弃)。重启审计前先重置总线(清除 _finished +
+        # _history 含旧 done 事件),让新事件能推送、前端重连 SSE 不会立即关闭。
+        reset_task_bus(task.id)
+        _publish_user_message()
+
         # 同步将状态改为 RUNNING 落库后再启动后台线程:
         # 消除 SSE 端点快照读到 COMPLETED 的竞态窗口 —— 否则前端重连 SSE 时,
         # stream_task_events 会按旧快照直接推 done 关闭连接,后续
@@ -730,28 +768,12 @@ def submit_task_message(
         # resume_audit_with_message 开头会再设置一次,幂等无冲突。
         task.status = TaskStatus.RUNNING
         task.current_stage = "用户追加消息,重启执行"
-        # 追问上传累积进 params.followup_upload_ids:沙箱回收后
-        # _restore_workspace_if_needed 据此重放追问文件(与创建上传一致可恢复)。
-        # JSONB 需整体重新赋值才能被 SQLAlchemy 追踪变更(不依赖 in-place 突变)
-        if followup_ids:
-            new_params = dict(task.params or {})
-            existing = list(new_params.get("followup_upload_ids") or [])
-            for uid in followup_ids:
-                if uid not in existing:
-                    existing.append(uid)
-            new_params["followup_upload_ids"] = existing
-            task.params = new_params
+        _accumulate_followup_uploads()
         db.commit()
 
         # 启动新的协作 round(后台线程)
         # resume_audit_with_message 会把 task.status 保持 RUNNING
-        thread = threading.Thread(
-            target=_run_resume_in_background,
-            args=(str(task_id), content, followup_ids or None),
-            daemon=True,
-            name=f"task-{task_id}-resume",
-        )
-        thread.start()
+        launch_resume_thread(str(task_id), content, upload_ids=followup_ids or None)
         return SendMessageResponse(
             accepted=True,
             message="已启动新一轮执行",
@@ -762,45 +784,6 @@ def submit_task_message(
         accepted=False,
         message=f"任务状态 {task.status.value} 不支持发送消息",
     )
-
-
-def _run_resume_in_background(
-    task_id: str, user_message: str, upload_ids: list[str] | None = None,
-) -> None:
-    """后台线程执行重启审计(与 _run_task_in_background 对齐)
-
-    用独立的 DB session(线程安全),执行完毕后关闭。
-    """
-    db = SessionLocal()
-    try:
-        task = db.get(Task, uuid.UUID(task_id))
-        if not task:
-            logger.error(f"重启任务:task {task_id} 不存在")
-            return
-        resume_audit_with_message(task, db, user_message, upload_ids=upload_ids)
-    except Exception as e:
-        logger.exception(f"[task={task_id}] 重启后台执行失败")
-        # 兜底:确保 task 状态被标记为失败
-        try:
-            task = db.get(Task, uuid.UUID(task_id))
-            if task and task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
-                task.status = TaskStatus.FAILED
-                task.error_message = _err_detail(e)[:1000]
-                task.current_stage = "重启执行失败"
-                db.commit()
-                # 兜底推送终止事件 + 标记总线结束:防止 SSE 订阅者因线程
-                # 在主 try 块前崩溃收不到 error 而永久挂起
-                publish(task.id, "error", {
-                    "status": "failed",
-                    "error_message": _err_detail(e)[:1000],
-                })
-                finish_task(task.id)
-        except Exception:
-            pass
-    finally:
-        db.close()
-        # 清理 in-memory 暂停状态(防止任务结束但状态卡住)
-        clear_pause_state(task_id)
 
 
 # ============================================================

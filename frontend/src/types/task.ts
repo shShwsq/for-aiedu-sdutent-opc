@@ -68,6 +68,12 @@ export interface TaskCreateRequest {
    */
   upload_id?: string
   /**
+   * 多文件上传(新):与 upload_id 合并去重后逐个校验。
+   * 旧客户端传 upload_id,新客户端传 upload_ids;二者可共存。
+   * 数量受后端 UPLOAD_MAX_FILES_PER_MESSAGE 约束。
+   */
+  upload_ids?: string[]
+  /**
    * 用户选择的 skill 列表(可选)
    *
    * 不传(undefined)= 使用全部可用 skill;传空数组 = 禁用所有 skill;
@@ -109,6 +115,14 @@ export interface TaskResult {
   metadata_?: Record<string, unknown> | null
 }
 
+/** 追问/创建消息附带的上传文件展示信息(后端 Conversation.attachments 项) */
+export interface AttachmentInfo {
+  upload_id: string
+  filename: string
+  size: number
+  kind: 'zip' | 'file'
+}
+
 /** 对话记录(后端 ConversationResponse) */
 export interface Conversation {
   id: string
@@ -144,6 +158,11 @@ export interface Conversation {
    * 历史数据为 null,回退相邻配对
    */
   tool_call_id?: string | null
+  /**
+   * 仅 user 追问消息有:附带上传文件展示信息(刷新后气泡仍渲染 chip)。
+   * 其他消息/历史数据为 null
+   */
+  attachments?: AttachmentInfo[] | null
   created_at: string
 }
 
@@ -242,6 +261,8 @@ export interface ConversationEventData {
   reasoning?: string | null
   /** 仅 type=tool_result 有:对应 tool_call 会话记录的 id */
   tool_call_id?: string | null
+  /** 仅 user 追问消息有:附带上传文件展示信息 */
+  attachments?: AttachmentInfo[] | null
   created_at: string | null
 }
 
@@ -486,6 +507,11 @@ export interface AgentPolicy {
 export interface SendMessageRequest {
   /** 消息内容(1-8000 字符) */
   content: string
+  /**
+   * 本条追问附带的上传文件 id(可空)。附件随非空文字消息发送,
+   * 数量受后端 UPLOAD_MAX_FILES_PER_MESSAGE 约束。
+   */
+  upload_ids?: string[]
 }
 
 /** 发送用户补充消息响应 */
@@ -494,4 +520,10 @@ export interface SendMessageResponse {
   accepted: boolean
   /** 提示信息(展示给用户) */
   message?: string
+  /**
+   * True=检查助手仍在核查中,消息已排队,核查结束后由后端自动启动
+   * 新一轮。前端保持 SSE 连接与当前展示(不切到"已启动新一轮"的
+   * 乐观态),新一轮事件经现有 SSE 连接继续送达
+   */
+  queued_for_review?: boolean
 }

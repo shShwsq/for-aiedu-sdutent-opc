@@ -336,8 +336,8 @@ const branch = ref('')
 type SourceMode = 'git' | 'zip' | 'file'
 /** 交付物来源 Tab(默认 Git 仓库;zip/file 调 POST /uploads 拿 upload_id) */
 const sourceMode = ref<SourceMode>('git')
-/** 已上传的交付物(POST /uploads 返回;null=未上传) */
-const uploadedDeliverable = ref<UploadResult | null>(null)
+/** 已上传的交付物列表(POST /uploads 返回;支持多选与多次追加) */
+const uploadedDeliverables = ref<UploadResult[]>([])
 const uploading = ref(false)
 const uploadError = ref('')
 const zipFileInputRef = ref<HTMLInputElement | null>(null)
@@ -347,7 +347,7 @@ const singleFileInputRef = ref<HTMLInputElement | null>(null)
 function switchSourceMode(mode: SourceMode): void {
   if (sourceMode.value === mode) return
   sourceMode.value = mode
-  uploadedDeliverable.value = null
+  uploadedDeliverables.value = []
   uploadError.value = ''
 }
 
@@ -357,32 +357,49 @@ function triggerFilePicker(): void {
   el?.click()
 }
 
-/** 选择文件后上传(expectZip=true 校验 .zip 后缀) */
+/** 选择文件后上传(支持多选;expectZip=true 校验 .zip 后缀) */
 async function onUploadFileChosen(e: Event, expectZip: boolean): Promise<void> {
   const input = e.target as HTMLInputElement
-  const file = input.files?.[0]
+  const files = Array.from(input.files || [])
   // 清空 value 允许再次选择同一文件
   input.value = ''
-  if (!file) return
-  if (expectZip && !file.name.toLowerCase().endsWith('.zip')) {
+  if (!files.length) return
+  // ZIP Tab:任一文件后缀不符即拒绝整批
+  if (expectZip && files.some((f) => !f.name.toLowerCase().endsWith('.zip'))) {
     uploadError.value = '请选择 .zip 压缩包'
     return
   }
   uploadError.value = ''
   uploading.value = true
   try {
-    uploadedDeliverable.value = await uploadTaskFile(file)
-  } catch (err: unknown) {
-    uploadedDeliverable.value = null
-    uploadError.value = extractErrorMessage(err)
+    // 逐个上传并追加(多次选择可累积;按 upload_id 去重)
+    for (const file of files) {
+      try {
+        const res = await uploadTaskFile(file)
+        if (!uploadedDeliverables.value.some((d) => d.upload_id === res.upload_id)) {
+          uploadedDeliverables.value.push(res)
+        }
+      } catch (err: unknown) {
+        // 单个失败不阻断其余;保留错误提示供用户感知
+        uploadError.value = extractErrorMessage(err)
+      }
+    }
   } finally {
     uploading.value = false
   }
 }
 
-/** 移除已上传的交付物 */
-function clearUploadedDeliverable(): void {
-  uploadedDeliverable.value = null
+/** 移除某个已上传的交付物 */
+function removeDeliverable(uploadId: string): void {
+  uploadedDeliverables.value = uploadedDeliverables.value.filter(
+    (d) => d.upload_id !== uploadId,
+  )
+  uploadError.value = ''
+}
+
+/** 清空全部已上传交付物(切换场景/Tab 时) */
+function clearUploadedDeliverables(): void {
+  uploadedDeliverables.value = []
   uploadError.value = ''
 }
 
@@ -662,7 +679,7 @@ watch(selectedScenario, () => {
   branch.value = ''
   // 交付物来源回退到 Git 仓库 Tab,清掉残留的上传
   sourceMode.value = 'git'
-  clearUploadedDeliverable()
+  clearUploadedDeliverables()
   // 根据场景推荐重置 skill 选中状态(skill 列表已加载时才生效)
   applyRecommendedSkills()
   nextTick(autoResize)
@@ -786,10 +803,10 @@ async function handleSubmit(): Promise<void> {
       scenario: selectedScenario.value,
       title: taskTitle.value.trim() || undefined,
       user_input: finalUserInput,
-      // 上传交付物 id:仅上传 Tab 且已上传时传(后端与 repo_url 互斥,422)
-      upload_id:
-        sourceMode.value !== 'git' && uploadedDeliverable.value
-          ? uploadedDeliverable.value.upload_id
+      // 上传交付物 ids:仅上传 Tab 且已上传时传(后端与 repo_url 互斥,422)
+      upload_ids:
+        sourceMode.value !== 'git' && uploadedDeliverables.value.length
+          ? uploadedDeliverables.value.map((d) => d.upload_id)
           : undefined,
       // 评估模型是 agent2 的能力:agent2 关闭时不提交(builtin 下 react 模型已单独显式指定)
       llm_config_id: policyAgent2Enabled.value ? selectedLlmConfigId.value || undefined : undefined,
@@ -1510,32 +1527,37 @@ onUnmounted(() => {
                   />
                 </div>
 
-                <!-- 上传 Tab:已上传展示 chip,未上传展示选择按钮 -->
+                <!-- 上传 Tab:已上传展示 chip 列表,可随时追加更多 -->
                 <template v-else>
-                  <!-- 已上传:文件名 + 大小(ZIP 含解压文件数)+ 移除按钮 -->
-                  <div v-if="uploadedDeliverable" class="upload-chip">
-                    <span class="upload-chip-name" :title="uploadedDeliverable.filename">
-                      {{ uploadedDeliverable.filename }}
-                    </span>
-                    <span class="upload-chip-meta">
-                      {{ formatBytes(uploadedDeliverable.size) }}
-                      <template v-if="uploadedDeliverable.kind === 'zip'">
-                        · {{ uploadedDeliverable.file_count }} 个文件
-                      </template>
-                    </span>
-                    <button
-                      type="button"
-                      class="upload-chip-remove"
-                      aria-label="移除已上传文件"
-                      :title="'移除 ' + uploadedDeliverable.filename"
-                      @click="clearUploadedDeliverable"
+                  <!-- 已上传列表:每项 文件名 + 大小(ZIP 含解压文件数)+ 移除按钮 -->
+                  <div v-if="uploadedDeliverables.length" class="upload-chips">
+                    <div
+                      v-for="d in uploadedDeliverables"
+                      :key="d.upload_id"
+                      class="upload-chip"
                     >
-                      ×
-                    </button>
+                      <span class="upload-chip-name" :title="d.filename">
+                        {{ d.filename }}
+                      </span>
+                      <span class="upload-chip-meta">
+                        {{ formatBytes(d.size) }}
+                        <template v-if="d.kind === 'zip'">
+                          · {{ d.file_count }} 个文件
+                        </template>
+                      </span>
+                      <button
+                        type="button"
+                        class="upload-chip-remove"
+                        aria-label="移除已上传文件"
+                        :title="'移除 ' + d.filename"
+                        @click="removeDeliverable(d.upload_id)"
+                      >
+                        ×
+                      </button>
+                    </div>
                   </div>
-                  <!-- 未上传:触发文件选择(重新上传会覆盖旧文件) -->
+                  <!-- 选择/追加文件(多次选择可累积) -->
                   <button
-                    v-else
                     type="button"
                     class="upload-btn"
                     :disabled="uploading"
@@ -1545,19 +1567,22 @@ onUnmounted(() => {
                     {{
                       uploading
                         ? '上传中...'
-                        : sourceMode === 'zip'
-                          ? '选择 .zip 压缩包'
-                          : '选择要上传的文件'
+                        : uploadedDeliverables.length
+                          ? '继续添加文件'
+                          : sourceMode === 'zip'
+                            ? '选择 .zip 压缩包'
+                            : '选择要上传的文件'
                     }}
                   </button>
                   <p v-if="uploadError" class="upload-error">{{ uploadError }}</p>
                 </template>
 
-                <!-- 隐藏文件选择框(常驻渲染,保证 triggerFilePicker 随时可点) -->
+                <!-- 隐藏文件选择框(常驻渲染,多选;保证 triggerFilePicker 随时可点) -->
                 <input
                   ref="zipFileInputRef"
                   type="file"
                   accept=".zip,application/zip"
+                  multiple
                   class="hidden-file-input"
                   aria-hidden="true"
                   tabindex="-1"
@@ -1566,6 +1591,7 @@ onUnmounted(() => {
                 <input
                   ref="singleFileInputRef"
                   type="file"
+                  multiple
                   class="hidden-file-input"
                   aria-hidden="true"
                   tabindex="-1"
@@ -2014,6 +2040,13 @@ onUnmounted(() => {
 .upload-btn .spinner {
   border-color: color-mix(in srgb, var(--color-text-secondary) 30%, transparent);
   border-top-color: var(--color-text-secondary);
+}
+
+/* 已上传 chip 列表(多文件纵向堆叠) */
+.upload-chips {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
 }
 
 /* 已上传:文件信息 chip */

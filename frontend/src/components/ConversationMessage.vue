@@ -12,6 +12,7 @@
  */
 import { computed, ref } from 'vue'
 import { renderMarkdown } from '@/utils/markdown'
+import type { AttachmentInfo } from '@/types/task'
 
 interface StreamingItem {
   conv_id: string
@@ -31,6 +32,8 @@ interface DisplayItem {
   content?: string
   /** 完整评估(可折叠回看,如 agent2 evaluation 的覆盖情况+判断) */
   reasoning?: string | null
+  /** 仅 user 追问消息有:附带上传文件展示信息(只读渲染 chip) */
+  attachments?: AttachmentInfo[] | null
   streaming?: StreamingItem
 }
 
@@ -186,6 +189,20 @@ const shouldCollapseDetail = computed(() => {
 const detailLabel = computed(() =>
   props.item.type === 'tool_call' ? '调用参数' : '工具结果',
 )
+
+/** 附件列表(仅 user 追问消息有;其余为空) */
+const attachmentList = computed<AttachmentInfo[]>(() => props.item.attachments || [])
+
+/** 字节数格式化(附件 chip 用) */
+function formatSize(bytes: number): string {
+  if (!bytes) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  const i = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    units.length - 1,
+  )
+  return `${(bytes / Math.pow(1024, i)).toFixed(i ? 1 : 0)} ${units[i]}`
+}
 </script>
 
 <template>
@@ -280,6 +297,33 @@ const detailLabel = computed(() =>
         :class="['msg-content-card', 'markdown-body', `msg-${variant}`]"
         v-html="displayContentHtml"
       />
+
+      <!-- 用户追问附带的文件 chip(只读展示) -->
+      <div v-if="attachmentList.length" class="msg-attachments">
+        <span
+          v-for="att in attachmentList"
+          :key="att.upload_id"
+          class="msg-att-chip"
+          :title="att.filename"
+        >
+          <svg
+            class="msg-att-icon"
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+            <polyline points="14 2 14 8 20 8" />
+          </svg>
+          <span class="msg-att-name">{{ att.filename }}</span>
+          <span class="msg-att-size">{{ formatSize(att.size) }}</span>
+        </span>
+      </div>
     </template>
   </div>
 </template>
@@ -496,6 +540,41 @@ const detailLabel = computed(() =>
   font-size: var(--fs-xs);
   max-height: 500px;
   overflow-y: auto;
+}
+
+/* 用户追问附件 chip(只读展示) */
+.msg-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.msg-att-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 220px;
+  padding: 3px 8px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+}
+
+.msg-att-icon {
+  flex-shrink: 0;
+}
+
+.msg-att-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg-att-size {
+  flex-shrink: 0;
+  color: var(--color-text-muted);
 }
 
 </style>

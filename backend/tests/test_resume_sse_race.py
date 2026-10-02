@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 import app.models.task_artifact  # noqa: F401
 import app.models.user_git_binding  # noqa: F401
 
+import app.agents.orchestrator as orchestrator
 import app.event_bus as event_bus
 import app.routers.tasks as tasks_module
 from app.models.task import TaskStatus
@@ -118,6 +119,7 @@ def _mk_db_and_task(status: TaskStatus):
     task.user_id = None
     task.current_stage = ""
     task.error_message = "原错误信息"
+    task.params = {}
     conv = MagicMock()
     conv.round_idx = 1
     conv.id = uuid.uuid4()
@@ -128,18 +130,29 @@ def _mk_db_and_task(status: TaskStatus):
 
 
 def _patch_endpoint_env(monkeypatch):
-    """屏蔽端点副作用:总线/推送/日志/线程。"""
+    """屏蔽端点副作用:总线/推送/日志/线程/resume 启动。"""
     monkeypatch.setattr(tasks_module, "reset_task_bus", lambda *a, **k: None)
-    monkeypatch.setattr(tasks_module, "publish", lambda *a, **k: None)
+    published = []
+    monkeypatch.setattr(
+        tasks_module, "publish",
+        lambda tid, etype, data=None: published.append((etype, data)),
+    )
     monkeypatch.setattr(tasks_module, "perf_log", lambda *a, **k: None)
+    launched = []
+    monkeypatch.setattr(
+        tasks_module, "launch_resume_thread",
+        lambda *a, **k: launched.append((a, k)),
+    )
     _FakeThread.instances = []
     monkeypatch.setattr(tasks_module.threading, "Thread", _FakeThread)
+    return launched, published
 
 
 def test_submit_message_completed_syncs_running(monkeypatch):
-    """completed 追问:返回响应前同步落库 RUNNING,再启动后台线程。"""
+    """completed 追问(无审查在跑=immediate):返回响应前同步落库 RUNNING,
+    再启动 resume 线程(经 orchestrator.launch_resume_thread)。"""
     db, task, task_id = _mk_db_and_task(TaskStatus.COMPLETED)
-    _patch_endpoint_env(monkeypatch)
+    launched, _ = _patch_endpoint_env(monkeypatch)
 
     resp = tasks_module.submit_task_message(
         task_id, SendMessageRequest(content="追加检查依赖漏洞"), db, None,
@@ -148,24 +161,81 @@ def test_submit_message_completed_syncs_running(monkeypatch):
     # 状态已同步为 RUNNING(消除 SSE 快照读到 COMPLETED 的窗口)
     assert task.status == TaskStatus.RUNNING
     assert task.current_stage == "用户追加消息,重启执行"
-    # 线程启动且响应 accepted
-    assert len(_FakeThread.instances) == 1
-    assert _FakeThread.instances[0].kwargs["name"] == f"task-{task_id}-resume"
+    # resume 已启动且响应 accepted
+    assert len(launched) == 1
+    args, kwargs = launched[0]
+    assert args[0] == str(task_id)
+    assert args[1] == "追加检查依赖漏洞"
+    assert kwargs.get("upload_ids") is None
     assert resp.accepted is True
+    assert resp.queued_for_review is False
 
 
 def test_submit_message_running_no_thread(monkeypatch):
     """running 追问:只入队,不启动 resume 线程、不改状态。"""
     db, task, task_id = _mk_db_and_task(TaskStatus.RUNNING)
-    _patch_endpoint_env(monkeypatch)
+    launched, _ = _patch_endpoint_env(monkeypatch)
 
     resp = tasks_module.submit_task_message(
         task_id, SendMessageRequest(content="补充要求"), db, None,
     )
 
-    assert len(_FakeThread.instances) == 0
+    assert len(launched) == 0
     assert task.status == TaskStatus.RUNNING  # 原样保持
     assert resp.accepted is True
+
+
+def test_submit_message_during_review_queued(monkeypatch):
+    """核查中追问(审查仍在跑=queued):立即返回 queued_for_review=True,
+    不阻塞、不改状态、不启动 resume —— 消息已落库并实时推送。"""
+    db, task, task_id = _mk_db_and_task(TaskStatus.COMPLETED)
+    launched, published = _patch_endpoint_env(monkeypatch)
+    monkeypatch.setattr(
+        tasks_module, "register_pending_resume",
+        lambda *a, **k: "queued",
+    )
+
+    resp = tasks_module.submit_task_message(
+        task_id, SendMessageRequest(content="深挖一下"), db, None,
+    )
+
+    assert resp.accepted is True
+    assert resp.queued_for_review is True
+    assert "排队" in (resp.message or "")
+    # 不启动 resume、不改状态(审查仍占着任务)
+    assert len(launched) == 0
+    assert task.status == TaskStatus.COMPLETED
+    # 消息事件已推送(审查期间总线打开,前端实时看到追问)
+    assert any(e == "conversation" for e, _ in published)
+    # 消息已落库
+    assert db.add.call_count == 1
+    assert db.commit.call_count >= 1
+
+
+def test_submit_message_claim_window_enqueues(monkeypatch):
+    """queued resume 已接管(claim 窗口=enqueue):按运行中语义入队,
+    不启动第二个 resume(防并发双跑)。"""
+    db, task, task_id = _mk_db_and_task(TaskStatus.COMPLETED)
+    launched, _ = _patch_endpoint_env(monkeypatch)
+    monkeypatch.setattr(
+        tasks_module, "register_pending_resume",
+        lambda *a, **k: "enqueue",
+    )
+    pushed = []
+    monkeypatch.setattr(
+        tasks_module, "push_user_message",
+        lambda *a, **k: pushed.append((a, k)),
+    )
+
+    resp = tasks_module.submit_task_message(
+        task_id, SendMessageRequest(content="再补一条"), db, None,
+    )
+
+    assert resp.accepted is True
+    assert resp.queued_for_review is False
+    assert len(pushed) == 1  # 入队(由新一轮 react_agent 迭代边界消费)
+    assert len(launched) == 0  # 不再启动 resume
+    assert task.status == TaskStatus.COMPLETED  # 状态未动
 
 
 def test_retry_syncs_running(monkeypatch):
@@ -200,7 +270,7 @@ def test_retry_non_failed_rejected(monkeypatch):
 # ============================================================
 
 
-def _mk_background_crash_env(monkeypatch, executor_name):
+def _mk_background_crash_env(monkeypatch, module, main_fn_name):
     """构造后台线程早期崩溃环境:主函数抛异常,捕获 publish/finish。"""
     task = MagicMock()
     task.id = uuid.uuid4()
@@ -209,23 +279,24 @@ def _mk_background_crash_env(monkeypatch, executor_name):
     task.current_stage = ""
     db = MagicMock()
     db.get.return_value = task
-    monkeypatch.setattr(tasks_module, "SessionLocal", lambda: db)
-    monkeypatch.setattr(tasks_module, executor_name, lambda *a, **k: (_ for _ in ()).throw(RuntimeError("早期崩溃")))
-    monkeypatch.setattr(tasks_module, "clear_pause_state", lambda *a, **k: None)
+    monkeypatch.setattr(module, "SessionLocal", lambda: db)
+    monkeypatch.setattr(module, main_fn_name, lambda *a, **k: (_ for _ in ()).throw(RuntimeError("早期崩溃")))
+    monkeypatch.setattr(module, "clear_pause_state", lambda *a, **k: None)
     events = []
-    monkeypatch.setattr(tasks_module, "publish", lambda tid, etype, data: events.append((etype, data)))
+    monkeypatch.setattr(module, "publish", lambda tid, etype, data: events.append((etype, data)))
     finished = []
-    monkeypatch.setattr(tasks_module, "finish_task", lambda tid: finished.append(tid))
+    monkeypatch.setattr(module, "finish_task", lambda tid: finished.append(tid))
     return task, db, events, finished
 
 
 def test_resume_background_crash_publishes_error(monkeypatch):
-    """resume 线程在主 try 块前崩溃 → 置 FAILED 并推 error + finish_task。"""
+    """resume 线程在主 try 块前崩溃 → 置 FAILED 并推 error + finish_task。
+    (resume 线程体已迁至 orchestrator._run_resume_in_background)"""
     task, _, events, finished = _mk_background_crash_env(
-        monkeypatch, "resume_audit_with_message",
+        monkeypatch, orchestrator, "resume_audit_with_message",
     )
 
-    tasks_module._run_resume_in_background(str(task.id), "追问内容")
+    orchestrator._run_resume_in_background(str(task.id), "追问内容")
 
     assert task.status == TaskStatus.FAILED
     assert task.error_message == "早期崩溃"
@@ -237,7 +308,7 @@ def test_resume_background_crash_publishes_error(monkeypatch):
 def test_retry_background_crash_publishes_error(monkeypatch):
     """retry 线程早期崩溃 → 置 FAILED 并推 error + finish_task。"""
     task, _, events, finished = _mk_background_crash_env(
-        monkeypatch, "retry_failed_task",
+        monkeypatch, tasks_module, "retry_failed_task",
     )
 
     tasks_module._run_retry_in_background(str(task.id))

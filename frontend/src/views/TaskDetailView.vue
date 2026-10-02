@@ -55,6 +55,7 @@ import { parseDiffFileSegments } from '@/utils/diffFiles'
 import { renderMarkdown } from '@/utils/markdown'
 import { buildToolSegments, buildToolSummary, parseAgentTrace, toolFileTargetOf } from '@/utils/toolSummary'
 import type {
+  AttachmentInfo,
   CloneProgressEventData,
   Conversation,
   PlanStep,
@@ -584,6 +585,7 @@ function connectSSE(taskId: string): void {
         content: data.content,
         reasoning: data.reasoning ?? null,
         tool_call_id: data.tool_call_id ?? null,
+        attachments: data.attachments ?? null,
         created_at: data.created_at || new Date().toISOString(),
       }
       task.value.conversations.push(conv)
@@ -1062,6 +1064,8 @@ interface DisplayItem {
   reasoning?: string | null
   /** 仅 type=tool_result 有:对应 tool_call 会话记录的 id(并行调用时精确配对) */
   tool_call_id?: string | null
+  /** 仅 user 追问消息有:附带上传文件展示信息(只读渲染 chip) */
+  attachments?: AttachmentInfo[] | null
   /** 流式项字段 */
   streaming?: StreamingItem
 }
@@ -1534,6 +1538,7 @@ const roundGroups = computed<RoundGroup[]>(() => {
         content: c.content,
         reasoning: c.reasoning,
         tool_call_id: c.tool_call_id,
+        attachments: c.attachments,
       })
     }
   })

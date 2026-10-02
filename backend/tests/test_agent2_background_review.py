@@ -5,14 +5,13 @@
 - 审查完成:临时结果被重点与知识点整体替换,review_status=done
 - 审查失败:任务仍 COMPLETED,临时结果保留,review_status=failed
 - review_status 流转:running(审查开始)→ done/failed
-- 审查互斥注册表:wait_for_review 的等待/超时/无注册语义
+- 审查互斥注册表:register_pending_resume 原子路由(queued/enqueue/immediate)
+- 核查中追问排队:审查结束自动 resume(总线保持打开,不推 done)
 - 单 agent 模式:无审查事件,review_status 不动
 - suggestions 落库契约(前端解析 type=suggestions 渲染深挖卡片)
 - 临时结果助手 _replace_interim_results:先清后落单条
 """
 import json
-import threading
-import time
 from unittest.mock import MagicMock
 
 import app.models.task_artifact  # noqa: F401  (mapper 依赖)
@@ -300,44 +299,158 @@ def test_replace_interim_results_clears_and_writes_single_row():
 
 
 # ============================================================
-# 审查互斥注册表:wait_for_review
+# 审查互斥注册表:register_pending_resume 原子路由 + _seal_review
 # ============================================================
 
 
-def test_wait_for_review_no_registration_returns_true():
-    """无审查注册(单 agent/审查已结束清理)→ 立即 True。"""
-    assert orchestrator.wait_for_review("no-such-task") is True
+def _clear_registry(task_id: str) -> None:
+    """清理注册表残留(测试隔离:pending/claim/event)"""
+    with orchestrator._review_lock:
+        orchestrator._review_done_events.pop(task_id, None)
+        orchestrator._pending_resume_messages.pop(task_id, None)
+        orchestrator._resume_claims.discard(task_id)
 
 
-def test_wait_for_review_blocks_until_finished():
-    """审查进行中 → 阻塞等待;审查结束(_mark_review_finished)→ 被唤醒。"""
-    task_id = "task-wait"
-    ev = orchestrator._mark_review_started(task_id)
+def test_register_pending_resume_routes():
+    """三路由:无审查=immediate;审查中=queued(登记);claim 窗口=enqueue。"""
+    task_id = "task-route"
     try:
-        # 注册未完成:短超时返回 False(仍在审查)
-        assert orchestrator.wait_for_review(task_id, timeout=0.05) is False
+        # 无审查注册 → immediate
+        assert orchestrator.register_pending_resume(task_id, "消息") == "immediate"
 
-        # 另一线程稍后标记审查结束
-        t = threading.Timer(0.1, lambda: ev.set())
-        t.start()
-        t_join = time.perf_counter()
-        assert orchestrator.wait_for_review(task_id, timeout=5.0) is True
-        assert time.perf_counter() - t_join < 5.0  # 及时唤醒,非超时返回
+        # 审查中 → queued + 登记(含附件)
+        orchestrator._mark_review_started(task_id)
+        assert orchestrator.register_pending_resume(
+            task_id, "深挖依赖", ["upload-1"],
+        ) == "queued"
+        with orchestrator._review_lock:
+            pending = orchestrator._pending_resume_messages[task_id]
+        assert pending == [("深挖依赖", ["upload-1"])]
+
+        # claim 窗口(queued resume 已接管)→ enqueue(claim 优先于审查事件)
+        with orchestrator._review_lock:
+            orchestrator._resume_claims.add(task_id)
+        assert orchestrator.register_pending_resume(task_id, "再补一条") == "enqueue"
     finally:
-        orchestrator._mark_review_finished(task_id, ev)
-
-    # 清理后:回到"无注册"语义
-    assert orchestrator.wait_for_review(task_id) is True
+        _clear_registry(task_id)
 
 
-def test_wait_for_review_timeout_returns_false():
-    """审查一直未结束 → 超时返回 False(调用方拒绝 resume 消息)。"""
-    task_id = "task-timeout"
-    ev = orchestrator._mark_review_started(task_id)
+def test_seal_review_takes_pending_and_claims():
+    """_seal_review:注销审查事件 + 取走排队消息;有消息时登记 claim。"""
+    task_id = "task-seal"
     try:
-        assert orchestrator.wait_for_review(task_id, timeout=0.05) is False
+        ev = orchestrator._mark_review_started(task_id)
+        orchestrator.register_pending_resume(task_id, "排队消息")
+
+        pending = orchestrator._seal_review(task_id)
+
+        assert pending == [("排队消息", None)]
+        with orchestrator._review_lock:
+            assert task_id not in orchestrator._review_done_events  # 事件已注销
+            assert task_id not in orchestrator._pending_resume_messages  # 消息已取走
+            assert task_id in orchestrator._resume_claims  # 已接管
+        assert ev.is_set() is False  # ev 由 _finalize_review 置位,seal 不动
     finally:
-        orchestrator._mark_review_finished(task_id, ev)
+        _clear_registry(task_id)
+
+
+# ============================================================
+# 核查中追问排队:审查结束自动 resume(总线保持打开)
+# ============================================================
+
+
+def test_pending_message_auto_resumes_without_done(monkeypatch):
+    """审查期间注册的追问 → 审查结束后自动 launch_resume_thread(queued),
+    不推 done、不 finish_task(总线保持打开,前端 SSE 不断线)。"""
+    task = _mk_task()
+    executor = MagicMock()
+    executor.name = "builtin"
+    executor.run = MagicMock(return_value=([], "总结", []))
+
+    # 在审查执行期间(run_agent2 回调)注册排队消息,模拟核查中用户追问
+    def _ua(*args, **kwargs):
+        orchestrator.register_pending_resume(task.id, "深挖一下依赖漏洞")
+        return _mk_review_result()
+
+    _patch_env(monkeypatch, executor, _ua)
+
+    launched = []
+    monkeypatch.setattr(
+        orchestrator, "launch_resume_thread",
+        lambda tid, msg, upload_ids=None, queued=False:
+            launched.append((tid, msg, upload_ids, queued)),
+    )
+    rec = _EventRecorder(monkeypatch)
+
+    try:
+        orchestrator.run_dual_agent_audit(task, MagicMock())
+    finally:
+        _clear_registry(str(task.id))
+
+    # 自动 resume 启动:消息原文 + queued 标志
+    assert launched == [(str(task.id), "深挖一下依赖漏洞", None, True)]
+    # review_done 照常推送(侧栏 badge 更新),但不推 done / finish(总线打开)
+    assert rec.events("review_done")
+    assert not rec.events("done")
+    assert rec.index(("finish",)) == -1
+
+
+def test_no_pending_message_publishes_done(monkeypatch):
+    """无排队消息 → 审查结束推 done + finish_task(原行为不变)。"""
+    task = _mk_task()
+    executor = MagicMock()
+    executor.name = "builtin"
+    executor.run = MagicMock(return_value=([], "总结", []))
+
+    _patch_env(monkeypatch, executor, lambda *a, **k: _mk_review_result())
+
+    launched = []
+    monkeypatch.setattr(
+        orchestrator, "launch_resume_thread",
+        lambda tid, msg, upload_ids=None, queued=False:
+            launched.append((tid, msg, upload_ids, queued)),
+    )
+    rec = _EventRecorder(monkeypatch)
+
+    orchestrator.run_dual_agent_audit(task, MagicMock())
+
+    assert launched == []  # 无自动 resume
+    assert rec.index("review_done") < rec.index("done")  # done 照常
+    assert rec.index("done") < rec.index(("finish",))    # finish 照常
+
+
+def test_multiple_pending_messages_merged(monkeypatch):
+    """多条排队消息合并为一次 resume(消息 \n\n 连接,附件去重保序)。"""
+    task = _mk_task()
+    executor = MagicMock()
+    executor.name = "builtin"
+    executor.run = MagicMock(return_value=([], "总结", []))
+
+    def _ua(*args, **kwargs):
+        orchestrator.register_pending_resume(task.id, "第一条", ["u1", "u2"])
+        orchestrator.register_pending_resume(task.id, "第二条", ["u2", "u3"])
+        return _mk_review_result()
+
+    _patch_env(monkeypatch, executor, _ua)
+
+    launched = []
+    monkeypatch.setattr(
+        orchestrator, "launch_resume_thread",
+        lambda tid, msg, upload_ids=None, queued=False:
+            launched.append((tid, msg, upload_ids, queued)),
+    )
+    _EventRecorder(monkeypatch)
+
+    try:
+        orchestrator.run_dual_agent_audit(task, MagicMock())
+    finally:
+        _clear_registry(str(task.id))
+
+    assert len(launched) == 1
+    tid, msg, upload_ids, queued = launched[0]
+    assert msg == "第一条\n\n第二条"
+    assert upload_ids == ["u1", "u2", "u3"]  # 去重保序
+    assert queued is True
 
 
 # ============================================================
