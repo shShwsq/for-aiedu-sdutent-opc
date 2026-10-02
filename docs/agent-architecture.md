@@ -64,10 +64,11 @@
 - **agent1 单轮执行**:初始运行只有 1 轮 agent1(无 agent2 初始评估,agent1 直接按用户意图执行)→ 返回 `summary`
 - **agent1 结束即任务完成**:summary 落库为临时 Result,`task.status=COMPLETED`、`review_status=running`,推 `agent1_done`(事件总线保持打开)。用户感知的"任务完成"以 agent1 结束为准
 - **agent2 后台审查**:在同一后台线程内单次完整核查(只读工具核对 / verify / check_reference),整理重点与知识点(`results + grouping`)替换临时结果,发现缺口输出"建议深挖方向"(`suggestions`,0-3 条);审查完成 `review_status=done` → 推 `review_done` → `done` → `finish_task`。agent2 只审不改
+- **纯对话轮跳过审查**:本轮 agent1 无任何工具调用(`_round_has_tool_calls` 查 Conversation 无 `role=agent1, type=tool_call` 记录;builtin 与 CLI 执行器均按此落库)→ 判定为纯对话轮,`_finish_conversation_round` 直接收尾(推 `agent1_done` → `done` → `finish_task`),跳过审查/结果替换/练习题/记忆归纳,保留既有结果与审查状态。不进入 `review_running`,后续 resume 不受 `wait_for_review` 阻塞
 - **审查失败/降级**:保留 agent1 summary 临时结果,`review_status=failed`,落警告对话,仍推 `review_done(review_status=failed)` → `done`;任务状态不回滚(审查失败 ≠ 任务失败)
 - **无"协作总轮次"设置**:初始运行单轮,多轮协作由用户驱动(resume)。原 `AgentPolicy.max_rounds` 已移除(启动迁移 `migrate_agent_policy_drop_max_rounds_column` 幂等 DROP 老库列)
 - **单 agent 退化**:协作策略页关闭 Agent 2(`agent2_enabled=false`)后退化为单 agent 模式——agent1 跑 1 轮直接产出结果,无后台审查,`review_status` 保持 `NULL`
-- **resume(用户驱动多轮)**:用户追加消息 / 点击建议「深挖」触发。审查进行中时 resume 先等待审查结束(`wait_for_review`,超时 120s 拒绝);用户消息**原文直接交给 agent1** 跑一轮(不经 agent2 转述,agent1 跨轮历史由 `_build_history_context` 注入),结束后再次后台审查。每次 resume = agent1 一轮 + 后台审查
+- **resume(用户驱动多轮)**:用户追加消息 / 点击建议「深挖」触发。审查进行中时 resume 先等待审查结束(`wait_for_review`,超时 120s 拒绝);用户消息**原文直接交给 agent1** 跑一轮(不经 agent2 转述,agent1 跨轮历史由 `_build_history_context` 注入),结束后按轮次类型分流:纯对话轮直接收尾,分析轮再次后台审查。每次 resume = agent1 一轮 + (分析轮)后台审查
 - **review_status 状态模型**:`NULL`(未审查:单 agent / 老任务)/ `running`(审查中)/ `done`(完成)/ `failed`(失败,任务仍 COMPLETED)。启动迁移 `migrate_stale_review_status` 把遗留 `running` 置 `failed`(后端重启后审查线程已死)
 
 ### 1.3 交付物来源与上传链路(uploads → orchestrator)
@@ -160,6 +161,11 @@ def run_agent2(
 建议深挖方向(suggestions)。
 [记忆提示] 上面已附上你之前各轮的评估记录，请保持覆盖度判断的连续性...
 ```
+
+> 轮次 summary 注入有长度上限(与 react_agent 侧历史压缩同常数):单条截断
+> `MAX_HISTORY_MSG_CHARS=3000`,总量超 `MAX_HISTORY_TOTAL_CHARS=12000` 时从
+> 最早轮开始丢弃(至少保留最近一轮,轮次编号保持原值),头部加省略标记
+> —— 多轮 resume 后轮次持续累积,不设上限会让 agent2 prompt 无界增长。
 
 ### 2.5 跨轮记忆（`_build_agent2_history`）
 
@@ -703,7 +709,7 @@ list of `{label, header_name, header_value}`：
 | 交互类型 | 触发条件 | 传递方式 |
 |---------|---------|---------|
 | **运行中追加消息** | 用户在对话界面输入框发消息 | API 端点落库 `Conversation(role=user, type=message)` + 推 SSE；react_agent 每个迭代开头 `drain_user_messages` 注入 `messages` |
-| **完成后重启(resume)** | 任务 COMPLETED 后用户追加消息 / 点击建议「深挖」 | 审查进行中先 `wait_for_review`(超时 120s 拒绝);`resume_audit_with_message`:用户消息原文直传 agent1 跑一轮(不经 agent2 转述) → 再次后台审查。多轮由用户驱动 |
+| **完成后重启(resume)** | 任务 COMPLETED 后用户追加消息 / 点击建议「深挖」 | 审查进行中先 `wait_for_review`(超时 120s 拒绝);`resume_audit_with_message`:用户消息原文直传 agent1 跑一轮(不经 agent2 转述) → 按轮次类型分流(纯对话轮直接收尾,分析轮再次后台审查)。多轮由用户驱动 |
 
 ### 7.4 事件流（event_bus）
 

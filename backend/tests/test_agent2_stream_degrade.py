@@ -125,7 +125,7 @@ def _patch_resume_env(monkeypatch, executor, ua_side_effect):
                         lambda *a, **k: None)
     monkeypatch.setattr(orchestrator, "run_agent2", ua_side_effect)
 
-    # _finish_resume 内部导入的归纳记忆/工作区 diff:屏蔽真实副作用
+    # _run_background_review 内部导入的归纳记忆/工作区 diff:屏蔽真实副作用
     import app.services.memory_summarize as memory_summarize
     import app.services.workspace_diff as workspace_diff
     monkeypatch.setattr(memory_summarize, "summarize_and_save_memory",
@@ -333,6 +333,63 @@ def test_dual_collab_degraded_ends_round(monkeypatch):
     assert task.status == TaskStatus.COMPLETED
     # 审查降级 → 子状态 failed(任务本身不失败,保留临时结果)
     assert task.review_status == "failed"
+
+
+# ============================================================
+# 纯对话轮:本轮无工具调用 → 跳过后台审查与重下游
+# ============================================================
+
+
+def _mk_no_tool_db():
+    """db mock:_round_has_tool_calls 的 query→filter→first 链返回 None
+    (即本轮没有任何 tool_call 记录)。"""
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = None
+    return db
+
+
+def test_dual_conversation_round_skips_review(monkeypatch):
+    """初始运行纯对话轮(如问候,无工具调用)→ agent2 不被调用,任务直接完成。"""
+    task = _mk_dual_task()
+    ua_calls = []
+
+    executor = MagicMock()
+    executor.name = "builtin"
+    executor.run = MagicMock(return_value=([], "你好!很高兴帮你分析代码。", []))
+
+    _patch_dual_env(monkeypatch, executor, lambda *a, **k: ua_calls.append(1))
+
+    orchestrator.run_dual_agent_audit(task, _mk_no_tool_db())
+
+    executor.run.assert_called_once()
+    assert not ua_calls  # 纯对话轮不触发 agent2 审查
+    assert task.status == TaskStatus.COMPLETED
+    assert "纯对话" in task.current_stage
+
+
+def test_resume_conversation_round_skips_review(monkeypatch):
+    """resume 纯对话轮(追问直接回答,无工具调用)→ 跳过审查/练习题/记忆,
+    保留既有结果与上一轮审查状态。"""
+    task = _mk_resume_task()
+    task.review_status = "done"  # 上一轮(分析轮)的审查状态
+    ua_calls = []
+
+    executor = MagicMock()
+    executor.name = "builtin"
+    executor.run = MagicMock(return_value=([], "这个函数用于校验入参。", []))
+
+    _patch_resume_env(monkeypatch, executor, lambda *a, **k: ua_calls.append(1))
+
+    orchestrator.resume_audit_with_message(task, _mk_no_tool_db(), "这个函数是干嘛的?")
+
+    # 用户消息仍逐字直传 agent1
+    executor.run.assert_called_once()
+    assert executor.run.call_args.kwargs["followup_query"] == "这个函数是干嘛的?"
+    assert not ua_calls  # 纯对话轮不触发 agent2 审查
+    assert task.status == TaskStatus.COMPLETED
+    assert "纯对话" in task.current_stage
+    # 既有审查状态保留(未被置为 running/failed)
+    assert task.review_status == "done"
 
 
 # ============================================================

@@ -557,11 +557,28 @@ def run_agent2(
     else:
         # 把 agent1 的自然语言总结给 agent2 质检
         # 注意:agent1 只输出自然语言 summary,不再有结构化 results 字段
+        # 单条截断 + 总量滑动窗口(与 react_agent 侧历史压缩同常数):
+        # 多轮 resume 后轮次持续累积,不设上限会让 agent2 prompt 无界增长
         rounds_text = []
         for i, r in enumerate(agent1_summaries, 1):
-            summary = r.get("summary", "(无 summary)")
+            summary = (r.get("summary") or "(无 summary)")[:MAX_HISTORY_MSG_CHARS]
             rounds_text.append(
                 f"### 第 {i} 轮 agent1 自然语言总结\n{summary}"
+            )
+        total_chars = sum(len(s) for s in rounds_text)
+        if total_chars > MAX_HISTORY_TOTAL_CHARS:
+            # 超总量上限:从最早轮开始丢弃(至少保留最近一轮;轮次编号保持
+            # 原值,便于与 agent2 自己的跨轮评估记录对齐),头部加省略标记
+            dropped = 0
+            while len(rounds_text) > 1 and total_chars > MAX_HISTORY_TOTAL_CHARS:
+                total_chars -= len(rounds_text[0])
+                rounds_text.pop(0)
+                dropped += 1
+            kept = len(rounds_text)
+            rounds_text.insert(
+                0,
+                f"[...早期 {dropped} 轮 agent1 总结已省略(超长度上限),"
+                f"以下仅保留最近 {kept} 轮...]",
             )
 
         # 跨轮记忆注入:agent2 看到自己之前各轮的评估记录,

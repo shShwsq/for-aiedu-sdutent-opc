@@ -9,6 +9,10 @@
    (suggestions,由用户决定是否让 agent1 继续深挖)
 4. 审查完成推 review_done + done;练习题生成/记忆归纳在审查后链式触发
 
+纯对话轮(本轮 agent1 无任何工具调用,回答完全来自历史上下文)在步骤 2
+之前直接收尾:跳过审查/结果替换/练习题/记忆归纳,保留既有结果与审查状态
+—— 交互对齐 Codex 式问答,纯追问即回答,不触发审查流水线。
+
 resume(用户追加消息/点击建议深挖):
 - 用户消息直接交给 agent1 跑一轮(不经 agent2 转述;agent1 跨轮历史
   由 react_agent._build_history_context 自行注入),随后走后台审查
@@ -314,6 +318,16 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
         )
         react_summaries.append({"round": 1, "summary": summary})
 
+        # ===== 轮次类型判定:纯对话轮(如问候/纯问答)跳过审查与重下游 =====
+        # 本轮无任何工具调用 → agent1 未触碰工作区,无新证据可审;
+        # 保留既有结果与审查状态(首轮即对话则任务无结果,回答在对话流)
+        if not _round_has_tool_calls(db, task.id, 1):
+            _finish_conversation_round(
+                task, db, rounds=len(react_summaries), mode="dual_agent",
+            )
+            normal_completed = True  # 正常完成:finally 不再兑底推 error
+            return  # finally 块仍会执行清理
+
         # agent1 summary 作为临时结果:审查完成前给前端可展示的结果
         # (审查完成后会被 agent2 的重点与知识点整体替换)
         all_results_count = _replace_interim_results(db, task, 1, summary)
@@ -452,8 +466,53 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
 
 
 # ============================================================
-# 辅助:记录 agent2 的对话 / 临时结果 / 后台审查
+# 辅助:轮次类型判定 / 记录 agent2 的对话 / 临时结果 / 后台审查
 # ============================================================
+
+
+def _round_has_tool_calls(db: Session, task_id, round_idx: int) -> bool:
+    """判定某轮 agent1 是否有过工具调用
+
+    builtin react_agent 与 CLI 执行器(acp_base)的工具调用均落库为
+    Conversation(role=agent1, type=tool_call),统一按此判定。
+    """
+    return (
+        db.query(Conversation.id)
+        .filter(
+            Conversation.task_id == task_id,
+            Conversation.round_idx == round_idx,
+            Conversation.role == "agent1",
+            Conversation.type == "tool_call",
+        )
+        .first()
+        is not None
+    )
+
+
+def _finish_conversation_round(
+    task: Task, db: Session, *, rounds: int, mode: str,
+) -> None:
+    """纯对话轮收尾:跳过后台审查与重下游,直接完成任务
+
+    纯对话轮 = 本轮 agent1 无任何工具调用(未触碰工作区,回答完全来自
+    历史上下文/模型知识):无新证据可审,跳过 agent2 审查、结果替换、
+    练习题生成与记忆归纳,保留既有结果与审查状态。交互对齐 Codex 式
+    问答 —— 纯追问即回答,不为一次对话触发整条审查流水线。
+
+    终止事件序列与单 agent 收尾同构:agent1_done → done → finish_task
+    (不进入 review_running,后续 resume 不受 wait_for_review 阻塞)。
+    """
+    task.status = TaskStatus.COMPLETED
+    task.current_stage = "任务完成(本轮为纯对话,跳过审查)"
+    task.completed_at = datetime.now(timezone.utc)
+    db.commit()
+    _publish_status(task)
+    # 领域事件:任务完成(对话轮,时刻=agent1 结束)
+    emit(TASK_COMPLETED, task.id, mode=mode, rounds=rounds)
+    perf_log(task.id, "agent1_done", rounds=rounds, conversation_round=True)
+    publish(task.id, "agent1_done", {"status": "completed"})
+    publish(task.id, "done", {"status": "completed"})
+    finish_task(task.id)
 
 
 def _record_agent2_review(
@@ -1162,8 +1221,10 @@ def resume_audit_with_message(
        同轮,不隔轮);失败重试时从 max+1 续接新轮
     4. agent1 直接执行用户消息(原文直传,不经 agent2 转述;
        跨轮历史由 react_agent._build_history_context 注入)
-    5. agent1 轮结束:summary 落临时结果,任务 COMPLETED(推 agent1_done)
-    6. 后台审查(同初始运行):整理重点与知识点替换临时结果,推 review_done + done
+    5. 轮次类型判定:纯对话轮(本轮无工具调用)直接收尾,保留既有结果
+       与审查状态,跳过审查/练习题/记忆归纳
+    6. agent1 轮结束:summary 落临时结果,任务 COMPLETED(推 agent1_done)
+    7. 后台审查(同初始运行):整理重点与知识点替换临时结果,推 review_done + done
 
     用户消息本身已由 API 端点落库为 Conversation(role=user, type=message),
     本函数不重复落库。
@@ -1273,14 +1334,24 @@ def resume_audit_with_message(
         )
         react_summaries.append({"round": start_round_idx, "summary": summary})
 
+        # ===== 轮次类型判定:纯对话轮(仅双 agent 模式)跳过审查与重下游 =====
+        # 本轮无任何工具调用 → agent1 回答完全来自历史上下文,无新证据可审;
+        # 保留既有整理结果与审查状态,不触发练习题/记忆归纳。
+        # 单 agent 模式本就无审查链,保持原行为(结果替换为 summary)
+        if ua_enabled and not _round_has_tool_calls(db, task.id, start_round_idx):
+            _finish_conversation_round(
+                task, db, rounds=len(react_summaries), mode="resume",
+            )
+            normal_completed = True  # 正常完成:finally 不再兑底推 error
+            return  # finally 块仍会执行清理
+
         # 本轮 summary 落临时结果(替换上一次的临时/审查产出)
         _replace_interim_results(db, task, start_round_idx, summary)
 
         # ===== 单 agent 模式:agent2 已禁用,执行完直接收尾(无审查) =====
         if not ua_enabled:
             logger.info(f"[task={task.id}] resume 单 agent 模式(agent2 已禁用)")
-            # ua_result=None:_finish_resume 据此写简洁总结(无 agent2 评估可展示)
-            _finish_resume(task, db, react_summaries, ua_result=None)
+            _finish_resume(task, db, react_summaries)
             normal_completed = True  # 正常完成:finally 不再兑底推 error(见 finally 注释)
             return  # finally 块仍会执行清理
 
@@ -1474,15 +1545,12 @@ def _err_detail(e: Exception) -> str:
     return text if text else f"{type(e).__name__}(无错误详情)"
 
 
-def _finish_resume(
-    task: Task, db: Session, react_summaries: list[dict], ua_result: dict | None,
-) -> None:
+def _finish_resume(task: Task, db: Session, react_summaries: list[dict]) -> None:
     """resume 收尾(单 agent 模式):标记状态 + 终止事件
 
-    ua_result=None 表示单 agent 模式(agent2 已禁用):
-    无 agent2 评估可展示,不写总结对话。
-    该路径结果已由调用方落库(_replace_interim_results),后续后台审查
-    路径不走此函数(由 _run_background_review 负责收尾)。
+    仅单 agent 模式(agent2 已禁用)使用:无 agent2 评估可展示,
+    不写总结对话。该路径结果已由调用方落库(_replace_interim_results),
+    后续后台审查路径不走此函数(由 _run_background_review 负责收尾)。
     """
     task.status = TaskStatus.COMPLETED
     task.current_stage = "重启执行完成"
@@ -1491,13 +1559,6 @@ def _finish_resume(
     _publish_status(task)
     # 领域事件:任务完成(resume/重试续跑路径)
     emit(TASK_COMPLETED, task.id, mode="resume", rounds=len(react_summaries))
-    if ua_result is not None:
-        # 与主流程一致:总结只展示最终评估本身
-        _add_conversation(
-            db, task, round_idx=len(react_summaries),
-            role="agent2", type="summary",
-            content=ua_result.get("reasoning") or "(未给出最终评估)",
-        )
 
     # 提前推送 done 事件:results 已落库,让前端立即拉取展示
     # (归纳记忆和 git diff 是后台兑底任务,不阻塞前端结果清单展示)
