@@ -90,8 +90,10 @@ class Settings(BaseSettings):
     # 注意:不建议追加 .svg(可内嵌脚本,有 XSS 风险)
     SKILL_ALLOWED_EXTENSIONS_EXTRA: str = ".png,.jpg,.jpeg,.webp,.gif"
 
-    # 任务交付物上传目录(ZIP 解压存树 / 单文件原样存,带 meta.json;
+    # 任务交付物上传目录(Stage 1 永久 staging:ZIP 解压存树 / 单文件原样存,带 meta.json;
     # 任务创建后长期保留,供失败重试 / 完成后追问 resume 复用)
+    # 仅 STORAGE_BACKEND=local 时使用。默认相对路径便于开发;生产必须用 env 覆盖为绝对路径
+    # (相对路径按进程 CWD 解析,存储位置随 uvicorn 启动目录漂移),并挂载持久卷
     UPLOADS_DIR: str = "./uploads_data"
 
     # ---- 引用复核(check_reference,agent2 用)----
@@ -134,6 +136,29 @@ class Settings(BaseSettings):
     UPLOAD_MAX_SINGLE_FILE_MB: int = 50
     # 解压后文件条目数上限(默认 2000)
     UPLOAD_MAX_FILES: int = 2000
+
+    # ---- 交付物存储后端(Stage 1 永久层)----
+    # 部署级选择(一套部署一个后端):local=本地磁盘 UPLOADS_DIR / s3=S3 兼容对象存储
+    # 详见 app/services/upload_storage.py
+    STORAGE_BACKEND: str = "local"
+    # S3 兼容对象存储(仅 STORAGE_BACKEND=s3 时读取;MinIO / 阿里云 OSS S3 兼容端点 / AWS S3)
+    # 端点(自建/云上兼容端点,如 https://oss-cn-hangzhou.aliyuncs.com 或 http://minio:9000);
+    # 留空则用 boto3 默认(AWS S3)
+    S3_ENDPOINT_URL: str = ""
+    S3_BUCKET: str = ""
+    S3_REGION: str = ""
+    S3_ACCESS_KEY_ID: str = ""
+    S3_SECRET_ACCESS_KEY: str = ""
+    # 对象 key 前缀(以 / 结尾;upload 对象存于 {prefix}{upload_id}/ 下)
+    S3_PREFIX: str = "uploads/"
+
+    # ---- 交付物保留 / GC ----
+    # 是否启用后台保留清理任务(lifespan 启动的周期协程)
+    UPLOAD_GC_ENABLED: bool = True
+    # 保留天数:任务进入终态(completed/failed)且超过此天数,或孤儿上传超过此天数,才清理
+    UPLOAD_RETENTION_DAYS: int = 30
+    # GC 周期(小时)
+    UPLOAD_GC_INTERVAL_HOURS: int = 24
 
     # 沙箱配置(阶段 2 起)
     # mode: local(本地模式,不用沙箱,在宿主机文件系统直接执行)/ sandbox(连真实 OpenSandbox Server)

@@ -1,9 +1,10 @@
 """任务交付物上传存储(ZIP 解压存树 / 单文件原样存)
 
-两种交付物(为合同场景预留单文件,常见为项目 ZIP):
-- zip:上传时校验(zip-slip / 大小 / 条目数)后解压成树,
-  存到 UPLOADS_DIR/{upload_id}/files/
-- file:单文件原样存到 UPLOADS_DIR/{upload_id}/files/<filename>
+存储落点由存储后端抽象(settings.STORAGE_BACKEND,见 app/services/upload_storage.py)
+决定:local 后端为 UPLOADS_DIR/{upload_id}/files/,s3 后端为对象 key
+{S3_PREFIX}{upload_id}/files/{relpath}。本模块只负责校验 + 门面,不直接碰磁盘/对象布局:
+- file:单文件原样存到 {upload_id}/files/<filename>
+- zip:校验后解压成树存到 {upload_id}/files/
 
 每个上传目录带 meta.json(filename/kind/size/file_count/user_id/created_at):
 - 任务创建时校验归属(只能引用自己上传的文件)
@@ -23,25 +24,37 @@
 import io
 import json
 import logging
+import shutil
 import uuid
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 from app.config import settings
+from app.services.upload_storage import (
+    FILES_DIR,
+    META_FILE,
+    UploadError,
+    get_backend,
+)
+
+# UploadError 下移到存储层(后端直接抛出),此处 re-export 保持
+# `from app.services.uploads import UploadError` 的既有导入不变。
+__all__ = [
+    "UploadError",
+    "save_upload",
+    "load_upload_meta",
+    "materialize_upload_files",
+    "validate_upload_for_task",
+]
 
 logger = logging.getLogger(__name__)
 
 # Mac zip 常见噪音(打包时自动生成的资源分叉 / 元数据)
 _SKIP_PREFIXES = ("__MACOSX/",)
 _SKIP_NAMES = {".DS_Store"}
-
-# meta.json 文件名(存储在 {upload_id}/ 下,与 files/ 同级)
-META_FILE = "meta.json"
-
-
-class UploadError(ValueError):
-    """上传相关错误(校验失败 / 不存在)。调用方转 HTTP 状态码。"""
 
 
 def _validate_entry_name(name: str) -> None:
@@ -60,12 +73,6 @@ def _is_skippable(name: str) -> bool:
     if name in _SKIP_NAMES:
         return True
     return any(name.startswith(p) for p in _SKIP_PREFIXES)
-
-
-def _uploads_root() -> Path:
-    root = Path(settings.UPLOADS_DIR)
-    root.mkdir(parents=True, exist_ok=True)
-    return root
 
 
 def _sanitize_single_filename(filename: str) -> str:
@@ -101,31 +108,45 @@ def save_upload(data: bytes, filename: str, user_id) -> dict:
         f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:12]}"
     )
 
-    upload_dir = _uploads_root() / upload_id
-    files_dir = upload_dir / "files"
+    # 存储后端提供本地暂存根:local=最终目录(is_temp=False),s3=临时目录(is_temp=True)
+    backend = get_backend()
+    staging_root, is_temp = backend.staging_root(upload_id)
+    files_dir = staging_root / FILES_DIR
     files_dir.mkdir(parents=True, exist_ok=True)
 
-    if is_zip:
-        file_count = _extract_zip_tree(data, files_dir)
-        kind = "zip"
-    else:
-        name = _sanitize_single_filename(filename)
-        (files_dir / name).write_bytes(data)
-        file_count = 1
-        kind = "file"
+    try:
+        if is_zip:
+            file_count = _extract_zip_tree(data, files_dir)
+            kind = "zip"
+        else:
+            name = _sanitize_single_filename(filename)
+            (files_dir / name).write_bytes(data)
+            file_count = 1
+            kind = "file"
 
-    meta = {
-        "upload_id": upload_id,
-        "kind": kind,
-        "filename": filename or "upload",
-        "size": len(data),
-        "file_count": file_count,
-        "user_id": str(user_id),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    (upload_dir / META_FILE).write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+        meta = {
+            "upload_id": upload_id,
+            "kind": kind,
+            "filename": filename or "upload",
+            "size": len(data),
+            "file_count": file_count,
+            "user_id": str(user_id),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        (staging_root / META_FILE).write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        # local:staging 即最终位置(no-op);s3:上传整棵树为对象
+        backend.persist(upload_id, staging_root)
+    except Exception:
+        # 落盘/上传失败:清理半成品,避免残留脏目录/孤儿对象
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+    finally:
+        # s3 临时暂存目录用完即删;local 的 staging 是真源,绝不能删
+        if is_temp:
+            shutil.rmtree(staging_root, ignore_errors=True)
+
     logger.info(
         f"[uploads] 保存成功: upload_id={upload_id}, kind={kind}, "
         f"filename={filename}, file_count={file_count}, size={len(data)}"
@@ -199,30 +220,27 @@ def _check_upload_id(upload_id: str) -> None:
 
 
 def load_upload_meta(upload_id: str) -> dict:
-    """读取上传的 meta.json
+    """读取上传的 meta.json(委托存储后端)
 
-    抛出 UploadError:upload_id 不合法或上传不存在
+    抛出 UploadError:upload_id 不合法或上传不存在 / 损坏
     """
     _check_upload_id(upload_id)
-    meta_path = _uploads_root() / upload_id / META_FILE
-    if not meta_path.is_file():
-        raise UploadError(f"上传不存在或已被清理: {upload_id}")
-    try:
-        return json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        raise UploadError(f"上传元数据损坏: {upload_id}") from e
+    return get_backend().load_meta(upload_id)
 
 
-def get_upload_files_dir(upload_id: str) -> Path:
-    """获取上传内容的 files 目录(orchestrator 传输进沙箱用)
+@contextmanager
+def materialize_upload_files(upload_id: str) -> Iterator[Path]:
+    """产出上传内容 files 目录的本地路径(上下文管理器;orchestrator 传输进沙箱用)
 
-    抛出 UploadError:upload_id 不合法 / 上传不存在 / files 目录缺失
+    local 后端:yield 真源目录,退出**不删除**(Stage 1 长期保留);
+    s3 后端:下载到临时目录,yield 后退出自动清理。
+    调用方应在 with 块内完成 transfer_upload_to_workspace。
+
+    抛出 UploadError:upload_id 不合法 / 上传不存在 / files 缺失
     """
     _check_upload_id(upload_id)
-    files_dir = _uploads_root() / upload_id / "files"
-    if not files_dir.is_dir():
-        raise UploadError(f"上传不存在或已被清理: {upload_id}")
-    return files_dir
+    with get_backend().materialize_files(upload_id) as files_dir:
+        yield files_dir
 
 
 def validate_upload_for_task(upload_id: str, current_user_id) -> dict:

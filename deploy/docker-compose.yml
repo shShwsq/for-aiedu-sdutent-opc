@@ -19,6 +19,9 @@ services:
       - backend_logs:/app/backend/logs
       # 用户上传的 skill(不挂卷则容器重建后丢失)
       - user_skills:/app/backend/user_skills
+      # 任务交付物上传(Stage 1 永久真源,失败重试 / resume 复用;
+      # 不挂卷则容器重建后永久丢失且不可再生,须与 UPLOADS_DIR 绝对路径一致)
+      - uploads_data:/app/backend/uploads_data
       # 本地克隆目录(local 模式备用,生产 sandbox 模式几乎不写)
       - backend_repos:/app/backend/_repos
     restart: unless-stopped
@@ -56,6 +59,7 @@ services:
 volumes:
   backend_logs:
   user_skills:
+  uploads_data:
   backend_repos:
 
 networks:

@@ -1019,14 +1019,13 @@ def _prepare_upload_context(
     """
     from app.services.uploads import (
         UploadError,
-        get_upload_files_dir,
         load_upload_meta,
+        materialize_upload_files,
     )
 
     upload_id = (task.params or {}).get("upload_id")
     try:
         meta = load_upload_meta(upload_id)
-        files_dir = get_upload_files_dir(upload_id)
     except UploadError as e:
         raise RuntimeError(f"上传内容不可用: {e}") from e
 
@@ -1034,9 +1033,15 @@ def _prepare_upload_context(
     db.commit()
     _publish_status(task)
 
-    repo_path = sandbox_tools.transfer_upload_to_workspace(
-        task_id_str, str(files_dir)
-    )
+    # materialize:local 后端直接给真源目录(退出不删);s3 后端下载到临时目录,
+    # with 退出即清理——故传输进沙箱必须在 with 块内完成。
+    try:
+        with materialize_upload_files(upload_id) as files_dir:
+            repo_path = sandbox_tools.transfer_upload_to_workspace(
+                task_id_str, str(files_dir)
+            )
+    except UploadError as e:
+        raise RuntimeError(f"上传内容不可用: {e}") from e
     logger.info(f"[task={task.id}] 上传交付物传输完成,path={repo_path}")
 
     # 根目录列表 → repo_context(同 clone 分支;list_files 复用同一会话)

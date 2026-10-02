@@ -16,8 +16,8 @@ import pytest
 from app.config import settings
 from app.services.uploads import (
     UploadError,
-    get_upload_files_dir,
     load_upload_meta,
+    materialize_upload_files,
     save_upload,
     validate_upload_for_task,
 )
@@ -54,9 +54,9 @@ def test_save_zip_extracts_tree():
     assert meta["kind"] == "zip"
     assert meta["file_count"] == 2
     assert meta["size"] == len(data)
-    files = get_upload_files_dir(meta["upload_id"])
-    assert (files / "src" / "main.py").read_text() == "print(1)"
-    assert (files / "dir" / "sub" / "a.txt").read_text() == "hello"
+    with materialize_upload_files(meta["upload_id"]) as files:
+        assert (files / "src" / "main.py").read_text() == "print(1)"
+        assert (files / "dir" / "sub" / "a.txt").read_text() == "hello"
     # meta.json 可回读
     m = load_upload_meta(meta["upload_id"])
     assert m["filename"] == "project.zip"
@@ -73,10 +73,10 @@ def test_save_zip_skips_mac_noise():
     })
     meta = save_upload(data, "noise.zip", "u1")
     assert meta["file_count"] == 1
-    files = get_upload_files_dir(meta["upload_id"])
-    assert (files / "README.md").read_text() == "hi"
-    assert not (files / "__MACOSX").exists()
-    assert not (files / ".DS_Store").exists()
+    with materialize_upload_files(meta["upload_id"]) as files:
+        assert (files / "README.md").read_text() == "hi"
+        assert not (files / "__MACOSX").exists()
+        assert not (files / ".DS_Store").exists()
 
 
 def test_save_single_file():
@@ -84,15 +84,15 @@ def test_save_single_file():
     meta = save_upload(b"contract body", "contract.docx", "u1")
     assert meta["kind"] == "file"
     assert meta["file_count"] == 1
-    files = get_upload_files_dir(meta["upload_id"])
-    assert (files / "contract.docx").read_bytes() == b"contract body"
+    with materialize_upload_files(meta["upload_id"]) as files:
+        assert (files / "contract.docx").read_bytes() == b"contract body"
 
 
 def test_save_single_file_strips_path_components():
     """客户端传带路径的文件名只保留 basename(防落到 files 外)"""
     meta = save_upload(b"x", "a/b/c.py", "u1")
-    files = get_upload_files_dir(meta["upload_id"])
-    assert list(files.iterdir())[0].name == "c.py"
+    with materialize_upload_files(meta["upload_id"]) as files:
+        assert list(files.iterdir())[0].name == "c.py"
 
 
 # ============================================================
@@ -203,6 +203,20 @@ def test_validate_upload_not_found():
 def test_upload_id_injection_rejected():
     """非法字符的 upload_id(路径拼接注入)拒绝"""
     with pytest.raises(UploadError, match="不合法"):
-        get_upload_files_dir("../uploads_data")
+        with materialize_upload_files("../uploads_data"):
+            pass
     with pytest.raises(UploadError, match="不合法"):
-        get_upload_files_dir("a/b")
+        with materialize_upload_files("a/b"):
+            pass
+
+
+def test_materialize_local_keeps_stage1_after_exit():
+    """local 后端:materialize 退出后 Stage 1 真源仍在(不能被误删)"""
+    meta = save_upload(b"keep me", "a.txt", "u1")
+    upload_id = meta["upload_id"]
+    with materialize_upload_files(upload_id) as files:
+        assert (files / "a.txt").read_bytes() == b"keep me"
+    # 退出 with 后再次进入仍可读到同一真源(未被删除)
+    with materialize_upload_files(upload_id) as files2:
+        assert (files2 / "a.txt").read_bytes() == b"keep me"
+    assert load_upload_meta(upload_id)["upload_id"] == upload_id

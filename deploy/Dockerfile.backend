@@ -20,9 +20,10 @@ RUN pip install --no-cache-dir -r requirements.txt -i https://mirrors.aliyun.com
 COPY backend/ .
 
 # 非 root 运行 + 预创建可写目录
-# (named volume 首次挂载会继承这些目录的所有权,user_skills 必须可写)
+# (named volume 首次挂载会继承这些目录的所有权,user_skills / uploads_data 必须可写;
+#  uploads_data 不预建则以 root 创建,uid 1000 无写权限,上传直接失败)
 RUN useradd -m -u 1000 appuser \
-    && mkdir -p logs user_skills _repos \
+    && mkdir -p logs user_skills _repos uploads_data \
     && chown -R appuser:appuser /app/backend
 USER appuser
 

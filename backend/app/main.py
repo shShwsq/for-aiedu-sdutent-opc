@@ -1,4 +1,5 @@
 """FastAPI 应用入口"""
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
@@ -158,7 +159,19 @@ async def lifespan(app: FastAPI):
     from app.services.domain_event_audit import register_audit_subscriber
 
     _unsub_audit = register_audit_subscriber()
+
+    # 交付物保留/GC 后台协程:周期清理终态超期 / 孤儿上传
+    # (单 worker 部署无多进程重复执行风险;关闭时 cancel)
+    _gc_task = None
+    if settings.UPLOAD_GC_ENABLED:
+        from app.services.upload_gc import gc_loop
+
+        _gc_task = asyncio.create_task(gc_loop())
+
     yield
+
+    if _gc_task is not None:
+        _gc_task.cancel()  # 优雅关闭:停止 GC 协程
     _unsub_audit()  # 优雅关闭:退订审计订阅
 
 
