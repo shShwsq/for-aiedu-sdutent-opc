@@ -8,7 +8,7 @@
  * 当前页高亮依赖 Vue Router 自动添加的 router-link-exact-active。
  * 个别视图若需自定义导航,仍可用 <template #nav> 覆盖默认内容。
  *
- * 硬约束:设置中心(/settings)只由齿轮按钮进入,不入主导航。
+ * 硬约束:设置中心(/settings)不入主导航;主入口为齿轮按钮,顶栏邮箱为次级快捷入口(点击进入 /settings/account)。
  * 模型设置、CLI 设置、协作策略已合并到 /settings 子路由。
  * 问号按钮:打开帮助文档弹窗(所有路由行为一致,展示完整 help.md)。
  * 主题按钮:弹出浅色/深色/跟随系统三选项,选择持久化到 localStorage(useTheme)。
@@ -137,7 +137,11 @@ function handleCloseHelp(): void {
         <slot name="trailing" />
       </div>
       <div class="user-area">
-        <span class="user-email">{{ authStore.user?.email }}</span>
+        <span
+          class="user-email"
+          title="进入账户设置"
+          @click="router.push('/settings/account')"
+        >{{ authStore.user?.email }}</span>
         <button
           class="btn-help"
           title="帮助文档"
@@ -306,9 +310,19 @@ function handleCloseHelp(): void {
 }
 
 .user-email {
+  /* 次级设置入口:hover 反馈与齿轮按钮一致(换文字色 + 浅背景) */
+  padding: var(--space-1) var(--space-2);
   font-size: var(--fs-sm);
   color: var(--color-text-secondary);
   letter-spacing: 0.01em;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.user-email:hover {
+  color: var(--color-text);
+  background: var(--color-surface-alt);
 }
 
 /* 设置图标按钮:与登出按钮风格一致但更紧凑,圆形 hover 反馈 */
