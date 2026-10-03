@@ -34,15 +34,25 @@ function dropTrailingSlash(p: string): string {
   return p.replace(/\/+$/, '')
 }
 
+/** 形似绝对路径:以 / 开头(POSIX / UNC)或 Windows 盘符(x:/) */
+function looksAbsolute(norm: string): boolean {
+  return norm.startsWith('/') || /^[A-Za-z]:\//.test(norm)
+}
+
 /**
  * 不知道工作区根时的启发式剥离:命中 local 临时目录根或 sandbox 仓库根则返回其
  * 后的相对路径,否则原样返回(本就相对的路径不需要剥)。
+ *
+ * 仅对形似绝对路径的输入尝试:相对路径即便恰好含 repos/、sandbox_local_xx 段
+ * (仓库内存在同名目录,如 docs/repos/list/all.md)也不能误剥——剥了按段名
+ * 查树必落空,这正是要修复的「点击无反应」bug 的另一种触发方式。
  *
  * 也用于展示:摘要里的路径文本去掉冗长的宿主机/沙箱前缀,只留仓库内位置
  * (保留尾斜杠等原文特征,不影响摘要可读性)。
  */
 export function stripWorkspaceRoot(p: string): string {
   const norm = normalizeSlashes(p)
+  if (!looksAbsolute(norm)) return norm
   const m = norm.match(LOCAL_ROOT_RE) ?? norm.match(SANDBOX_ROOT_RE)
   return m ? m[1] : norm
 }

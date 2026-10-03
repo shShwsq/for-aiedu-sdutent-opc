@@ -52,6 +52,14 @@ describe('stripWorkspaceRoot', () => {
     expect(stripWorkspaceRoot('src/main.py')).toBe('src/main.py')
   })
 
+  it('相对路径中段恰好含 repos/、sandbox_local_*/ 段不误剥(仓库内同名目录)', () => {
+    // 回归:启发式若不限绝对路径,docs/repos/list/all.md 会被剥成 all.md,
+    // 按段名查树落空 → 点击文件链接静默无反应(bug 的另一种触发方式)
+    expect(stripWorkspaceRoot('docs/repos/list/all.md')).toBe('docs/repos/list/all.md')
+    expect(stripWorkspaceRoot('tests/sandbox_local_abc/data/x.txt'))
+      .toBe('tests/sandbox_local_abc/data/x.txt')
+  })
+
   it('非工作区根的绝对路径原样返回(交 repo_path 分支处理)', () => {
     expect(stripWorkspaceRoot('/etc/hosts')).toBe('/etc/hosts')
   })
@@ -83,6 +91,13 @@ describe('toWorkspaceRelative', () => {
 
   it('相对路径原样返回', () => {
     expect(toWorkspaceRelative('backend/app.py', '/home/user/repos/x')).toBe('backend/app.py')
+  })
+
+  it('相对路径含 repos/ 段时不被启发式误剥(applyLocate 回归)', () => {
+    // 源码查阅 locateFile 传仓库相对路径时,旧实现直接透传可定位;
+    // 不能因中段恰好叫 repos/ 就剥掉前缀
+    expect(toWorkspaceRelative('docs/repos/list/all.md', '/home/user/repos/x'))
+      .toBe('docs/repos/list/all.md')
   })
 
   it('repo_path 为空时退回启发式剥离', () => {
