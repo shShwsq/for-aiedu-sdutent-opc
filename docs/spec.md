@@ -285,7 +285,7 @@ Result(任务结果项,通用)
 **后续新增表**(详见 §9.15-9.18):
 - `AgentPolicy`(agent_policies):用户级协作策略独立表(1:1,agent2 启停 / 验证权限 / 引用复核开关),从 `user_preferences` JSONB 迁移而来,任务级经 `task.params._agent_policy` 覆盖(曾有的 `max_rounds` 协作总轮次列已随后台审查重构移除)
 - `TaskArtifact`(task_artifacts):任务工作区产物,1:N 挂在 Task 上(`kind=git_diff` 存工作区变更 patch,`kind=repo_tree` 存仓库树快照)
-- 练习模块表族(knowledge_points / questions / user_knowledge_states / practice_sessions / attempts / practice_settings):知识点、题库、SM-2 记忆状态、会话、答题流水与用户练习设置
+- 练习模块表族(knowledge_points / questions / user_knowledge_states / practice_sessions / attempts / practice_settings / learning_topics):知识点、题库、SM-2 记忆状态、会话、答题流水、用户练习设置与学习主题词表;`KnowledgePoint.learning_topic` 存所属主题 key(出题时首次写入 first-wins,存量由启动迁移回填众数);`learning_topics` 为用户级主题词表(内置 4 行懒播种 is_builtin=true 仅可停用 + 自定义行可增删改,enabled 兼出题开关)
 
 ---
 
@@ -753,17 +753,20 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 - **关卡 2 材料上下文**(工作区可用时):无 `code_snippet` 的题视为常识题丢弃
 - 配套提示词条款:禁止虚构人物叙述题与答案可由措辞推断的题;考察点须为漏洞模式/设计缺陷/条款风险/语言陷阱级专业判断(文件扩展名等常识不出题);发现内容单薄不足以支撑专业考察点时允许返回空数组(宁缺毋滥)
 
-**知识点看板**:`GET /practice/knowledge-points` 返回全量知识点卡片(SM-2 状态 + 作答统计 + active 题数 + 看板分栏状态)。分栏按优先级派生(薄弱判定复用 selector 常量):`weak`(错误率 > 40% 且作答 ≥ 3 次)> `due`(SM-2 到期)> `mastered`(连续答对 ≥ 3 次且正确率 ≥ 75%)> `learning`(有作答记录)> `fresh`(从未作答);排序分栏优先,栏内薄弱按错误率、待复习按最急到期。前端 `KnowledgeBoardView.vue` 五栏渲染,卡片「专项练习」跳 `/practice?topic=<key>` 由练习页接管组卷。
+**知识点看板**:`GET /practice/knowledge-points` 返回全量知识点卡片(SM-2 状态 + 作答统计 + active 题数 + 看板分栏状态 + 所属学习主题 `learning_topic`)。分栏按优先级派生(薄弱判定复用 selector 常量):`weak`(错误率 > 40% 且作答 ≥ 3 次)> `due`(SM-2 到期)> `mastered`(连续答对 ≥ 3 次且正确率 ≥ 75%)> `learning`(有作答记录)> `fresh`(从未作答);排序分栏优先,栏内薄弱按错误率、待复习按最急到期。前端 `KnowledgeBoardView.vue` 按 `learning_topic` 分组为主题折叠区(内置主题排序在前,未知 key 兜底「未分类」组排最后;含薄弱/待复习的分区自动展开;停用主题照常成区并带灰徽章),区头「练这个主题」跳 `/practice?learningTopic=<key>`,卡片「专项练习」跳 `/practice?topic=<key>`,均由练习页接管组卷。
+
+**学习主题词表**(两级结构的核心,`learning_topics` 表,per-user):内置 4 行(security/architecture/coding/contract,`is_builtin=true` 懒播种,不可删改仅可停用)+ 自定义行(上限 10 个,key 服务端生成 `custom_<8位随机>`,全字段可管理)。`enabled=false` 的主题不再为新 finding 出题(存量不动,分类与出题提示词仅按启用词表动态构建;分类失败降级到排序第一的启用主题);启用数不可归零(最后一个启用的主题不可停/删);`KnowledgePoint.learning_topic` 在知识点首次创建时写入(first-wins),存量由 `migrate_practice_learning_columns()` 一次性回填(取该 KP 题目主题众数,无题落默认 security)。
 
 **API 一览**(`backend/app/routers/practice.py`,全部 `Depends(get_current_user)`):
 - `POST /practice/generate` + `GET /practice/generate/jobs` + `GET /practice/generate/{job_id}` + `GET /practice/generate/{job_id}/stream`(异步出题 job + SSE 进度)
 - `GET /practice/drafts`(候选题预览)+ `POST /practice/questions/confirm`(确认入库)+ `POST /practice/questions/activate`(直接激活)
-- `POST /practice/sessions` + `POST /practice/sessions/{id}/answers`(组卷与判分,答案不下发;`StartSessionRequest.topic_filter` 支持知识点专项练习)
+- `POST /practice/sessions` + `POST /practice/sessions/{id}/answers`(组卷与判分,答案不下发;`topic_filter` 知识点专项练习 / `learning_topic` 主题级练习,二者互斥,同传 422;`learning_topic` 为 `learning_topics.key`,格式非法 422、无匹配 404)
 - `GET /practice/summary` / `GET /practice/trend` / `GET /practice/stats`(统计与趋势)
 - `GET /practice/knowledge-points`(知识点看板卡片列表)
 - `GET /practice/questions` + `POST /practice/questions/{id}/archive`(题库管理)+ `DELETE /practice/records`(清空记录)
+- 学习主题 CRUD(`backend/app/routers/learning_topics.py`,随 PRACTICE_ENABLED 注册):`GET /practice/topics`(懒播种内置 4 行,附每主题 kp_count)/ `POST /practice/topics`(自定义,名称用户内唯一,超限 400)/ `PATCH /practice/topics/{id}`(内置仅 enabled,自定义全字段;启用数不可归零 400)/ `DELETE /practice/topics/{id}`(仅自定义;有关联知识点 400 提示先停用)
 
-**前端**:`PracticeView.vue`(练习首页 / 会话答题 / 统计;`?topic=<key>` 进入自动发起专项练习)、`KnowledgeBoardView.vue`(知识点看板,薄弱点板块从练习首页移入其薄弱栏)、`PracticeHistoryView.vue`(练习记录)、`PracticeGenerateSidebar`(出题进度侧栏,与答题代码栏互斥,360px)、`PracticeGenerateDialog`(生成确认)、`PracticeSettingsDialog`(主题 / 恢复开关 / 默认出题模型 / 思考模式)、`PracticeCodeSidebar`(答题时源码查阅);任务详情页结果区有「生成练习题」入口。
+**前端**:`PracticeView.vue`(练习首页 / 会话答题 / 统计;`?topic=<key>` 进入自动发起专项练习,`?learningTopic=<key>` 自动发起主题级练习)、`KnowledgeBoardView.vue`(知识点看板,主题折叠区分组)、`PracticeHistoryView.vue`(练习记录)、`PracticeGenerateSidebar`(出题进度侧栏,与答题代码栏互斥,360px)、`PracticeGenerateDialog`(生成确认)、`PracticeSettingsPanel.vue` 练习设置面板含「学习主题」管理区(内置启停 + 自定义增删改)、`PracticeCodeSidebar`(答题时源码查阅);任务详情页结果区有「生成练习题」入口。
 
 **出题日志**:`backend/logs/practice_generate.log`(滚动 10MB×3),记录模型解析 / 工作区状态 / 每条 finding 的解析与丢弃原因,便于排查"一道题也没生成"。
 

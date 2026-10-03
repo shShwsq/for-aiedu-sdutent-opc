@@ -161,6 +161,8 @@ export interface ActivateQuestionsResponse {
 export interface StartSessionRequest {
   count?: number
   topic_filter?: string | null
+  /** 限定学习主题(learning_topics.key,内置或自定义);与 topic_filter 互斥 */
+  learning_topic?: string | null
   /** 题目白名单(错题重练):非空时只从这些 active 题中组卷 */
   question_ids?: string[]
 }
@@ -239,6 +241,41 @@ export interface WeakPointItem {
 /** 知识点看板分栏(后端按优先级派生):weak=薄弱 / due=待复习 / mastered=已巩固 / learning=学习中 / fresh=未开始 */
 export type BoardStatus = 'weak' | 'due' | 'mastered' | 'learning' | 'fresh'
 
+/**
+ * 学习主题 key(learning_topics.key):
+ * 内置 security/architecture/coding/contract 或自定义 custom_*
+ * 为动态值(用户可管理),统一用 string 表示
+ */
+export type LearningTopic = string
+
+/** 学习主题定义(用户可管理词表,GET /practice/topics) */
+export interface LearningTopicDef {
+  id: string
+  key: LearningTopic
+  name: string
+  /** 主题视角说明(出题视角 + 分类依据) */
+  description: string
+  is_builtin: boolean
+  /** 出题开关:false 时不再出新题(存量不动) */
+  enabled: boolean
+  sort_order: number
+  /** 该主题下的知识点数 */
+  kp_count: number
+}
+
+/** 新增自定义主题请求 */
+export interface LearningTopicCreateRequest {
+  name: string
+  description?: string
+}
+
+/** 修改主题请求(内置仅 enabled;自定义可改 name/description/enabled) */
+export interface LearningTopicUpdateRequest {
+  name?: string
+  description?: string
+  enabled?: boolean
+}
+
 /** 知识点卡片(知识点看板视图,GET /practice/knowledge-points) */
 export interface KnowledgePointCard {
   knowledge_key: string
@@ -246,6 +283,8 @@ export interface KnowledgePointCard {
   /** 粗分类(如 cwe / general) */
   category: string | null
   languages: string[]
+  /** 所属学习主题 key(看板按主题分组展示) */
+  learning_topic: LearningTopic
   /** 作答统计(无作答记录为 0) */
   attempts: number
   correct_count: number

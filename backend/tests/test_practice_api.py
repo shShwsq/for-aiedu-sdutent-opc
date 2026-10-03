@@ -33,13 +33,16 @@ import app.models.practice  # noqa: F401
 
 from app.models.practice import (
     KnowledgePoint,
+    LearningTopic,
     Question,
     QuestionStatus,
     QuestionType,
     UserKnowledgeState,
+    ensure_user_topics,
 )
 from app.models.task import Result, Task
 from app.models.user import User
+from app.routers import learning_topics as learning_topics_router
 from app.routers import practice as practice_router
 
 # schema 名含 PID + 随机后缀:并发 pytest 进程(多会话/前后台任务)各自
@@ -47,7 +50,7 @@ from app.routers import practice as practice_router
 TEST_SCHEMA = f"pytest_practice_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 _TABLES = (
     "practice_attempts", "practice_sessions", "practice_questions",
-    "user_knowledge_states", "knowledge_points",
+    "user_knowledge_states", "knowledge_points", "learning_topics",
     "results", "conversations", "task_artifacts", "tasks", "user_preferences", "user_git_bindings", "users",
 )
 
@@ -149,6 +152,7 @@ class Ctx:
         self.session_factory = session_factory
         self.app = FastAPI()
         self.app.include_router(practice_router.router)
+        self.app.include_router(learning_topics_router.router)
         db = session_factory()
         self.user = User(email=email, password_hash="x")
         db.add(self.user)
@@ -552,10 +556,12 @@ def test_clear_records_user_isolation(ctx, ctx_b):
 def _make_kp_q_state(
     db_session, user_id, key, name, *,
     attempts, correct, repetitions, due_at, question_count=1,
+    learning_topic="security",
 ):
     """直接造一个知识点 + active 题 + SM-2 状态(attempts=0 时不造状态行)"""
     kp = KnowledgePoint(
         user_id=user_id, key=key, name=name, category="cwe", languages=["python"],
+        learning_topic=learning_topic,
     )
     db_session.add(kp)
     db_session.flush()
@@ -643,3 +649,330 @@ def test_knowledge_points_auth_and_user_isolation(ctx, ctx_b):
     r = ctx_b.client.get("/practice/knowledge-points")
     assert r.status_code == 200
     assert all(c["knowledge_key"] != "CWE-700" for c in r.json())
+
+
+def test_knowledge_points_return_learning_topic(ctx):
+    """看板卡片返回知识点所属学习主题(前端按主题分组展示)"""
+    ctx.login()
+    s = ctx.session_factory()
+    now = datetime.now(timezone.utc)
+    _make_kp_q_state(s, ctx.user.id, "CWE-A", "合同点",
+                     attempts=0, correct=0, repetitions=0, due_at=None,
+                     learning_topic="contract")
+    _make_kp_q_state(s, ctx.user.id, "CWE-B", "安全点",
+                     attempts=0, correct=0, repetitions=0, due_at=now,
+                     learning_topic="security")
+    r = ctx.client.get("/practice/knowledge-points")
+    assert r.status_code == 200
+    by_key = {c["knowledge_key"]: c for c in r.json()}
+    assert by_key["CWE-A"]["learning_topic"] == "contract"
+    assert by_key["CWE-B"]["learning_topic"] == "security"
+
+
+# ============================================================
+# 学习主题:播种幂等 + CRUD(GET/POST/PATCH/DELETE /practice/topics)
+# ============================================================
+
+
+def test_ensure_user_topics_seeds_and_idempotent(ctx):
+    """播种:补齐内置 4 行;重复调用不重复插行;文案与排序正确"""
+    ctx.login()
+    s = ctx.session_factory()
+    topics = ensure_user_topics(s, ctx.user.id)
+    s.commit()
+    assert [t.key for t in topics] == [
+        "security", "architecture", "coding", "contract",
+    ]
+    assert all(t.is_builtin and t.enabled for t in topics)
+    assert [t.sort_order for t in topics] == [10, 20, 30, 40]
+    # 幂等:重复调用不重复插行
+    ensure_user_topics(s, ctx.user.id)
+    s.commit()
+    count = s.query(LearningTopic).filter(
+        LearningTopic.user_id == ctx.user.id
+    ).count()
+    assert count == 4
+    # 内置描述非空(分类提示词与设置页展示用)
+    assert all(t.description for t in topics)
+
+
+def test_topics_list_seeds_builtins(ctx):
+    """GET /practice/topics:懒播种内置 4 行,按 sort_order 排序"""
+    ctx.login()
+    r = ctx.client.get("/practice/topics")
+    assert r.status_code == 200
+    body = r.json()
+    assert [t["key"] for t in body] == [
+        "security", "architecture", "coding", "contract",
+    ]
+    assert all(t["is_builtin"] and t["enabled"] for t in body)
+    assert all(t["kp_count"] == 0 for t in body)
+
+
+def test_topics_create_and_name_uniqueness(ctx):
+    """POST /practice/topics:自定义主题创建;重名 400;空名 422"""
+    ctx.login()
+    ctx.client.get("/practice/topics")  # 先播种
+    r = ctx.client.post("/practice/topics", json={
+        "name": "算法", "description": "复杂度分析与正确性证明",
+    })
+    assert r.status_code == 201
+    body = r.json()
+    assert body["key"].startswith("custom_")
+    assert len(body["key"]) == len("custom_") + 8
+    assert not body["is_builtin"]
+    assert body["enabled"] is True
+    assert body["sort_order"] >= 50
+    # 重名(与自定义同名)→ 400
+    r2 = ctx.client.post("/practice/topics", json={"name": "算法"})
+    assert r2.status_code == 400
+    # 重名(与内置名「安全」)→ 400
+    r3 = ctx.client.post("/practice/topics", json={"name": "安全"})
+    assert r3.status_code == 400
+    # 空名 → 422
+    r4 = ctx.client.post("/practice/topics", json={"name": ""})
+    assert r4.status_code == 422
+
+
+def test_topics_create_custom_limit(ctx):
+    """自定义主题上限 10 个,超出 400"""
+    ctx.login()
+    ctx.client.get("/practice/topics")
+    for i in range(10):
+        r = ctx.client.post("/practice/topics", json={"name": f"主题{i}"})
+        assert r.status_code == 201
+    r = ctx.client.post("/practice/topics", json={"name": "超额主题"})
+    assert r.status_code == 400
+    assert "上限" in r.json()["detail"]
+
+
+def test_topics_update_builtin_and_custom(ctx):
+    """PATCH:内置仅接受 enabled(改 name 400);自定义全字段可改"""
+    ctx.login()
+    body = ctx.client.get("/practice/topics").json()
+    security = next(t for t in body if t["key"] == "security")
+
+    # 内置改 name → 400
+    r = ctx.client.patch(
+        f"/practice/topics/{security['id']}", json={"name": "改名"},
+    )
+    assert r.status_code == 400
+    # 内置停用 → 200(其他 3 个仍启用,不触发保护)
+    r = ctx.client.patch(
+        f"/practice/topics/{security['id']}", json={"enabled": False},
+    )
+    assert r.status_code == 200
+    assert r.json()["enabled"] is False
+
+    # 自定义:改 name/description → 200
+    created = ctx.client.post("/practice/topics", json={"name": "算法"}).json()
+    r = ctx.client.patch(
+        f"/practice/topics/{created['id']}",
+        json={"name": "算法与数据结构", "description": "复杂度、边界、证明"},
+    )
+    assert r.status_code == 200
+    assert r.json()["name"] == "算法与数据结构"
+    assert r.json()["description"] == "复杂度、边界、证明"
+
+    # 他人主题 → 404(per-user 隔离)
+    other = Ctx(ctx.session_factory, "eve@test.local", n_results=0).login()
+    r2 = other.client.patch(
+        f"/practice/topics/{created['id']}", json={"enabled": False},
+    )
+    assert r2.status_code == 404
+
+
+def test_topics_cannot_disable_or_delete_last_enabled(ctx):
+    """启用数不可归零:最后一个启用的主题不能停/删(400)"""
+    ctx.login()
+    body = ctx.client.get("/practice/topics").json()
+    for t in body[:-1]:
+        r = ctx.client.patch(f"/practice/topics/{t['id']}", json={"enabled": False})
+        assert r.status_code == 200
+    last = body[-1]
+    # 停用最后一个启用主题 → 400
+    r = ctx.client.patch(f"/practice/topics/{last['id']}", json={"enabled": False})
+    assert r.status_code == 400
+    # 删除最后一个启用主题 → 400
+    r = ctx.client.delete(f"/practice/topics/{last['id']}")
+    assert r.status_code == 400
+
+
+def test_topics_delete_rules(ctx):
+    """DELETE:内置 400;有知识点的自定义主题 400;无知识点自定义主题 204"""
+    ctx.login()
+    ctx.client.get("/practice/topics")
+    # 内置不可删
+    builtin = ctx.client.get("/practice/topics").json()[0]
+    r = ctx.client.delete(f"/practice/topics/{builtin['id']}")
+    assert r.status_code == 400
+    # 自定义主题 + 关联知识点 → 400
+    created = ctx.client.post("/practice/topics", json={"name": "算法"}).json()
+    s = ctx.session_factory()
+    s.add(KnowledgePoint(
+        user_id=ctx.user.id, key="CWE-ALGO", name="复杂度",
+        learning_topic=created["key"],
+    ))
+    s.commit()
+    s.close()
+    r = ctx.client.delete(f"/practice/topics/{created['id']}")
+    assert r.status_code == 400
+    assert "知识点" in r.json()["detail"]
+    # 清掉关联 KP → 删除成功 204
+    s = ctx.session_factory()
+    s.query(KnowledgePoint).filter(
+        KnowledgePoint.user_id == ctx.user.id,
+        KnowledgePoint.key == "CWE-ALGO",
+    ).delete()
+    s.commit()
+    s.close()
+    r = ctx.client.delete(f"/practice/topics/{created['id']}")
+    assert r.status_code == 204
+    # 列表中不再出现
+    keys = [t["key"] for t in ctx.client.get("/practice/topics").json()]
+    assert created["key"] not in keys
+
+
+# ============================================================
+# 会话:主题级练习(learning_topic 过滤组卷)
+# ============================================================
+
+
+def test_start_session_learning_topic_filter(ctx):
+    """learning_topic 过滤组卷:只出该主题知识点的题;stats 快照记录主题"""
+    ctx.login()
+    _generate_and_confirm(ctx)  # 3 个 KP(security)各 1 题
+    # 把第二个 KP 改为 contract 主题
+    s = ctx.session_factory()
+    kps = s.query(KnowledgePoint).filter(
+        KnowledgePoint.user_id == ctx.user.id
+    ).all()
+    assert len(kps) == 3
+    contract_kp = kps[1]
+    contract_kp.learning_topic = "contract"
+    s.commit()
+    s.close()
+
+    # security 主题组卷 → 只含 security KP 的题
+    r = ctx.client.post("/practice/sessions", json={"learning_topic": "security"})
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["questions"]) == 2
+    # contract 主题组卷 → 只含 contract KP 的题
+    r = ctx.client.post("/practice/sessions", json={"learning_topic": "contract"})
+    assert r.status_code == 200
+    assert len(r.json()["questions"]) == 1
+    # stats 快照记录 learning_topic
+    s = ctx.session_factory()
+    from app.models.practice import PracticeSession
+    latest = (
+        s.query(PracticeSession)
+        .filter(PracticeSession.user_id == ctx.user.id)
+        .order_by(PracticeSession.started_at.desc())
+        .first()
+    )
+    assert latest is not None
+    assert latest.stats["learning_topic"] == "contract"
+    s.close()
+
+
+def test_start_session_learning_topic_not_found(ctx):
+    """learning_topic 无匹配知识点 → 404"""
+    ctx.login()
+    _generate_and_confirm(ctx)
+    r = ctx.client.post("/practice/sessions", json={
+        "learning_topic": "custom_nonexist",
+    })
+    assert r.status_code == 404
+
+
+def test_start_session_learning_topic_validation(ctx):
+    """learning_topic 格式非法 → 422;与 topic_filter 同传 → 422"""
+    ctx.login()
+    _generate_and_confirm(ctx)
+    # 格式非法(大写/特殊字符)→ 422
+    r = ctx.client.post("/practice/sessions", json={"learning_topic": "Bad Key!"})
+    assert r.status_code == 422
+    # 与 topic_filter 同传 → 422
+    r = ctx.client.post("/practice/sessions", json={
+        "learning_topic": "security", "topic_filter": "CWE-89",
+    })
+    assert r.status_code == 422
+
+
+# ============================================================
+# 迁移:knowledge_points.learning_topic 存量回填(众数)
+# ============================================================
+
+
+def test_kp_learning_topic_migration_backfill(test_engine, ctx, monkeypatch):
+    """迁移回填:KP 主题取其题目主题众数(并列按主题名),无题落默认 security"""
+    import app.database as database_module
+    from app.models.practice import migrate_practice_learning_columns
+
+    ctx.login()
+    # 造数据:
+    # kp_majority:2 题 contract + 1 题 security → contract
+    # kp_single:1 题 architecture → architecture
+    # kp_no_questions:无题 → security(默认)
+    # kp_topicless_questions:题全部无主题 → security(默认)
+    s = ctx.session_factory()
+
+    def _mk_kp(key):
+        kp = KnowledgePoint(user_id=ctx.user.id, key=key, name=key)
+        s.add(kp)
+        s.flush()
+        return kp
+
+    def _mk_q(kp, topic=None):
+        s.add(Question(
+            user_id=ctx.user.id, knowledge_point_id=kp.id,
+            qtype=QuestionType.SINGLE_CHOICE, stem=f"{kp.key}-{topic}",
+            options=["甲", "乙"], answer_idx=0, explanation="",
+            difficulty=3.0, status=QuestionStatus.ACTIVE,
+            dedup_hash=uuid.uuid4().hex, learning_topic=topic,
+        ))
+
+    kp_majority = _mk_kp("CWE-MAJ")
+    _mk_q(kp_majority, "contract")
+    _mk_q(kp_majority, "contract")
+    _mk_q(kp_majority, "security")
+    kp_single = _mk_kp("CWE-SINGLE")
+    _mk_q(kp_single, "architecture")
+    kp_no_q = _mk_kp("CWE-NOQ")
+    kp_topicless = _mk_kp("CWE-TOPICLESS")
+    _mk_q(kp_topicless, None)
+    s.commit()
+    s.close()
+
+    # DROP 列模拟老库
+    with test_engine.begin() as conn:
+        conn.execute(text("ALTER TABLE knowledge_points DROP COLUMN learning_topic"))
+
+    # monkeypatch engine 后执行迁移(函数内 from-import 在调用时取属性)
+    monkeypatch.setattr(database_module, "engine", test_engine)
+    migrate_practice_learning_columns()
+
+    # 断言回填结果
+    s = ctx.session_factory()
+    topics = {
+        kp.key: kp.learning_topic
+        for kp in s.query(KnowledgePoint).filter(
+            KnowledgePoint.user_id == ctx.user.id
+        ).all()
+    }
+    assert topics["CWE-MAJ"] == "contract"       # 众数 2:1
+    assert topics["CWE-SINGLE"] == "architecture"
+    assert topics["CWE-NOQ"] == "security"       # 无题 → 默认
+    assert topics["CWE-TOPICLESS"] == "security"  # 题无主题 → 默认
+    s.close()
+
+    # 幂等:列已存在时再跑不报错、值不变
+    migrate_practice_learning_columns()
+    s = ctx.session_factory()
+    kp = s.query(KnowledgePoint).filter(
+        KnowledgePoint.user_id == ctx.user.id,
+        KnowledgePoint.key == "CWE-MAJ",
+    ).one()
+    assert kp.learning_topic == "contract"
+    s.close()

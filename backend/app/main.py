@@ -219,9 +219,12 @@ app.include_router(memory_router.router)
 app.include_router(uploads_router.router)
 # 出题 & 练习功能总开关:关闭时 /practice/* 全部 404(路由不注册)
 if settings.PRACTICE_ENABLED:
+    from app.routers import learning_topics as learning_topics_router
     from app.routers import practice as practice_router
 
     app.include_router(practice_router.router)
+    # 学习主题词表 CRUD(内置 4 个 + 用户自定义,分类与出题视角的定义源)
+    app.include_router(learning_topics_router.router)
 
 
 @app.get("/")

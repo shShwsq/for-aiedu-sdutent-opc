@@ -3,9 +3,10 @@
 流程:
 1. 取任务 Results(上限 max_findings 条,防 LLM 成本失控)
 2. 逐条 finding 调 LLM 生成 1~3 题:
-   - system prompt 按发现内容自动匹配的主题切换
-     (security/architecture/coding/contract;规则先行 + LLM 批量兜底,
-     不再读用户级 learning_topic 设置)
+   - system prompt 按发现内容自动匹配的主题切换:
+     主题词表来自用户设置(learning_topics 表,内置 4 个 + 自定义,
+     仅启用主题参与;规则先行 + LLM 批量兜底),内置主题用专有
+     出题视角,自定义主题用通用模板 + 用户描述
    - 提示词强制题目必须阅读真实材料(代码或文书原文)才能作答(禁止常识题);
      工作区可用时挂只读迷你工具循环(read_file / search_code / find_files),
      要求出题前先读材料并记录 source_file/source_lines;
@@ -38,11 +39,12 @@ from sqlalchemy.orm import Session
 import openai
 from app.llm.client import LLMClient
 from app.models.practice import (
+    BUILTIN_TOPIC_DEFS,
+    DEFAULT_LEARNING_TOPIC,
     LEARNING_TOPIC_ARCHITECTURE,
     LEARNING_TOPIC_CODING,
     LEARNING_TOPIC_CONTRACT,
     LEARNING_TOPIC_SECURITY,
-    LEARNING_TOPICS,
     THINKING_MODE_OFF,
     THINKING_MODE_ON,
     KnowledgePoint,
@@ -50,6 +52,7 @@ from app.models.practice import (
     Question,
     QuestionStatus,
     QuestionType,
+    ensure_user_topics,
 )
 from app.models.task import Result, Task
 from app.models.user_llm_config import UserLLMConfig
@@ -101,12 +104,12 @@ from app.prompts.practice import (
     _LEARNING_NOTE_TEMPLATE,
     _NO_CODE_FEEDBACK,
     _PRACTICE_TOOL_DEFINITIONS,
-    _TOPIC_CLASSIFY_SYSTEM,
     build_system_prompt,
+    build_topic_classify_prompt,
 )
 
 # ============================================================
-# 主题自动匹配:规则先行 + LLM 批量兜底(不再是用户级设置)
+# 主题自动匹配:规则先行 + LLM 批量兜底(主题词表来自用户设置)
 # ============================================================
 
 # metadata 值里的 CWE 编号模式(如 "CWE-89")
@@ -135,9 +138,12 @@ def _match_topic_by_rule(task: Task, meta: dict | None) -> str | None:
 
 def _classify_topics_with_llm(
     client: LLMClient, pending: list[tuple[int, Result]], task_id: str,
+    topic_defs: list[dict],
 ) -> dict[int, str]:
     """把规则未定的 findings 一次批量送 LLM 分类,返回 {序号: topic}
 
+    topic_defs 为用户启用主题词表(内置 + 自定义,{key,name,description}),
+    分类提示词按词表动态构建,输出必须命中词表内的 key。
     任何异常由调用方捕获降级;输出解析容错,个别条目非法只跳过该条。
     """
     items = []
@@ -153,11 +159,12 @@ def _classify_topics_with_llm(
         + "\n请对每条判断出题主题,按系统要求的格式输出。"
     )
     messages: list[dict] = [
-        {"role": "system", "content": _TOPIC_CLASSIFY_SYSTEM},
+        {"role": "system", "content": build_topic_classify_prompt(topic_defs)},
         {"role": "user", "content": user_prompt},
     ]
     content, _ = _stream_one_round(client, messages, None)
     parsed = json.loads(repair_json(content))
+    valid_keys = {d["key"] for d in topic_defs}
     result: dict[int, str] = {}
     if isinstance(parsed, list):
         for item in parsed:
@@ -168,19 +175,23 @@ def _classify_topics_with_llm(
             except (TypeError, ValueError):
                 continue
             t = str(item.get("topic") or "").strip()
-            if t in LEARNING_TOPICS:
+            if t in valid_keys:
                 result[i] = t
     return result
 
 
 def _match_finding_topics(
     task: Task, findings: list[Result], client: LLMClient,
+    topic_defs: list[dict],
 ) -> dict:
     """逐 finding 匹配出题主题:规则先行,判不定的批量送 LLM 分类
 
-    返回 {finding.id: topic}。LLM 分类失败/条目缺失时降级 security
-    (原用户级默认主题,保证出题不中断)。异常静默降级,不阻断出题主流程。
+    topic_defs 为用户启用主题词表(按 sort_order 排序)。
+    返回 {finding.id: topic}。LLM 分类失败/条目缺失时降级到
+    排序第一的启用主题(防该主题被停用后降级落空),保证出题不中断。
+    异常静默降级,不阻断出题主流程。
     """
+    fallback_topic = topic_defs[0]["key"] if topic_defs else DEFAULT_LEARNING_TOPIC
     topics: dict = {}
     pending: list[tuple[int, Result]] = []
     for idx, f in enumerate(findings):
@@ -192,19 +203,21 @@ def _match_finding_topics(
 
     if pending:
         try:
-            classified = _classify_topics_with_llm(client, pending, str(task.id))
+            classified = _classify_topics_with_llm(
+                client, pending, str(task.id), topic_defs,
+            )
         except Exception as e:
             logger.warning(
-                "[practice] task=%s 主题 LLM 分类失败,全部降级 security: %s",
-                task.id, e,
+                "[practice] task=%s 主题 LLM 分类失败,全部降级 %s: %s",
+                task.id, fallback_topic, e,
             )
             classified = {}
         for idx, f in pending:
-            topics[f.id] = classified.get(idx) or LEARNING_TOPIC_SECURITY
+            topics[f.id] = classified.get(idx) or fallback_topic
 
     # 兜底:理论上不会缺,防御性补齐
     for f in findings:
-        topics.setdefault(f.id, LEARNING_TOPIC_SECURITY)
+        topics.setdefault(f.id, fallback_topic)
     return topics
 
 
@@ -557,6 +570,7 @@ def _normalize_languages(raw: Any, source_file: str | None) -> list[str]:
 
 def _get_or_create_knowledge_point(
     db: Session, user_id, key: str, name: str, languages: list[str] | None = None,
+    learning_topic: str = DEFAULT_LEARNING_TOPIC,
 ) -> KnowledgePoint:
     key = (key or "").strip() or "general"
     kp = db.query(KnowledgePoint).filter(
@@ -564,7 +578,8 @@ def _get_or_create_knowledge_point(
         KnowledgePoint.key == key,
     ).first()
     if kp:
-        # 已有知识点:语言标签并集累积(保持原顺序追加新语言)
+        # 已有知识点:语言标签并集累积(保持原顺序追加新语言);
+        # learning_topic first-wins(首个出题主题归属保持稳定)
         merged = list(kp.languages or [])
         added = [l for l in (languages or []) if l not in merged]
         if added:
@@ -576,6 +591,7 @@ def _get_or_create_knowledge_point(
         name=(name or "").strip() or key,
         category="cwe" if key.upper().startswith("CWE-") else "general",
         languages=list(languages or []),
+        learning_topic=learning_topic,
     )
     db.add(kp)
     db.flush()
@@ -797,11 +813,32 @@ def generate_questions_for_task(
         client = resolve_llm_client(db, task)
 
     # 用户练习设置:是否允许出题前恢复工作区;思考模式覆盖出题模型的思考开关
-    # (学习主题已改为出题时按 finding 内容自动匹配,不再读取用户设置)
     settings_row = db.query(PracticeSettings).filter(
         PracticeSettings.user_id == user_id
     ).first()
     _apply_thinking_mode(client, settings_row)
+
+    # 用户学习主题词表(仅启用主题参与分类与出题):
+    # 停用主题的 finding 出题前被过滤,只停新增、不动存量。
+    # CRUD 已保证启用数不归零;此处防御兜底为内置词表
+    all_topics = ensure_user_topics(db, user_id)
+    enabled_topics = [t for t in all_topics if t.enabled]
+    if enabled_topics:
+        topic_defs = [
+            {"key": t.key, "name": t.name, "description": t.description}
+            for t in enabled_topics
+        ]
+    else:
+        logger.warning(
+            "[practice] task=%s user=%s 无启用学习主题,按内置词表出题",
+            task.id, user_id,
+        )
+        topic_defs = [
+            {"key": d["key"], "name": d["name"], "description": d["description"]}
+            for d in BUILTIN_TOPIC_DEFS
+        ]
+    custom_defs = [d for d in topic_defs if d["key"] not in
+                   {b["key"] for b in BUILTIN_TOPIC_DEFS}]
 
     # 工作区:存活 → 挂工具循环;已清理 → 按设置尝试重新 clone
     # (restore 事件经 event_callback 推出题进度侧栏展示克隆进度)
@@ -815,10 +852,25 @@ def generate_questions_for_task(
     total_findings = len(findings)
 
     # 主题自动匹配:规则先行 + LLM 批量兜底(每任务至多一次分类调用)
-    topic_map = _match_finding_topics(task, findings, client)
-    # 预构建各主题的 system prompt(工作区可用性统一判定)
+    topic_map = _match_finding_topics(task, findings, client, topic_defs)
+    # 主题开关过滤:规则捷径可能命中停用主题(如停用安全后 metadata 带 CWE 的
+    # 发现),分类完成后统一拦截,并重算进度分母
+    enabled_keys = {d["key"] for d in topic_defs}
+    disabled_hits = [f.id for f in findings if topic_map[f.id] not in enabled_keys]
+    if disabled_hits:
+        logger.info(
+            "[practice] task=%s 主题开关跳过 %d 条停用主题的 finding",
+            task.id, len(disabled_hits),
+        )
+        findings = [f for f in findings if topic_map[f.id] in enabled_keys]
+        topic_map = {f.id: topic_map[f.id] for f in findings}
+        total_findings = len(findings)
+    # 预构建各主题的 system prompt(工作区可用性统一判定;
+    # 内置主题用专有视角,自定义主题用通用模板 + 用户描述)
     system_prompts = {
-        t: build_system_prompt(t, workspace_available=bool(repo_path))
+        t: build_system_prompt(
+            t, workspace_available=bool(repo_path), custom_topics=custom_defs,
+        )
         for t in set(topic_map.values())
     }
 
@@ -951,6 +1003,7 @@ def generate_questions_for_task(
             kp = _get_or_create_knowledge_point(
                 db, user_id, q["knowledge_key"], q["knowledge_name"],
                 languages=q["languages"],
+                learning_topic=topic,
             )
             question = Question(
                 user_id=user_id,

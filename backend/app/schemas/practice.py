@@ -1,9 +1,14 @@
 """练习模块的 Pydantic 模型(请求与响应)"""
+import re
 import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+# 学习主题 key 格式(与 learning_topics.key 一致:内置 security/architecture/
+# coding/contract 或自定义 custom_xxxxxxxx)
+_TOPIC_KEY_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 
 
 # ============================================================
@@ -159,8 +164,27 @@ class StartSessionRequest(BaseModel):
     count: int = Field(default=8, ge=1, le=30)
     # 限定知识点 key(如只看 "CWE-89"),为空表示全部
     topic_filter: str | None = None
+    # 限定学习主题(learning_topics.key,内置或自定义),为空表示全部;
+    # 与 topic_filter 互斥(同传 422)。key 为动态值(用户自定义),
+    # 仅做格式校验防注入,不存在的 key 由端点 404 兜底
+    learning_topic: str | None = None
     # 限定题目白名单(如错题重练):非空时只从这些 active 题中组卷
     question_ids: list[uuid.UUID] | None = None
+
+    @field_validator("learning_topic")
+    @classmethod
+    def _validate_learning_topic(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if not _TOPIC_KEY_RE.fullmatch(v):
+            raise ValueError("learning_topic 格式非法(仅允许小写字母/数字/下划线,长度 1-64)")
+        return v
+
+    @model_validator(mode="after")
+    def _check_topic_filters_exclusive(self) -> "StartSessionRequest":
+        if self.topic_filter and self.learning_topic:
+            raise ValueError("topic_filter 与 learning_topic 不能同时指定")
+        return self
 
 
 class SessionQuestionResponse(BaseModel):
@@ -262,6 +286,8 @@ class KnowledgePointCardItem(BaseModel):
     # 粗分类(如 cwe / general)
     category: str | None = None
     languages: list[str] = []
+    # 所属学习主题 key(learning_topics.key,前端按主题分组展示)
+    learning_topic: str = "security"
     # 作答统计(无作答记录为 0)
     attempts: int = 0
     correct_count: int = 0
@@ -381,3 +407,43 @@ class ClearRecordsResponse(BaseModel):
     deleted_sessions: int = 0
     deleted_attempts: int = 0
     deleted_questions: int = 0
+
+
+# ============================================================
+# 学习主题(用户可管理:内置 4 个 + 自定义,CRUD /practice/topics)
+# ============================================================
+
+
+class TopicOut(BaseModel):
+    """学习主题条目(GET /practice/topics)"""
+
+    id: uuid.UUID
+    key: str
+    name: str
+    # 主题视角说明(出题视角 + 分类依据)
+    description: str = ""
+    is_builtin: bool = True
+    # 出题开关:false 时该主题不再出新题(存量不动)
+    enabled: bool = True
+    sort_order: int = 0
+    # 该主题下的知识点数(前端分组展示与删除保护提示用)
+    kp_count: int = 0
+
+
+class TopicCreateRequest(BaseModel):
+    """新增自定义主题(POST /practice/topics)"""
+
+    name: str = Field(min_length=1, max_length=64)
+    # 主题视角描述(选填;出题质量取决于描述的具体程度)
+    description: str = Field(default="", max_length=500)
+
+
+class TopicUpdateRequest(BaseModel):
+    """修改主题(PATCH /practice/topics/{id})
+
+    内置主题仅接受 enabled;自定义主题可改 name/description/enabled。
+    """
+
+    name: str | None = Field(default=None, min_length=1, max_length=64)
+    description: str | None = Field(default=None, max_length=500)
+    enabled: bool | None = None

@@ -490,6 +490,13 @@ def start_session(
         if not kps:
             raise HTTPException(status_code=404, detail=f"题库中没有知识点 {req.topic_filter} 的题目")
         questions = [q for q in questions if q.knowledge_point_id in kps]
+    if req.learning_topic:
+        # 主题级练习:按知识点所属学习主题过滤(内置/自定义 key 皆可,
+        # key 存在性由 kp 匹配兜底——无匹配 404)
+        kps = {k: v for k, v in kps.items() if v.learning_topic == req.learning_topic}
+        if not kps:
+            raise HTTPException(status_code=404, detail=f"题库中没有学习主题 {req.learning_topic} 的题目")
+        questions = [q for q in questions if q.knowledge_point_id in kps]
     if req.question_ids:
         # 白名单组卷(错题重练):只从传入 id 中选题,跳过复习/多样性约束
         allow = set(req.question_ids)
@@ -540,6 +547,7 @@ def start_session(
         stats={
             "ability": ability,
             "topic_filter": req.topic_filter,
+            "learning_topic": req.learning_topic,
             "review_count": sum(
                 1 for c in picked if c.kp_due_at is not None and c.kp_due_at <= now
             ),
@@ -1056,6 +1064,7 @@ def list_knowledge_points(
             knowledge_name=kp.name,
             category=kp.category,
             languages=kp.languages or [],
+            learning_topic=kp.learning_topic,
             attempts=attempts,
             correct_count=correct,
             accuracy=accuracy,

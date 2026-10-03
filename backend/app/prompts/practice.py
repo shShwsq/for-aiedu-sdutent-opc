@@ -1,12 +1,13 @@
 """练习出题的提示词资产。
 
 按学习主题切换出题视角(head 段)+ 共享的工具说明段与通用规则段,
-外加主题分类器 system、单条发现模板与质量反馈文案。
+外加主题分类器 system(按用户启用主题词表动态构建)、单条发现模板与质量反馈文案。
 执行逻辑(工具循环、LLM 调用、解析落库)在 app/services/practice/generator.py。
 
 本模块保持零 app.* 依赖:主题 key 使用与
 app/models/practice.py LEARNING_TOPIC_* 一致的字符串字面量
-("security" / "architecture" / "coding" / "contract",DB 存储的稳定枚举值)。
+("security" / "architecture" / "coding" / "contract",DB 存储的稳定枚举值)
++ 用户自定义主题的 "custom_*" 键,全部经参数传入(纯数据)。
 """
 from typing import Any
 
@@ -54,6 +55,16 @@ _CONTRACT_TOPIC_HEAD = """你是一名合同文书培训出题专家。基于给
 - languages 固定给空数组 []
 - source_file 为文书文件路径(工作区内相对路径),source_lines 不适用时给 null"""
 
+# 自定义主题通用出题视角模板(视角由用户描述驱动,生成质量取决于描述具体程度)
+_CUSTOM_TOPIC_HEAD_TEMPLATE = """你是一名「{name}」培训出题专家。基于给定的真实发现,从「{name}」的专业视角改编出客观题。
+
+## 出题视角
+{description}
+
+- 出题必须落到材料的具体细节,考察需要「{name}」专业知识才能判断的问题
+- knowledge_key 用英文短标识(如该领域常见概念的英文缩写或短语)"""
+
+
 # key 与 app/models/practice.py 的 LEARNING_TOPIC_* 枚举值一致
 _TOPIC_PROMPT_HEADS = {
     "security": _SECURITY_TOPIC_HEAD,
@@ -61,6 +72,14 @@ _TOPIC_PROMPT_HEADS = {
     "coding": _CODING_TOPIC_HEAD,
     "contract": _CONTRACT_TOPIC_HEAD,
 }
+
+
+def build_custom_topic_head(topic: dict) -> str:
+    """渲染自定义主题的出题视角 head(topic 为 {key,name,description})"""
+    return _CUSTOM_TOPIC_HEAD_TEMPLATE.format(
+        name=str(topic.get("name") or "自定义主题").strip() or "自定义主题",
+        description=str(topic.get("description") or "").strip() or "考察该主题的核心概念、常见陷阱与最佳实践",
+    )
 
 # 工作区可用时注入的工具说明段(工具实际可用与否与 sandbox 存活状态一致)
 _TOOL_SECTION = """## 材料查阅工具(工作区已就绪,必须使用)
@@ -123,9 +142,23 @@ _COMMON_RULES = """## 通用要求
  "languages": ["python", "sql"]}"""
 
 
-def build_system_prompt(topic: str, workspace_available: bool) -> str:
-    """按学习主题拼出题 system prompt;工作区可用时附工具说明段"""
-    head = _TOPIC_PROMPT_HEADS.get(topic) or _TOPIC_PROMPT_HEADS["security"]
+def build_system_prompt(
+    topic: str, workspace_available: bool,
+    custom_topics: list[dict] | None = None,
+) -> str:
+    """按学习主题拼出题 system prompt;工作区可用时附工具说明段
+
+    内置主题用专有视角 head;自定义主题(custom_topics 传入 {key,name,
+    description} 列表)用通用模板 + 用户描述渲染;无匹配回落 security(防御)。
+    """
+    head = _TOPIC_PROMPT_HEADS.get(topic)
+    if head is None and custom_topics:
+        for d in custom_topics:
+            if d.get("key") == topic:
+                head = build_custom_topic_head(d)
+                break
+    if head is None:
+        head = _TOPIC_PROMPT_HEADS["security"]
     sections = [head]
     if workspace_available:
         sections.append(_TOOL_SECTION)
@@ -134,17 +167,50 @@ def build_system_prompt(topic: str, workspace_available: bool) -> str:
 
 
 # ============================================================
-# 主题自动匹配:规则先行 + LLM 批量兜底(不再是用户级设置)
+# 主题自动匹配:规则先行 + LLM 批量兜底(主题词表来自用户设置)
 # ============================================================
 
-_TOPIC_CLASSIFY_SYSTEM = """你是审查发现的主题分类器。对给定的每条发现,判断它最适合改编成哪种主题的练习题:
-- security:安全漏洞(注入、硬编码凭证、越权、SSRF、配置泄露等)
-- architecture:架构设计问题(分层、耦合、模块边界、设计模式、技术选型)
-- coding:通用代码质量问题(bug、边界条件、异常处理、性能、可读性、测试)
-- contract:合同文书问题(条款不利、权责失衡、付款违约、知识产权、霸王条款)
+# 内置主题的分类描述(与 _TOPIC_CLASSIFY_SYSTEM 历史文案一致)
+_BUILTIN_CLASSIFY_LINES = (
+    "- security:安全漏洞(注入、硬编码凭证、越权、SSRF、配置泄露等)",
+    "- architecture:架构设计问题(分层、耦合、模块边界、设计模式、技术选型)",
+    "- coding:通用代码质量问题(bug、边界条件、异常处理、性能、可读性、测试)",
+    "- contract:合同文书问题(条款不利、权责失衡、付款违约、知识产权、霸王条款)",
+)
 
-只输出 JSON 数组,不要任何其他文字。每个元素:
-{"id": <发现序号,原样返回>, "topic": "security|architecture|coding|contract", "reason": "一句话理由"}"""
+
+def build_topic_classify_prompt(topics: list[dict]) -> str:
+    """按用户启用主题词表构建分类器 system prompt
+
+    topics 为 [{key,name,description}](仅启用主题):内置四类保留专有描述,
+    自定义主题以「- {key}:{name}——{description}」列出;输出必须命中词表 key。
+    """
+    builtin_keys = set(_TOPIC_PROMPT_HEADS)
+    lines: list[str] = []
+    for d in topics:
+        key = str(d.get("key") or "").strip()
+        if not key:
+            continue
+        if key in builtin_keys:
+            # 内置主题:保留专有分类描述(与历史文案一致)
+            for line in _BUILTIN_CLASSIFY_LINES:
+                if line.startswith(f"- {key}:"):
+                    lines.append(line)
+                    break
+        else:
+            name = str(d.get("name") or key).strip()
+            desc = str(d.get("description") or "").strip()
+            entry = f"- {key}:{name}"
+            if desc:
+                entry += f"——{desc}"
+            lines.append(entry)
+    return (
+        "你是审查发现的主题分类器。对给定的每条发现,判断它最适合改编成哪种主题的练习题:\n"
+        + "\n".join(lines)
+        + "\n\ntopic 必须是上述列表中给定的 key 之一。\n"
+        + "只输出 JSON 数组,不要任何其他文字。每个元素:\n"
+        + '{"id": <发现序号,原样返回>, "topic": "<列表中的 key>", "reason": "一句话理由"}'
+    )
 
 
 # ============================================================

@@ -28,6 +28,139 @@ class QuestionType(str, PyEnum):
     TRUE_FALSE = "true_false"
 
 
+# ============================================================
+# 学习主题(用户级词表:内置 4 个 + 自定义,存 learning_topics 表)
+# 出题提示词按主题切换;题目/知识点落库时记录所属主题 key,
+# 便于按主题筛选/组卷。分类仍按 finding 内容自动匹配(规则先行 + LLM 兜底),
+# 主题集合(含自定义)由用户在练习设置中管理。
+# practice_settings.learning_topic 列保留但已不读写(历史废弃列)。
+# ============================================================
+LEARNING_TOPIC_SECURITY = "security"          # 网络安全
+LEARNING_TOPIC_ARCHITECTURE = "architecture"  # 架构设计
+LEARNING_TOPIC_CODING = "coding"              # 通用代码能力
+LEARNING_TOPIC_CONTRACT = "contract"          # 合同文书
+LEARNING_TOPICS = (
+    LEARNING_TOPIC_SECURITY,
+    LEARNING_TOPIC_ARCHITECTURE,
+    LEARNING_TOPIC_CODING,
+    LEARNING_TOPIC_CONTRACT,
+)
+DEFAULT_LEARNING_TOPIC = LEARNING_TOPIC_SECURITY
+
+# 自定义主题 key 前缀(服务端生成,用户不接触 key,杜绝与内置键冲突)
+CUSTOM_TOPIC_KEY_PREFIX = "custom_"
+# 单用户自定义主题上限(防词表膨胀拖慢分类调用)
+MAX_CUSTOM_TOPICS = 10
+
+# 内置主题定义(ensure_user_topics 懒播种;description 供分类提示词与设置页展示)
+BUILTIN_TOPIC_DEFS: tuple[dict, ...] = (
+    {
+        "key": LEARNING_TOPIC_SECURITY,
+        "name": "安全",
+        "description": "网络安全漏洞:注入、硬编码凭证、越权、SSRF、配置泄露、"
+                       "不安全反序列化等漏洞模式与安全编码实践",
+        "sort_order": 10,
+    },
+    {
+        "key": LEARNING_TOPIC_ARCHITECTURE,
+        "name": "架构",
+        "description": "软件架构设计:分层与模块边界、耦合与内聚、设计模式应用与误用、"
+                       "技术选型权衡、扩展性与可测试性缺陷",
+        "sort_order": 20,
+    },
+    {
+        "key": LEARNING_TOPIC_CODING,
+        "name": "编码",
+        "description": "通用代码质量:bug 与边界条件、异常与错误处理、性能问题(如 N+1 查询)、"
+                       "代码坏味道、语言特性与工程最佳实践",
+        "sort_order": 30,
+    },
+    {
+        "key": LEARNING_TOPIC_CONTRACT,
+        "name": "合同",
+        "description": "合同文书审查:条款不利识别、权责对等、付款与违约、知识产权归属、"
+                       "霸王条款(任意解除权、单方变更、过度免责)",
+        "sort_order": 40,
+    },
+)
+
+
+class LearningTopic(Base):
+    """用户级学习主题词表(finding 分类与出题视角的定义源)
+
+    内置 4 行由 ensure_user_topics 懒播种(is_builtin=true:
+    不可删、不可改 key/name/description,仅可停用);
+    自定义行(is_builtin=false)全字段可管理,上限 MAX_CUSTOM_TOPICS 个。
+    enabled=false 的主题不再为新 finding 出题(存量题目/知识点不受影响)。
+    """
+
+    __tablename__ = "learning_topics"
+    __table_args__ = (
+        UniqueConstraint("user_id", "key", name="uq_learning_topic_user_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    # 稳定标识:内置=security/architecture/coding/contract;自定义=custom_<8位随机>
+    key: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 展示名(内置:安全/架构/编码/合同)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 主题视角说明(出题视角 + 分类依据;内置行存内置文案,自定义行用户填写)
+    description: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="", server_default=""
+    )
+    is_builtin: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    # 出题开关:false 时该主题的 finding 不再出题(存量不动)
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    # 排序:内置 10/20/30/40,自定义从 50 递增(按创建顺序)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(),
+        nullable=False,
+    )
+
+
+def ensure_user_topics(db, user_id) -> list["LearningTopic"]:
+    """确保用户已播种全部内置主题行(幂等),返回该用户全部主题(按 sort_order)
+
+    只 flush 不 commit,事务边界由调用方决定。
+    """
+    existing = (
+        db.query(LearningTopic)
+        .filter(LearningTopic.user_id == user_id)
+        .all()
+    )
+    existing_keys = {t.key for t in existing}
+    missing = [d for d in BUILTIN_TOPIC_DEFS if d["key"] not in existing_keys]
+    if missing:
+        for d in missing:
+            db.add(LearningTopic(
+                user_id=user_id, key=d["key"], name=d["name"],
+                description=d["description"], is_builtin=True,
+                enabled=True, sort_order=d["sort_order"],
+            ))
+        db.flush()
+        existing = (
+            db.query(LearningTopic)
+            .filter(LearningTopic.user_id == user_id)
+            .all()
+        )
+    return sorted(existing, key=lambda t: (t.sort_order, t.created_at))
+
+
 class QuestionStatus(str, PyEnum):
     # LLM 刚生成,待用户预览确认
     DRAFT = "draft"
@@ -66,6 +199,12 @@ class KnowledgePoint(Base):
     # 编程语言标签(多值,如 ["python", "sql"]);出题时由 LLM 给出,
     # 同知识点多次出题做并集累积;老数据为空列表
     languages: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    # 所属学习主题(learning_topics.key:内置 security/architecture/coding/contract
+    # 或自定义 custom_*);出题时随知识点首次创建写入,已存在知识点不改(first-wins)
+    learning_topic: Mapped[str] = mapped_column(
+        String(64), nullable=False,
+        default=DEFAULT_LEARNING_TOPIC, server_default=DEFAULT_LEARNING_TOPIC,
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -242,24 +381,6 @@ class Attempt(Base):
 
 
 # ============================================================
-# 学习主题(出题提示词按主题切换;题目落库时记录出题实际采用的主题,
-# 便于后续按主题筛选/组卷)。
-# 主题在出题时按 finding 内容自动匹配(规则先行 + LLM 兜底),
-# 不再是用户级设置;practice_settings.learning_topic 列保留但已不读写。
-# ============================================================
-LEARNING_TOPIC_SECURITY = "security"          # 网络安全
-LEARNING_TOPIC_ARCHITECTURE = "architecture"  # 架构设计
-LEARNING_TOPIC_CODING = "coding"              # 通用代码能力
-LEARNING_TOPIC_CONTRACT = "contract"          # 合同文书
-LEARNING_TOPICS = (
-    LEARNING_TOPIC_SECURITY,
-    LEARNING_TOPIC_ARCHITECTURE,
-    LEARNING_TOPIC_CODING,
-    LEARNING_TOPIC_CONTRACT,
-)
-DEFAULT_LEARNING_TOPIC = LEARNING_TOPIC_SECURITY
-
-# ============================================================
 # 出题思考模式(用户级覆盖出题模型的思考开关)
 # follow=跟随模型配置自身开关(默认);on/off=强制开/关。
 # 仅支持思考模式的模型(catalog thinking=only)强制关会被忽略。
@@ -399,11 +520,13 @@ def migrate_practice_settings_table() -> None:
 
 
 def migrate_practice_learning_columns() -> None:
-    """幂等给 practice_settings / practice_questions 补新列
+    """幂等给 practice_settings / knowledge_points / practice_questions 补新列
 
     背景:项目用 Base.metadata.create_all(无 Alembic),已存在的表不会自动加新列。
     - practice_settings 加 learning_topic / restore_workspace_for_practice /
       default_llm_config_id / thinking_mode_for_practice / force_default_llm
+    - knowledge_points 加 languages / learning_topic(加列时一次性回填:
+      取该 KP 题目中最常见的非空 learning_topic,无题保持默认 'security')
     - practice_questions 加 learning_topic(可空,老题不补)与
       source_file / source_lines(源码定位,可空)
     全新库(create_all 已建好新列)或已迁过 → 直接返回。
@@ -450,6 +573,7 @@ def migrate_practice_learning_columns() -> None:
                     "force_default_llm BOOLEAN NOT NULL DEFAULT false"
                 ))
                 log.info("practice_settings.force_default_llm 列迁移完成")
+        kp_topic_added = False
         if insp.has_table("knowledge_points"):
             cols = {c["name"] for c in insp.get_columns("knowledge_points")}
             if "languages" not in cols:
@@ -458,6 +582,13 @@ def migrate_practice_learning_columns() -> None:
                     "JSONB NOT NULL DEFAULT '[]'"
                 ))
                 log.info("knowledge_points.languages 列迁移完成")
+            if "learning_topic" not in cols:
+                conn.execute(text(
+                    "ALTER TABLE knowledge_points ADD COLUMN learning_topic "
+                    "VARCHAR(64) NOT NULL DEFAULT 'security'"
+                ))
+                kp_topic_added = True
+                log.info("knowledge_points.learning_topic 列迁移完成")
         if insp.has_table("practice_questions"):
             cols = {c["name"] for c in insp.get_columns("practice_questions")}
             if "learning_topic" not in cols:
@@ -484,4 +615,19 @@ def migrate_practice_learning_columns() -> None:
                     "VARCHAR(16) DEFAULT 'repo'"
                 ))
                 log.info("practice_questions.origin 列迁移完成")
+        # KP 主题回填:仅在本轮刚加列时执行一次(幂等)。
+        # 必须放在 practice_questions 分支之后(回填依赖题表 learning_topic 列已存在),
+        # 取该 KP 题目中最常见的非空 learning_topic(并列按主题名排序保证确定性),
+        # 无带主题题目的 KP 保持默认 'security'。
+        if kp_topic_added and insp.has_table("practice_questions"):
+            conn.execute(text("""
+                UPDATE knowledge_points kp SET learning_topic = sub.topic
+                FROM (SELECT q.knowledge_point_id AS kpid, q.learning_topic AS topic,
+                             ROW_NUMBER() OVER (PARTITION BY q.knowledge_point_id
+                               ORDER BY COUNT(*) DESC, q.learning_topic) AS rn
+                      FROM practice_questions q WHERE q.learning_topic IS NOT NULL
+                      GROUP BY q.knowledge_point_id, q.learning_topic) sub
+                WHERE sub.rn = 1 AND kp.id = sub.kpid
+            """))
+            log.info("knowledge_points.learning_topic 存量回填完成(取题目主题众数)")
         conn.commit()

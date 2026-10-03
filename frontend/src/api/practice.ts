@@ -18,6 +18,9 @@ import type {
   GenerateModelInfo,
   GenerateRequest,
   KnowledgePointCard,
+  LearningTopicCreateRequest,
+  LearningTopicDef,
+  LearningTopicUpdateRequest,
   PracticeStats,
   PracticeSummary,
   QuestionListItem,
@@ -101,6 +104,33 @@ export function getPracticeStats(): Promise<PracticeStats> {
 /** 知识点卡片列表(知识点看板视图):全量知识点 + SM-2 状态 + 题数 + 分栏状态 */
 export function listKnowledgePoints(): Promise<KnowledgePointCard[]> {
   return client.get('/practice/knowledge-points').then((r) => r.data)
+}
+
+// ---- 学习主题(用户可管理词表:内置 4 个 + 自定义) ----
+
+/** 学习主题列表(懒播种内置主题),按 sort_order 排序,附每主题知识点数 */
+export function listLearningTopics(): Promise<LearningTopicDef[]> {
+  return client.get('/practice/topics').then((r) => r.data)
+}
+
+/** 新增自定义主题(key 服务端生成;重名/超限 400) */
+export function createLearningTopic(
+  req: LearningTopicCreateRequest,
+): Promise<LearningTopicDef> {
+  return client.post('/practice/topics', req).then((r) => r.data)
+}
+
+/** 修改主题(内置仅 enabled;自定义可改 name/description/enabled) */
+export function updateLearningTopic(
+  id: string,
+  req: LearningTopicUpdateRequest,
+): Promise<LearningTopicDef> {
+  return client.patch(`/practice/topics/${id}`, req).then((r) => r.data)
+}
+
+/** 删除自定义主题(内置不可删;有关联知识点 400) */
+export function deleteLearningTopic(id: string): Promise<void> {
+  return client.delete(`/practice/topics/${id}`).then(() => undefined)
 }
 
 /** 题库列表(可按状态 / 知识点筛选;mistake=true 只返回答错过的 active 题) */

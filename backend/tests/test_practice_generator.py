@@ -26,6 +26,7 @@ import pytest
 
 import app.models.task_artifact  # noqa: F401  让 Task mapper 能解析 TaskArtifact 关联
 import app.services.practice.generator as gen
+from app.models.practice import LearningTopic
 from app.prompts.practice import build_system_prompt
 from app.services.practice.generator import (
     _MAX_TOOL_RESULT_CHARS,
@@ -287,8 +288,8 @@ def test_origin_and_kp_languages_persisted_in_pipeline(monkeypatch):
 # ============================================================
 
 
-def _gen_db(finding_count=1, findings=None):
-    """构造 mock db:按查询目标返回不同链(可指定 finding 条数/列表)"""
+def _gen_db(finding_count=1, findings=None, topics=None):
+    """构造 mock db:按查询目标返回不同链(可指定 finding 列表/主题词表)"""
     db = MagicMock()
     if findings is None:
         findings = [
@@ -309,6 +310,9 @@ def _gen_db(finding_count=1, findings=None):
             q.filter.return_value.order_by.return_value.all.return_value = findings
         elif model is gen.KnowledgePoint:
             q.filter.return_value.first.return_value = None
+        elif model is LearningTopic:
+            # ensure_user_topics 的词表查询(需含全部内置 key 才不触发播种)
+            q.filter.return_value.all.return_value = topics if topics is not None else []
         else:  # Question.dedup_hash 列查询:无已入库题目
             q.filter.return_value.all.return_value = []
         return q
@@ -624,6 +628,28 @@ def _plain_finding(fid, title="发现", meta=None):
     )
 
 
+def _builtin_topic_defs():
+    """内置主题词表(模拟 ensure_user_topics 返回启用主题的 dict 形态)"""
+    return [
+        {"key": d["key"], "name": d["name"], "description": d["description"]}
+        for d in gen.BUILTIN_TOPIC_DEFS
+    ]
+
+
+def _topic_rows(enabled_keys=None):
+    """构造 LearningTopic 行(SimpleNamespace,模拟库表返回)"""
+    enabled_keys = enabled_keys or {d["key"] for d in gen.BUILTIN_TOPIC_DEFS}
+    return [
+        SimpleNamespace(
+            key=d["key"], name=d["name"], description=d["description"],
+            is_builtin=True, enabled=d["key"] in enabled_keys,
+            sort_order=d["sort_order"],
+            created_at="2026-01-01",
+        )
+        for d in gen.BUILTIN_TOPIC_DEFS
+    ]
+
+
 def test_match_topic_by_rule_document_review_scenario():
     """文书审核场景 → 全部 contract(场景强信号,优先于 CWE)"""
     task = _gen_task(scenario="document_review")
@@ -653,7 +679,9 @@ def test_match_finding_topics_rule_hits_skip_llm(monkeypatch):
         lambda *a, **k: calls.append(1) or {},
     )
     findings = [_mk_finding("a"), _mk_finding("b")]  # 均带 cwe → security
-    out = gen._match_finding_topics(_gen_task(), findings, MagicMock())
+    out = gen._match_finding_topics(
+        _gen_task(), findings, MagicMock(), _builtin_topic_defs(),
+    )
     assert out == {"a": "security", "b": "security"}
     assert not calls
 
@@ -665,7 +693,7 @@ def test_match_finding_topics_llm_classifies_pending(monkeypatch):
         _plain_finding("p1", title="SQL 注入风险"),
     ]
 
-    def fake_classify(client, pending, task_id):
+    def fake_classify(client, pending, task_id, topic_defs):
         return {
             idx: ("contract" if "付款" in f.title else "security")
             for idx, f in pending
@@ -674,19 +702,38 @@ def test_match_finding_topics_llm_classifies_pending(monkeypatch):
     monkeypatch.setattr(gen, "_classify_topics_with_llm", fake_classify)
     out = gen._match_finding_topics(
         _gen_task(scenario="code_review"), findings, MagicMock(),
+        _builtin_topic_defs(),
     )
     assert out == {"p0": "contract", "p1": "security"}
 
 
-def test_match_finding_topics_llm_failure_degrades_security(monkeypatch):
-    """LLM 分类抛异常 → 全部降级 security,不阻断出题"""
+def test_match_finding_topics_llm_failure_degrades_first_enabled(monkeypatch):
+    """LLM 分类抛异常 → 降级到排序第一的启用主题(不再硬编码 security)"""
     def boom(*a, **k):
         raise RuntimeError("llm down")
 
     monkeypatch.setattr(gen, "_classify_topics_with_llm", boom)
     findings = [_plain_finding("x")]
-    out = gen._match_finding_topics(_gen_task(), findings, MagicMock())
-    assert out == {"x": "security"}
+    # security 停用,排序第一的启用主题为 architecture
+    defs = [d for d in _builtin_topic_defs() if d["key"] != "security"]
+    out = gen._match_finding_topics(_gen_task(), findings, MagicMock(), defs)
+    assert out == {"x": "architecture"}
+
+
+def test_match_finding_topics_custom_key_accepted(monkeypatch):
+    """LLM 分类返回自定义主题 key 被接受(词表含自定义)"""
+    defs = _builtin_topic_defs() + [
+        {"key": "custom_abcd1234", "name": "算法", "description": "复杂度分析"},
+    ]
+    monkeypatch.setattr(
+        gen, "_classify_topics_with_llm",
+        lambda *a, **k: {0: "custom_abcd1234"},
+    )
+    findings = [_plain_finding("x")]
+    out = gen._match_finding_topics(
+        _gen_task(scenario="code_review"), findings, MagicMock(), defs,
+    )
+    assert out == {"x": "custom_abcd1234"}
 
 
 def test_question_learning_topic_records_matched(monkeypatch):
@@ -701,6 +748,186 @@ def test_question_learning_topic_records_matched(monkeypatch):
         _gen_db(), _gen_task(scenario="document_review"), "u1", client=MagicMock(),
     )
     assert created and created[0].learning_topic == "contract"
+
+
+# ============================================================
+# 学习主题词表动态化(分类器 / 提示词 / 出题过滤)
+# ============================================================
+
+
+def test_classify_topics_custom_key_accepted(monkeypatch):
+    """LLM 分类返回词表内的自定义 key → 被接受"""
+    monkeypatch.setattr(
+        gen, "_stream_one_round",
+        lambda client, messages, tools: (
+            '[{"id": 0, "topic": "custom_abcd1234", "reason": "算法相关"}]', None,
+        ),
+    )
+    defs = _builtin_topic_defs() + [
+        {"key": "custom_abcd1234", "name": "算法", "description": "复杂度分析"},
+    ]
+    out = gen._classify_topics_with_llm(
+        MagicMock(), [(0, _plain_finding("x"))], "t1", defs,
+    )
+    assert out == {0: "custom_abcd1234"}
+
+
+def test_classify_topics_unknown_key_dropped(monkeypatch):
+    """LLM 分类返回词表外的 key → 条目被丢弃(不落入 topics)"""
+    monkeypatch.setattr(
+        gen, "_stream_one_round",
+        lambda client, messages, tools: (
+            '[{"id": 0, "topic": "not_in_vocab", "reason": "x"}]', None,
+        ),
+    )
+    out = gen._classify_topics_with_llm(
+        MagicMock(), [(0, _plain_finding("x"))], "t1", _builtin_topic_defs(),
+    )
+    assert out == {}
+
+
+def test_classify_prompt_includes_custom_topics():
+    """分类提示词按词表动态构建:自定义主题以 key:name——描述 列出"""
+    from app.prompts.practice import build_topic_classify_prompt
+
+    defs = _builtin_topic_defs() + [
+        {"key": "custom_abcd1234", "name": "算法", "description": "复杂度分析"},
+    ]
+    prompt = build_topic_classify_prompt(defs)
+    # 内置四类描述保留
+    for key in ("security", "architecture", "coding", "contract"):
+        assert f"- {key}:" in prompt
+    # 自定义主题出现且格式正确
+    assert "- custom_abcd1234:算法——复杂度分析" in prompt
+    # 输出约束:key 必须来自列表
+    assert "必须是上述列表中给定的 key 之一" in prompt
+
+
+def test_classify_prompt_builtin_only_matches_legacy_text():
+    """仅内置词表时,分类提示词与历史四行文案一致(无自定义条目)"""
+    from app.prompts.practice import build_topic_classify_prompt
+
+    prompt = build_topic_classify_prompt(_builtin_topic_defs())
+    assert "- security:安全漏洞" in prompt
+    assert "custom_" not in prompt
+
+
+def test_build_custom_topic_head_renders_user_description():
+    """自定义主题出题视角:通用模板渲染用户描述"""
+    from app.prompts.practice import build_custom_topic_head
+
+    head = build_custom_topic_head({
+        "key": "custom_abcd1234", "name": "算法",
+        "description": "考察复杂度分析、边界条件、正确性证明",
+    })
+    assert "「算法」培训出题专家" in head
+    assert "考察复杂度分析、边界条件、正确性证明" in head
+
+
+def test_build_system_prompt_custom_topic(monkeypatch):
+    """自定义主题 key 命中 custom_topics → 用通用模板渲染(不回落 security)"""
+    from app.prompts.practice import build_system_prompt
+
+    custom = [{"key": "custom_abcd1234", "name": "算法", "description": "复杂度"}]
+    prompt = build_system_prompt(
+        "custom_abcd1234", False, custom_topics=custom,
+    )
+    assert "「算法」培训出题专家" in prompt
+    # 通用规则段仍包含
+    assert "必须阅读材料才能作答" in prompt
+
+
+def test_build_system_prompt_unknown_custom_without_defs_falls_back():
+    """自定义 key 不在 custom_topics / 无词表 → 回落 security(防御)"""
+    from app.prompts.practice import build_system_prompt
+
+    prompt = build_system_prompt("custom_xxxx", False, custom_topics=None)
+    assert "网络安全培训出题专家" in prompt
+
+
+def test_kp_learning_topic_first_wins():
+    """新建 KP 写入出题主题;已存在 KP 保持原主题(first-wins)"""
+    # 新建:query 返回 None → learning_topic 写入
+    db = _gen_db()
+    kp = gen._get_or_create_knowledge_point(
+        db, "u1", "CWE-89", "SQL 注入", learning_topic="contract",
+    )
+    assert kp.learning_topic == "contract"
+
+    # 已存在:query 返回既有 KP(learning_topic=security)→ 不改
+    existing = SimpleNamespace(
+        user_id="u1", key="CWE-89", name="SQL 注入",
+        languages=["python"], learning_topic="security",
+    )
+    db2 = MagicMock()
+    q = MagicMock()
+    q.filter.return_value.first.return_value = existing
+    db2.query.return_value = q
+    kp2 = gen._get_or_create_knowledge_point(
+        db2, "u1", "CWE-89", "SQL 注入", learning_topic="contract",
+    )
+    assert kp2 is existing
+    assert kp2.learning_topic == "security"
+
+
+def test_generator_filters_disabled_topic_findings(monkeypatch):
+    """停用主题的 finding 在出题前被过滤,进度分母重算"""
+    import json
+
+    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
+    monkeypatch.setattr(
+        gen, "_call_llm", lambda *a, **k: json.dumps([_raw()], ensure_ascii=False),
+    )
+    # security 停用:带 CWE 的 finding(规则捷径命中 security)应被跳过;
+    # 无 CWE 的 finding 走 LLM 分类失败降级 architecture(排序第一启用主题)
+    def boom(*a, **k):
+        raise RuntimeError("llm down")
+
+    monkeypatch.setattr(gen, "_classify_topics_with_llm", boom)
+    findings = [
+        _mk_finding("a"),                              # cwe → security(停用)
+        _plain_finding("b", title="模块耦合过紧"),       # LLM 分类 → 降级 architecture
+    ]
+    topics = _topic_rows(enabled_keys={"architecture", "coding", "contract"})
+    events = []
+    created, _ = gen.generate_questions_for_task(
+        _gen_db(findings=findings, topics=topics), _gen_task(), "u1",
+        client=MagicMock(), event_callback=lambda t, d: events.append((t, d)),
+    )
+    # 只有 finding b 出题(topic=architecture)
+    assert len(created) == 1
+    assert created[0].learning_topic == "architecture"
+    # 进度事件的 total 反映过滤后的分母(1 而非 2)
+    finding_events = [d for t, d in events if t == "finding"]
+    assert finding_events and finding_events[-1]["total"] == 1
+
+
+def test_generator_all_enabled_keeps_legacy_behavior(monkeypatch):
+    """全启用时行为与现状等价:带 CWE 的 finding 照常出题(security)"""
+    import json
+
+    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
+    monkeypatch.setattr(
+        gen, "_call_llm", lambda *a, **k: json.dumps([_raw()], ensure_ascii=False),
+    )
+    created, _ = gen.generate_questions_for_task(
+        _gen_db(topics=_topic_rows()), _gen_task(), "u1", client=MagicMock(),
+    )
+    assert created and created[0].learning_topic == "security"
+
+
+def test_generator_no_enabled_topics_falls_back_builtin(monkeypatch):
+    """词表为空(防御)→ 按内置词表出题,不阻断"""
+    import json
+
+    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
+    monkeypatch.setattr(
+        gen, "_call_llm", lambda *a, **k: json.dumps([_raw()], ensure_ascii=False),
+    )
+    created, _ = gen.generate_questions_for_task(
+        _gen_db(topics=[]), _gen_task(), "u1", client=MagicMock(),
+    )
+    assert created and created[0].learning_topic == "security"
 
 
 # ============================================================

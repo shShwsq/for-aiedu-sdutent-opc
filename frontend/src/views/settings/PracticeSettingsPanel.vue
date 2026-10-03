@@ -8,6 +8,8 @@
  * - 出题思考模式:覆盖出题模型的思考开关(跟随配置/强制开/强制关)
  * - 默认出题模型:用户级默认(任务级配置优先,未设置则回退 env 默认);
  *   可开「始终用默认出题模型」忽略任务级配置
+ * - 学习主题管理:内置 4 个(安全/架构/编码/合同,可停用)+ 自定义增删改;
+ *   停用的主题不再出新题(存量不动)
  * 另含危险操作:清空练习记录 / 清空全部数据(均二次确认,不可逆)。
  *
  * (由练习页右上角弹窗迁移而来;练习页入口改为跳转本面板)
@@ -16,10 +18,17 @@ import { computed, onMounted, ref } from 'vue'
 
 import { getPreferences, savePracticeSettings } from '@/api/memory'
 import { getMyModels } from '@/api/model_configs'
-import { clearPracticeRecords } from '@/api/practice'
+import {
+  clearPracticeRecords,
+  createLearningTopic,
+  deleteLearningTopic,
+  listLearningTopics,
+  updateLearningTopic,
+} from '@/api/practice'
 import { extractErrorMessage } from '@/utils/error'
 import type { LLMConfigItemOut } from '@/types/model_configs'
 import type { PracticeThinkingMode } from '@/types/memory'
+import type { LearningTopicDef } from '@/types/practice'
 
 // ============================================================
 // 状态
@@ -71,6 +80,120 @@ const THINKING_OPTIONS: Array<{ value: PracticeThinkingMode; label: string; desc
 ]
 
 // ============================================================
+// 学习主题管理(内置 4 个 + 自定义,独立 CRUD,不走 preferences 链路)
+// ============================================================
+const topics = ref<LearningTopicDef[]>([])
+/** 主题操作中(增删改/开关),禁用全部主题交互 */
+const topicBusy = ref(false)
+/** 新增表单展开态 */
+const showCreateForm = ref(false)
+const newName = ref('')
+const newDesc = ref('')
+/** 正在编辑的自定义主题 id(空串=无) */
+const editingId = ref('')
+const editName = ref('')
+const editDesc = ref('')
+/** 删除确认中的主题 id(空串=无) */
+const deletingId = ref('')
+
+/** 启用主题数(最后一个启用的主题不可停/删,前端预判 + 后端兜底 400) */
+const enabledCount = computed(() => topics.value.filter((t) => t.enabled).length)
+
+async function loadTopics(): Promise<void> {
+  topicBusy.value = true
+  try {
+    topics.value = await listLearningTopics()
+  } catch (err) {
+    showToast(extractErrorMessage(err), 'error')
+  } finally {
+    topicBusy.value = false
+  }
+}
+
+async function toggleTopic(t: LearningTopicDef): Promise<void> {
+  if (topicBusy.value) return
+  if (t.enabled && enabledCount.value <= 1) {
+    showToast('至少需保留一个启用的学习主题', 'error')
+    return
+  }
+  topicBusy.value = true
+  try {
+    const latest = await updateLearningTopic(t.id, { enabled: !t.enabled })
+    Object.assign(t, latest)
+    showToast(
+      latest.enabled
+        ? `已启用「${latest.name}」,新任务的发现将参与该主题出题`
+        : `已停用「${latest.name}」,不再出新题(已有题目不受影响)`,
+      'success',
+    )
+  } catch (err) {
+    showToast(extractErrorMessage(err), 'error')
+  } finally {
+    topicBusy.value = false
+  }
+}
+
+async function handleCreateTopic(): Promise<void> {
+  const name = newName.value.trim()
+  if (!name || topicBusy.value) return
+  topicBusy.value = true
+  try {
+    await createLearningTopic({ name, description: newDesc.value.trim() })
+    newName.value = ''
+    newDesc.value = ''
+    showCreateForm.value = false
+    await loadTopics()
+    showToast('自定义主题已添加,新任务的发现会自动参与该主题分类与出题', 'success')
+  } catch (err) {
+    showToast(extractErrorMessage(err), 'error')
+  } finally {
+    topicBusy.value = false
+  }
+}
+
+function startEdit(t: LearningTopicDef): void {
+  editingId.value = t.id
+  deletingId.value = ''
+  editName.value = t.name
+  editDesc.value = t.description
+}
+
+async function saveEdit(t: LearningTopicDef): Promise<void> {
+  const name = editName.value.trim()
+  if (!name || topicBusy.value) return
+  topicBusy.value = true
+  try {
+    const latest = await updateLearningTopic(t.id, {
+      name,
+      description: editDesc.value.trim(),
+    })
+    Object.assign(t, latest)
+    editingId.value = ''
+    showToast('主题已更新', 'success')
+  } catch (err) {
+    showToast(extractErrorMessage(err), 'error')
+  } finally {
+    topicBusy.value = false
+  }
+}
+
+async function handleDeleteTopic(t: LearningTopicDef): Promise<void> {
+  if (topicBusy.value) return
+  topicBusy.value = true
+  try {
+    await deleteLearningTopic(t.id)
+    topics.value = topics.value.filter((x) => x.id !== t.id)
+    deletingId.value = ''
+    showToast(`已删除「${t.name}」`, 'success')
+  } catch (err) {
+    // 400 详情(如该主题下还有知识点)直接展示
+    showToast(extractErrorMessage(err), 'error')
+  } finally {
+    topicBusy.value = false
+  }
+}
+
+// ============================================================
 // 加载
 // ============================================================
 async function load(): Promise<void> {
@@ -94,6 +217,7 @@ async function load(): Promise<void> {
   } catch {
     // 静默失败,下拉只展示「跟随系统默认」
   }
+  loadTopics()
 }
 
 // ============================================================
@@ -347,6 +471,113 @@ onMounted(load)
           >
             <span class="switch-thumb" />
           </button>
+        </div>
+      </div>
+
+      <!-- 学习主题管理:内置 4 个(可停用)+ 自定义增删改 -->
+      <div class="setting-block">
+        <span class="setting-title">学习主题</span>
+        <span class="setting-desc">
+          出题视角与自动分类的主题词表。停用的主题不再出新题,已有题目不受影响;
+          自定义主题的出题质量取决于描述的具体程度
+        </span>
+
+        <div v-if="topicBusy" class="loading-box"><span class="btn-spinner" /> 加载中…</div>
+        <div v-else class="topic-manage-list">
+          <div
+            v-for="t in topics"
+            :key="t.id"
+            :class="['topic-manage-row', { 'topic-row-disabled': !t.enabled }]"
+          >
+            <!-- 编辑态(仅自定义行) -->
+            <template v-if="editingId === t.id">
+              <div class="topic-edit-form">
+                <input
+                  v-model="editName"
+                  class="topic-input"
+                  type="text"
+                  maxlength="64"
+                  placeholder="主题名称"
+                >
+                <textarea
+                  v-model="editDesc"
+                  class="topic-textarea"
+                  rows="2"
+                  maxlength="500"
+                  placeholder="主题视角描述(选填)"
+                />
+                <div class="topic-edit-actions">
+                  <button class="btn-plain" :disabled="!editName.trim()" @click="saveEdit(t)">保存</button>
+                  <button class="btn-plain" @click="editingId = ''">取消</button>
+                </div>
+              </div>
+            </template>
+
+            <!-- 展示态 -->
+            <template v-else>
+              <div class="topic-manage-info">
+                <span class="topic-manage-name">
+                  {{ t.name }}
+                  <span v-if="t.is_builtin" class="topic-badge" title="内置主题:不可删除,仅可启用/停用">内置</span>
+                </span>
+                <span class="topic-manage-desc">{{ t.description || '暂无视角描述' }}</span>
+                <span class="topic-manage-meta">{{ t.kp_count }} 个知识点</span>
+              </div>
+              <div class="topic-manage-side">
+                <button
+                  type="button"
+                  role="switch"
+                  :aria-checked="t.enabled"
+                  :aria-label="`${t.enabled ? '停用' : '启用'}主题「${t.name}」`"
+                  :class="['switch', { 'switch-on': t.enabled }]"
+                  :disabled="topicBusy || (t.enabled && enabledCount <= 1)"
+                  :title="t.enabled && enabledCount <= 1 ? '至少需保留一个启用的学习主题' : (t.enabled ? '停用后不再出新题,已有题目不受影响' : '启用后新任务的发现将参与该主题出题')"
+                  @click="toggleTopic(t)"
+                >
+                  <span class="switch-thumb" />
+                </button>
+                <div v-if="!t.is_builtin" class="topic-manage-actions">
+                  <button class="btn-plain" :disabled="topicBusy" @click="startEdit(t)">编辑</button>
+                  <template v-if="deletingId === t.id">
+                    <button class="btn-danger" :disabled="topicBusy" @click="handleDeleteTopic(t)">确认删除</button>
+                    <button class="btn-plain" :disabled="topicBusy" @click="deletingId = ''">取消</button>
+                  </template>
+                  <button
+                    v-else
+                    class="btn-plain"
+                    :disabled="topicBusy"
+                    title="有关联知识点的主题无法删除,可改为停用"
+                    @click="deletingId = t.id"
+                  >删除</button>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <!-- 新增自定义主题 -->
+        <div v-if="!showCreateForm" class="topic-add-row">
+          <button class="btn-plain" :disabled="topicBusy" @click="showCreateForm = true">+ 添加自定义主题</button>
+        </div>
+        <div v-else class="topic-create-form">
+          <input
+            v-model="newName"
+            class="topic-input"
+            type="text"
+            maxlength="64"
+            placeholder="主题名称(如:算法与数据结构)"
+          >
+          <textarea
+            v-model="newDesc"
+            class="topic-textarea"
+            rows="2"
+            maxlength="500"
+            placeholder="例如:算法与数据结构——考察复杂度分析、边界条件、正确性证明"
+          />
+          <div class="topic-edit-actions">
+            <button class="btn-plain" :disabled="topicBusy || !newName.trim()" @click="handleCreateTopic">添加</button>
+            <button class="btn-plain" :disabled="topicBusy" @click="showCreateForm = false">取消</button>
+          </div>
         </div>
       </div>
 
@@ -699,6 +930,134 @@ onMounted(load)
 
 .force-title {
   font-size: var(--fs-sm);
+}
+
+/* ---- 学习主题管理 ---- */
+.topic-manage-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.topic-manage-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.topic-manage-row:first-child {
+  padding-top: var(--space-1);
+}
+
+.topic-manage-row:last-of-type {
+  border-bottom: none;
+}
+
+.topic-row-disabled .topic-manage-name,
+.topic-row-disabled .topic-manage-desc,
+.topic-row-disabled .topic-manage-meta {
+  color: var(--color-text-muted);
+}
+
+.topic-manage-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.topic-manage-name {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--color-text);
+}
+
+.topic-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--color-text-secondary);
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+}
+
+.topic-manage-desc {
+  font-size: var(--fs-xs);
+  color: var(--color-text-secondary);
+  line-height: var(--lh-relaxed);
+}
+
+.topic-manage-meta {
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
+}
+
+.topic-manage-side {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.topic-manage-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.topic-add-row {
+  margin-top: var(--space-2);
+}
+
+.topic-create-form,
+.topic-edit-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+  margin-top: var(--space-1);
+}
+
+.topic-edit-form {
+  padding: var(--space-2) 0;
+}
+
+.topic-input,
+.topic-textarea {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-sm);
+  font-family: inherit;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.topic-textarea {
+  resize: vertical;
+  line-height: var(--lh-relaxed);
+}
+
+.topic-input:focus,
+.topic-textarea:focus {
+  border-color: var(--color-primary);
+}
+
+.topic-edit-actions {
+  display: flex;
+  gap: var(--space-2);
 }
 
 /* ---- 开关 ---- */

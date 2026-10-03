@@ -213,6 +213,7 @@ const sessionResults = ref<{ question: SessionQuestion; correct: boolean }[]>([]
 async function handleStartPractice(
   topicFilter?: string,
   questionIds?: string[],
+  learningTopic?: string,
 ): Promise<void> {
   if (starting.value) return
   starting.value = true
@@ -221,6 +222,7 @@ async function handleStartPractice(
     const res = await startSession({
       count: questionIds?.length ?? sessionCount.value,
       topic_filter: topicFilter ?? null,
+      learning_topic: learningTopic ?? null,
       question_ids: questionIds,
     })
     if (res.message) showToast(res.message, 'success')
@@ -416,10 +418,16 @@ onMounted(() => {
   // 出题进度:进页先拉一次,之后每 5 秒轮询发现运行中 job
   pollGenerateJobs()
   genPollTimer = setInterval(pollGenerateJobs, 5000)
-  // 知识点看板跳转:带 ?topic=<知识点key> 进入时自动发起该知识点的专项练习
+  // 知识点看板跳转:带 ?topic=<知识点key> 进入时自动发起该知识点的专项练习;
+  // 带 ?learningTopic=<主题key> 进入时自动发起主题级练习(知识点/主题级互斥,topic 优先)
   const topic = route.query.topic
   if (typeof topic === 'string' && topic) {
     handleStartPractice(topic)
+  } else {
+    const learningTopic = route.query.learningTopic
+    if (typeof learningTopic === 'string' && learningTopic) {
+      handleStartPractice(undefined, undefined, learningTopic)
+    }
   }
 })
 
