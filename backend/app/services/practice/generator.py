@@ -11,7 +11,10 @@
      要求出题前先读材料并记录 source_file/source_lines;
      沙箱已清理且用户开启「出题前恢复工作区」时先重新 clone 恢复
 3. json_repair 容错解析 + 字段校验,失败重试 1 次,仍失败丢弃该 finding;
-   工作区可用时无 code_snippet 的题判为不合格,带质量反馈重试 1 次后丢弃
+   两级质量关卡拦截不合格题(全部被拦时带质量反馈重试 1 次后丢弃):
+   - 关卡 1(始终启用):退化题 — 叙述式判断题(某同学做了某判断是否
+     正确)或判断题措辞泄露答案(题干含「仅凭」等)
+   - 关卡 2(工作区可用时):无 code_snippet 的题,不看材料也能作答
 4. 致命错误快速失败:模型 401/403(额度耗尽/Key 失效)等不可重试错误
    立即中止剩余 finding,抛 PracticeGenerateError 由 job 层展示原因
 5. 知识点 get_or_create(优先 CWE 编号)+ 同用户 sha256 去重
@@ -93,6 +96,7 @@ def _fatal_llm_reason(e: Exception) -> str | None:
 # 提示词资产:集中管理于 app/prompts/practice.py,此处仅导入
 # ============================================================
 from app.prompts.practice import (
+    _DEGEN_FEEDBACK,
     _FINDING_TEMPLATE,
     _LEARNING_NOTE_TEMPLATE,
     _NO_CODE_FEEDBACK,
@@ -711,6 +715,44 @@ def _is_practice_worthy(finding: Result) -> bool:
     return isinstance(meta, dict) and meta.get("practice_worthy") is True
 
 
+# ============================================================
+# 质量关卡 1:退化题检测(叙述式判断题 / 答案泄露措辞)
+# ============================================================
+
+# 虚构人物叙述模式:某(位/个)同学/工程师/...、小明/小王等
+_NARRATOR_PATTERN = re.compile(
+    r"某(?:位|个)?(?:同学|工程师|开发(?:者|人员)?|程序员|测试(?:人员|工程师)?|"
+    r"用户|新人|审计(?:员|人员)?|分析(?:师|人员)?)|小[明华红强伟芳]"
+)
+# 叙述式判断题的题干问法(与人物模式同时出现即为退化)
+_NARRATIVE_JUDGE_PATTERN = re.compile(
+    r"是否正确|正确吗|对不对|对吗|判断是否|判断正确"
+)
+# 判断题措辞即答案的泄露词(「仅凭 X 就 Y」的叙述必然是反例)
+_ANSWER_LEAK_WORDS = ("仅凭", "就想当然", "便断定", "就直接认定", "就认定")
+
+
+def _is_degenerate_question(q: dict) -> bool:
+    """检测退化题:不看材料也能答对、或题型套路泄露答案的题
+
+    两类模式:
+    1. 叙述式判断题:「某同学做了某判断,该判断是否正确」— 出题惯性里
+       此类叙述必然是反例,看到「某同学 + 仅凭」即可答"错误",零知识送分
+    2. 判断题措辞泄露:题干含「仅凭」等泄露词时,答案恒为"错误"
+
+    纯规则检测(零 LLM 成本),误伤可控:正常专业题不会引入虚构人物
+    叙述,也不会用「仅凭」开头描述材料事实。
+    """
+    stem = q.get("stem") or ""
+    if not stem:
+        return False
+    if _NARRATOR_PATTERN.search(stem) and _NARRATIVE_JUDGE_PATTERN.search(stem):
+        return True
+    if q.get("qtype") == "true_false":
+        return any(w in stem for w in _ANSWER_LEAK_WORDS)
+    return False
+
+
 def _select_findings(
     db: Session, task: Task, max_findings: int,
 ) -> list[Result]:
@@ -849,24 +891,38 @@ def generate_questions_for_task(
                 )
                 content = ""
             questions = _parse_llm_questions(content, meta, finding_id=finding.id)
-            # 质量关卡:工作区可用时无 code_snippet 的题不合格(常识题拦截)
+            # 质量关卡 1(始终启用):退化题拦截(叙述式判断题/答案泄露措辞)
+            degen_dropped = 0
+            if questions:
+                sane = [q for q in questions if not _is_degenerate_question(q)]
+                degen_dropped = len(questions) - len(sane)
+                if degen_dropped:
+                    logger.info(
+                        "[practice] finding=%s 质量关卡: %d/%d 题为退化题"
+                        "(叙述式判断/答案泄露)被丢弃",
+                        finding.id, degen_dropped, len(questions),
+                    )
+                questions = sane
+            # 质量关卡 2:工作区可用时无 code_snippet 的题不合格(常识题拦截)
+            no_snippet_dropped = 0
             if repo_path and questions:
                 qualified = [q for q in questions if q["code_snippet"]]
-                dropped = len(questions) - len(qualified)
-                if dropped:
+                no_snippet_dropped = len(questions) - len(qualified)
+                if no_snippet_dropped:
                     logger.info(
                         "[practice] finding=%s 质量关卡: %d/%d 题缺 code_snippet 被丢弃",
-                        finding.id, dropped, len(questions),
+                        finding.id, no_snippet_dropped, len(questions),
                     )
-                if not qualified and attempt < PARSE_RETRY:
-                    # 全部缺代码上下文:带质量反馈重试一次
-                    logger.info(
-                        "[practice] finding=%s 全部题目缺代码上下文,带质量反馈重试",
-                        finding.id,
-                    )
-                    user_prompt = prompt + _NO_CODE_FEEDBACK
-                    continue
                 questions = qualified
+            # 全部被关卡拦截:带对应质量反馈重试一次(退化问题优先反馈)
+            if not questions and attempt < PARSE_RETRY and (degen_dropped or no_snippet_dropped):
+                feedback = _DEGEN_FEEDBACK if degen_dropped else _NO_CODE_FEEDBACK
+                logger.info(
+                    "[practice] finding=%s 全部题目被质量关卡拦截,带反馈重试(退化 %d/缺材料 %d)",
+                    finding.id, degen_dropped, no_snippet_dropped,
+                )
+                user_prompt = prompt + feedback
+                continue
             if questions:
                 break
 

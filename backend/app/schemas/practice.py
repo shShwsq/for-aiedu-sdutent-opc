@@ -250,6 +250,34 @@ class WeakPointItem(BaseModel):
     due_at: datetime | None = None
 
 
+class KnowledgePointCardItem(BaseModel):
+    """知识点卡片(知识点看板视图,GET /practice/knowledge-points)
+
+    一张卡片 = 一个知识点:静态信息(key/name/languages) +
+    SM-2 记忆状态(无作答记录时为默认值) + 题库题数 + 看板分栏状态。
+    """
+
+    knowledge_key: str
+    knowledge_name: str
+    # 粗分类(如 cwe / general)
+    category: str | None = None
+    languages: list[str] = []
+    # 作答统计(无作答记录为 0)
+    attempts: int = 0
+    correct_count: int = 0
+    accuracy: float | None = None
+    # SM-2 记忆参数(无作答记录为默认值)
+    repetitions: int = 0
+    interval_days: float = 0.0
+    ease_factor: float = 2.5
+    due_at: datetime | None = None
+    # 题库中该知识点的 active 题数
+    question_count: int = 0
+    # 看板分栏(按优先级派生):weak=薄弱 / due=待复习 /
+    # mastered=已巩固 / learning=学习中 / fresh=未开始
+    board_status: Literal["weak", "due", "mastered", "learning", "fresh"] = "fresh"
+
+
 class StatsResponse(BaseModel):
     """练习首页统计(GET /practice/stats)"""
 

@@ -17,6 +17,7 @@ import type {
   GenerateJobStatus,
   GenerateModelInfo,
   GenerateRequest,
+  KnowledgePointCard,
   PracticeStats,
   PracticeSummary,
   QuestionListItem,
@@ -95,6 +96,11 @@ export function submitAnswer(
 /** 练习统计:能力值 / 到期复习数 / 薄弱点分布 */
 export function getPracticeStats(): Promise<PracticeStats> {
   return client.get('/practice/stats').then((r) => r.data)
+}
+
+/** 知识点卡片列表(知识点看板视图):全量知识点 + SM-2 状态 + 题数 + 分栏状态 */
+export function listKnowledgePoints(): Promise<KnowledgePointCard[]> {
+  return client.get('/practice/knowledge-points').then((r) => r.data)
 }
 
 /** 题库列表(可按状态 / 知识点筛选;mistake=true 只返回答错过的 active 题) */

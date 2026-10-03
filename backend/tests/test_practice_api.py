@@ -542,3 +542,104 @@ def test_clear_records_user_isolation(ctx, ctx_b):
     assert len(ctx_b.client.get("/practice/questions").json()) == 1
     # Alice 已清空
     assert ctx.client.get("/practice/sessions").json() == []
+
+
+# ============================================================
+# 知识点看板(GET /practice/knowledge-points)
+# ============================================================
+
+
+def _make_kp_q_state(
+    db_session, user_id, key, name, *,
+    attempts, correct, repetitions, due_at, question_count=1,
+):
+    """直接造一个知识点 + active 题 + SM-2 状态(attempts=0 时不造状态行)"""
+    kp = KnowledgePoint(
+        user_id=user_id, key=key, name=name, category="cwe", languages=["python"],
+    )
+    db_session.add(kp)
+    db_session.flush()
+    for i in range(question_count):
+        db_session.add(Question(
+            user_id=user_id, knowledge_point_id=kp.id,
+            qtype=QuestionType.SINGLE_CHOICE, stem=f"{key}-题{i}",
+            options=["甲", "乙"], answer_idx=0, explanation="",
+            difficulty=3.0, status=QuestionStatus.ACTIVE,
+            dedup_hash=uuid.uuid4().hex,
+        ))
+    if attempts > 0:
+        db_session.add(UserKnowledgeState(
+            user_id=user_id, knowledge_point_id=kp.id,
+            attempts=attempts, correct_count=correct,
+            repetitions=repetitions, interval_days=1.0, due_at=due_at,
+        ))
+    db_session.commit()
+    db_session.close()
+    return kp
+
+
+def test_knowledge_points_board_statuses(ctx):
+    """看板分栏:薄弱/待复习/已巩固/学习中/未开始 各状态正确派生"""
+    ctx.login()
+    s = ctx.session_factory()
+    now = datetime.now(timezone.utc)
+    # 错误率 75% > 40% 且作答 ≥ 3 次 → weak
+    _make_kp_q_state(s, ctx.user.id, "CWE-100", "薄弱点",
+                     attempts=4, correct=1, repetitions=0, due_at=None)
+    # SM-2 已到期(未到期不满足 mastered 之前先判 due)→ due
+    _make_kp_q_state(s, ctx.user.id, "CWE-200", "待复习点",
+                     attempts=2, correct=2, repetitions=2,
+                     due_at=now - timedelta(days=1))
+    # 连续答对且正确率 100% ≥ 75%,未到期 → mastered
+    _make_kp_q_state(s, ctx.user.id, "CWE-300", "已巩固点",
+                     attempts=5, correct=5, repetitions=5,
+                     due_at=now + timedelta(days=30))
+    # 有作答但样本不足/未到期/未巩固 → learning
+    _make_kp_q_state(s, ctx.user.id, "CWE-400", "学习中点",
+                     attempts=2, correct=1, repetitions=1,
+                     due_at=now + timedelta(days=2))
+    # 从未作答 → fresh
+    _make_kp_q_state(s, ctx.user.id, "CWE-500", "未开始点",
+                     attempts=0, correct=0, repetitions=0, due_at=None)
+
+    r = ctx.client.get("/practice/knowledge-points")
+    assert r.status_code == 200
+    cards = r.json()
+    by_key = {c["knowledge_key"]: c for c in cards}
+    assert by_key["CWE-100"]["board_status"] == "weak"
+    assert by_key["CWE-200"]["board_status"] == "due"
+    assert by_key["CWE-300"]["board_status"] == "mastered"
+    assert by_key["CWE-400"]["board_status"] == "learning"
+    assert by_key["CWE-500"]["board_status"] == "fresh"
+    # 卡片字段:题数与作答统计
+    assert by_key["CWE-100"]["question_count"] == 1
+    assert by_key["CWE-100"]["attempts"] == 4
+    assert by_key["CWE-500"]["accuracy"] is None
+    # 排序:薄弱栏最前
+    assert cards[0]["board_status"] == "weak"
+
+
+def test_knowledge_points_weak_over_due_priority(ctx):
+    """既薄弱又到期 → weak 优先(薄弱栏更能引起注意)"""
+    ctx.login()
+    s = ctx.session_factory()
+    now = datetime.now(timezone.utc)
+    _make_kp_q_state(s, ctx.user.id, "CWE-900", "既薄弱又到期",
+                     attempts=5, correct=1, repetitions=0,
+                     due_at=now - timedelta(days=1))
+    r = ctx.client.get("/practice/knowledge-points")
+    assert r.status_code == 200
+    assert r.json()[0]["board_status"] == "weak"
+
+
+def test_knowledge_points_auth_and_user_isolation(ctx, ctx_b):
+    """未登录 401;数据 per-user 隔离(Bob 看不到 Alice 的知识点)"""
+    ctx.logout()
+    assert ctx.client.get("/practice/knowledge-points").status_code == 401
+    ctx.login()
+    s = ctx.session_factory()
+    _make_kp_q_state(s, ctx.user.id, "CWE-700", "alice 的知识点",
+                     attempts=0, correct=0, repetitions=0, due_at=None)
+    r = ctx_b.client.get("/practice/knowledge-points")
+    assert r.status_code == 200
+    assert all(c["knowledge_key"] != "CWE-700" for c in r.json())

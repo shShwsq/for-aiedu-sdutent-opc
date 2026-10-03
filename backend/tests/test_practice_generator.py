@@ -387,6 +387,108 @@ def test_quality_gate_skipped_without_workspace(monkeypatch):
 
 
 # ============================================================
+# 质量关卡 1:退化题检测(叙述式判断题 / 答案泄露措辞,始终启用)
+# ============================================================
+
+# 真实退化案例:仅凭叙述句式即可答「错误」,零知识送分
+REAL_BAD_STEM = (
+    "某同学在仓库中看到文件「vibe_coding_contract_final.md」,大小 5 KB,"
+    "首行为「# 外包开发合同(AI 生成版)」。他仅凭文件名里有 \"contract\" "
+    "就认定这是一份 Word 合同文档。该判断是否正确?"
+)
+
+
+def test_is_degenerate_narrative_question():
+    """「某同学 + 该判断是否正确」的叙述式判断题:单选/判断均为退化"""
+    assert gen._is_degenerate_question(_raw(
+        stem=REAL_BAD_STEM, qtype="true_false", options=["正确", "错误"]))
+    assert gen._is_degenerate_question(_raw(stem=REAL_BAD_STEM))
+
+
+def test_is_degenerate_answer_leak_wording():
+    """判断题含「仅凭」等泄露词:措辞即答案(此类叙述必然是反例)"""
+    for word in ("仅凭", "就想当然", "便断定", "就认定"):
+        assert gen._is_degenerate_question(_raw(
+            stem=f"他{word}配置无误,可以安全上线",
+            qtype="true_false", options=["正确", "错误"],
+        ))
+
+
+def test_is_degenerate_normal_question_passes():
+    """正常专业题不误伤:题干直接对材料技术事实作判断"""
+    assert not gen._is_degenerate_question(_raw())
+    # 判断题但题干是专业事实判断,无人物叙述、无泄露词
+    assert not gen._is_degenerate_question(_raw(
+        stem="该查询直接拼接用户输入,存在 SQL 注入风险",
+        qtype="true_false", options=["正确", "错误"],
+    ))
+    # 单选题含「仅凭」不拦截:有干扰项,泄露程度低
+    assert not gen._is_degenerate_question(
+        _raw(stem="仅凭文件名后缀判断上传文件格式,以下哪种做法更安全?")
+    )
+    # 无人物只有「是否正确」不拦截:可能是正常的事实判断
+    assert not gen._is_degenerate_question(_raw(
+        stem="该函数对空输入的处理是否正确?",
+        qtype="true_false", options=["正确", "错误"],
+    ))
+
+
+def test_quality_gate_filters_degenerate_questions(monkeypatch):
+    """混合输出:正常题保留,叙述式判断题被丢弃(工作区不可用也拦截)"""
+    import json
+
+    good = _raw()
+    bad = _raw(stem=REAL_BAD_STEM, qtype="true_false", options=["正确", "错误"])
+    output = json.dumps([good, bad], ensure_ascii=False)
+    monkeypatch.setattr(gen, "_call_llm", lambda *a, **k: output)
+    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
+    created, skipped = gen.generate_questions_for_task(
+        _gen_db(), _gen_task(), "u1", client=MagicMock(),
+    )
+    assert len(created) == 1
+    assert created[0].stem == good["stem"]
+    assert skipped == 0
+
+
+def test_quality_gate_degenerate_retry_feedback(monkeypatch):
+    """全部退化 → 带退化题质量反馈重试一次;仍退化则整条 finding 跳过"""
+    import json
+
+    bad = json.dumps([_raw(
+        stem=REAL_BAD_STEM, qtype="true_false", options=["正确", "错误"],
+    )], ensure_ascii=False)
+    prompts_seen = []
+
+    def fake_call_llm(client, system_prompt, finding_text, task_id, repo_path, on_event=None):
+        prompts_seen.append(finding_text)
+        return bad
+
+    monkeypatch.setattr(gen, "_call_llm", fake_call_llm)
+    monkeypatch.setattr(gen.sandbox_tools, "get_workspace_info", lambda tid: None)
+    created, skipped = gen.generate_questions_for_task(
+        _gen_db(), _gen_task(), "u1", client=MagicMock(),
+    )
+    assert not created
+    assert skipped == 1
+    # 第一次原始 prompt,第二次追加了退化题质量反馈
+    assert len(prompts_seen) == 2
+    assert "出题套路" not in prompts_seen[0]
+    assert "出题套路" in prompts_seen[1]
+
+
+def test_common_rules_forbid_narrative_and_leak():
+    """通用规则含退化题禁止条款(叙述式判断/答案泄露/常识题/空数组许可)"""
+    rules = build_system_prompt("security", workspace_available=False)
+    # 禁止叙述式判断题与答案泄露措辞
+    assert "某同学" in rules
+    assert "仅凭" in rules
+    # 知识密度要求(禁常识题)
+    assert "专业深度" in rules
+    # 空数组许可扩大到「发现内容单薄」
+    assert "单薄" in rules
+
+
+# ============================================================
 # 致命错误快速失败(401/403 额度类:立即中止并冒泡友好原因)
 # ============================================================
 

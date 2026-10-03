@@ -658,6 +658,8 @@ react_agent 维护跨轮 plan 状态:
 | `/cli` | CliSettingsView | 外部 CLI 凭据配置(Qoder / DeepSeek / Codex) |
 | `/agent-policy` | AgentPolicyView | 协作策略(检查助手启用 / 轮次 / 验证授权模式 / 引用复核开关 / CLI 命令确认模式) |
 | `/practice` | PracticeView | 自适应练习(出题生成 / 练习会话 / 题库管理 / 统计趋势) |
+| `/practice/history` | PracticeHistoryView | 练习记录(历史会话 + 每周正确率趋势) |
+| `/practice/board` | KnowledgeBoardView | 知识点看板(薄弱/待复习/已巩固/学习中/未开始五栏,卡片发起专项练习) |
 | `/skills` | SkillManagerView | 技能管理(上传 zip / 列表 / 在线编辑 SKILL.md / 删除) |
 | `/memory` | MemoryView | 记忆管理(用户偏好 / 全局记忆 / 项目记忆) |
 | `/settings` | SettingsView | 用户设置(改密码/Git 平台绑定 GitHub+Gitee/删除账号) |
@@ -746,14 +748,22 @@ agent2 调用独立 ReAct 智能体在已部署测试环境动态验证发现(�
 
 **思考模式覆盖**:`practice_settings.thinking_mode_for_practice` 三态(follow=跟随模型配置 / on=强制开 / off=强制关),出题前应用到 `client.enable_thinking`;catalog 中 thinking=only 的模型强制关被忽略并记日志。
 
+**出题质量关卡**(两级,全部被拦时带质量反馈重试 1 次后丢弃该 finding):
+- **关卡 1 退化题拦截**(始终启用,纯规则零成本):叙述式判断题(「某同学做了某判断,该判断是否正确」式虚构人物叙事,答案由句式泄露)与判断题措辞泄露(题干含「仅凭 / 就想当然 / 便断定」等,答案恒为"错误")
+- **关卡 2 材料上下文**(工作区可用时):无 `code_snippet` 的题视为常识题丢弃
+- 配套提示词条款:禁止虚构人物叙述题与答案可由措辞推断的题;考察点须为漏洞模式/设计缺陷/条款风险/语言陷阱级专业判断(文件扩展名等常识不出题);发现内容单薄不足以支撑专业考察点时允许返回空数组(宁缺毋滥)
+
+**知识点看板**:`GET /practice/knowledge-points` 返回全量知识点卡片(SM-2 状态 + 作答统计 + active 题数 + 看板分栏状态)。分栏按优先级派生(薄弱判定复用 selector 常量):`weak`(错误率 > 40% 且作答 ≥ 3 次)> `due`(SM-2 到期)> `mastered`(连续答对 ≥ 3 次且正确率 ≥ 75%)> `learning`(有作答记录)> `fresh`(从未作答);排序分栏优先,栏内薄弱按错误率、待复习按最急到期。前端 `KnowledgeBoardView.vue` 五栏渲染,卡片「专项练习」跳 `/practice?topic=<key>` 由练习页接管组卷。
+
 **API 一览**(`backend/app/routers/practice.py`,全部 `Depends(get_current_user)`):
 - `POST /practice/generate` + `GET /practice/generate/jobs` + `GET /practice/generate/{job_id}` + `GET /practice/generate/{job_id}/stream`(异步出题 job + SSE 进度)
 - `GET /practice/drafts`(候选题预览)+ `POST /practice/questions/confirm`(确认入库)+ `POST /practice/questions/activate`(直接激活)
-- `POST /practice/sessions` + `POST /practice/sessions/{id}/answers`(组卷与判分,答案不下发)
+- `POST /practice/sessions` + `POST /practice/sessions/{id}/answers`(组卷与判分,答案不下发;`StartSessionRequest.topic_filter` 支持知识点专项练习)
 - `GET /practice/summary` / `GET /practice/trend` / `GET /practice/stats`(统计与趋势)
+- `GET /practice/knowledge-points`(知识点看板卡片列表)
 - `GET /practice/questions` + `POST /practice/questions/{id}/archive`(题库管理)+ `DELETE /practice/records`(清空记录)
 
-**前端**:`PracticeView.vue`(练习首页 / 会话答题 / 统计)、`PracticeGenerateSidebar`(出题进度侧栏,与答题代码栏互斥,360px)、`PracticeGenerateDialog`(生成确认)、`PracticeSettingsDialog`(主题 / 恢复开关 / 默认出题模型 / 思考模式)、`PracticeCodeSidebar`(答题时源码查阅);任务详情页结果区有「生成练习题」入口。
+**前端**:`PracticeView.vue`(练习首页 / 会话答题 / 统计;`?topic=<key>` 进入自动发起专项练习)、`KnowledgeBoardView.vue`(知识点看板,薄弱点板块从练习首页移入其薄弱栏)、`PracticeHistoryView.vue`(练习记录)、`PracticeGenerateSidebar`(出题进度侧栏,与答题代码栏互斥,360px)、`PracticeGenerateDialog`(生成确认)、`PracticeSettingsDialog`(主题 / 恢复开关 / 默认出题模型 / 思考模式)、`PracticeCodeSidebar`(答题时源码查阅);任务详情页结果区有「生成练习题」入口。
 
 **出题日志**:`backend/logs/practice_generate.log`(滚动 10MB×3),记录模型解析 / 工作区状态 / 每条 finding 的解析与丢弃原因,便于排查"一道题也没生成"。
 

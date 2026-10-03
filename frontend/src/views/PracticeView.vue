@@ -3,18 +3,21 @@
  * 自适应练习页
  *
  * 两种界面(组件内切换,不走路由):
- * - 首页:练习统计(能力值/到期复习/正确率/题库规模)+ 薄弱点列表 +
- *   开始练习入口 + 题库管理(列表/归档)
+ * - 首页:练习统计(能力值/到期复习/正确率/题库规模)+ 开始练习入口 +
+ *   错题回顾 + 题库管理(列表/归档)
  * - 会话:逐题作答(单选/判断),提交后即时判分 + 解析 + 知识点掌握度反馈;
  *   结束时显示本局统计
  *
- * 历史练习会话与学习趋势拆到独立路由页(/practice/history,见 PracticeHistoryView),
- * 首页顶部「历史记录」按钮进入。
+ * 历史练习会话与学习趋势拆到独立路由页(/practice/history),
+ * 知识点掌握全景拆到 /practice/board(原首页薄弱点板块移入其薄弱栏),
+ * 首页顶部按钮进入。带 ?topic=<知识点key> 进入时自动发起该知识点的专项练习
+ * (知识点看板卡片「专项练习」入口)。
  *
  * 组卷由后端 selector 完成(到期复习 > 薄弱点 > 难度匹配 > 新题),答案不下发。
  * 题目来源:审计任务详情页「生成练习题」产出并确认入库。
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { useRoute } from 'vue-router'
 
 import AppHeader from '@/components/AppHeader.vue'
 import PracticeCodeSidebar from '@/components/PracticeCodeSidebar.vue'
@@ -39,6 +42,8 @@ import type {
   SessionQuestion,
   SubmitAnswerResponse,
 } from '@/types/practice'
+
+const route = useRoute()
 
 // ============================================================
 // 历史任务侧栏(与首页/其他视图一致的折叠模式)
@@ -169,7 +174,7 @@ type ViewMode = 'home' | 'session' | 'summary'
 const mode = ref<ViewMode>('home')
 
 // ============================================================
-// 首页:统计 + 薄弱点
+// 首页:统计(薄弱点全景已移至知识点看板页 /practice/board)
 // ============================================================
 const stats = ref<PracticeStats | null>(null)
 const statsLoading = ref(true)
@@ -404,13 +409,6 @@ function formatDifficulty(d: number): string {
   return Number.isInteger(d) ? String(d) : d.toFixed(1)
 }
 
-/** 到期复习徽标:weak point 的 due_at 已过 → 显示「待复习」 */
-function isDue(iso: string | null | undefined): boolean {
-  if (!iso) return false
-  const d = new Date(iso)
-  return !Number.isNaN(d.getTime()) && d.getTime() <= Date.now()
-}
-
 onMounted(() => {
   loadStats()
   loadQuestionBank()
@@ -418,6 +416,11 @@ onMounted(() => {
   // 出题进度:进页先拉一次,之后每 5 秒轮询发现运行中 job
   pollGenerateJobs()
   genPollTimer = setInterval(pollGenerateJobs, 5000)
+  // 知识点看板跳转:带 ?topic=<知识点key> 进入时自动发起该知识点的专项练习
+  const topic = route.query.topic
+  if (typeof topic === 'string' && topic) {
+    handleStartPractice(topic)
+  }
 })
 
 onBeforeUnmount(() => {
@@ -619,6 +622,18 @@ onBeforeUnmount(() => {
               </button>
               <RouterLink
                 class="gen-toggle-btn"
+                title="知识点掌握全景:按薄弱/待复习/已巩固分栏,可发起专项练习"
+                :to="{ name: 'practice-board' }"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="3" y="3" width="5" height="8" rx="1" />
+                  <rect x="10" y="3" width="5" height="12" rx="1" />
+                  <rect x="17" y="3" width="4" height="6" rx="1" />
+                </svg>
+                知识点看板
+              </RouterLink>
+              <RouterLink
+                class="gen-toggle-btn"
                 title="查看历史练习会话与学习趋势"
                 :to="{ name: 'practice-history' }"
               >
@@ -703,40 +718,6 @@ onBeforeUnmount(() => {
               </div>
             </div>
             <p v-if="startError" class="action-error">{{ startError }}</p>
-          </section>
-
-          <!-- 薄弱点 -->
-          <section class="panel">
-            <h2>薄弱知识点</h2>
-            <p v-if="stats.weak_points.length === 0" class="panel-empty">
-              暂无作答记录 — 完成几轮练习后,这里会按错误率展示各知识点掌握情况
-            </p>
-            <div v-else class="weak-list">
-              <div v-for="w in stats.weak_points" :key="w.knowledge_key" class="weak-item">
-                <div class="weak-info">
-                  <span class="weak-name">{{ w.knowledge_name }}</span>
-                  <span class="weak-key">{{ w.knowledge_key }}</span>
-                  <span
-                    v-for="lang in (w.languages ?? [])"
-                    :key="lang"
-                    class="tag tag-lang"
-                  >{{ lang }}</span>
-                  <span v-if="isDue(w.due_at)" class="tag tag-due">待复习</span>
-                </div>
-                <div class="weak-bar-wrap" :title="`错误率 ${formatPercent(w.accuracy)}`">
-                  <div class="weak-bar" :style="{ width: `${Math.min(w.accuracy * 100, 100)}%` }" />
-                </div>
-                <span class="weak-stat">
-                  错 {{ formatPercent(w.accuracy) }} · {{ w.attempts }} 次作答
-                </span>
-                <button
-                  class="btn-secondary btn-small"
-                  :disabled="starting || stats.active_question_count === 0"
-                  title="只练习该知识点的题目"
-                  @click="handleStartPractice(w.knowledge_key)"
-                >专项练习</button>
-              </div>
-            </div>
           </section>
 
           <!-- 错题回顾 -->
@@ -1125,67 +1106,6 @@ onBeforeUnmount(() => {
   border-radius: var(--radius-md);
 }
 
-/* ============ 薄弱点列表 ============ */
-.weak-list {
-  display: flex;
-  flex-direction: column;
-}
-
-.weak-item {
-  display: grid;
-  grid-template-columns: minmax(180px, 1.4fr) minmax(80px, 1fr) auto auto;
-  align-items: center;
-  gap: var(--space-4);
-  padding: var(--space-3) 0;
-  border-top: 1px solid var(--color-border);
-}
-
-.weak-item:first-child {
-  border-top: none;
-}
-
-.weak-info {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  min-width: 0;
-}
-
-.weak-name {
-  font-size: var(--fs-sm);
-  font-weight: var(--fw-medium);
-  color: var(--color-text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.weak-key {
-  font-size: var(--fs-xs);
-  font-family: var(--font-mono);
-  color: var(--color-text-muted);
-  white-space: nowrap;
-}
-
-.weak-bar-wrap {
-  height: 6px;
-  background: var(--color-surface-alt);
-  border-radius: var(--radius-full);
-  overflow: hidden;
-}
-
-.weak-bar {
-  height: 100%;
-  background: var(--color-danger);
-  border-radius: var(--radius-full);
-}
-
-.weak-stat {
-  font-size: var(--fs-xs);
-  color: var(--color-text-secondary);
-  white-space: nowrap;
-}
-
 /* ============ 题库管理 ============ */
 .bank-head {
   display: flex;
@@ -1383,11 +1303,6 @@ onBeforeUnmount(() => {
 .tag-synthetic {
   color: var(--color-warning, #b45309);
   background: color-mix(in srgb, var(--color-warning, #b45309) 10%, transparent);
-}
-
-.tag-due {
-  color: var(--color-warning, #b45309);
-  background: color-mix(in srgb, var(--color-warning, #f59e0b) 15%, transparent);
 }
 
 .question-stem {
@@ -1754,20 +1669,6 @@ onBeforeUnmount(() => {
   .stat-cards {
     grid-template-columns: repeat(2, 1fr);
     gap: var(--space-2);
-  }
-
-  /* 薄弱点行:四列 grid 改为上下两行(名称+统计 / 进度条独占) */
-  .weak-item {
-    grid-template-columns: 1fr auto;
-    gap: var(--space-2);
-  }
-
-  .weak-bar-wrap {
-    grid-column: 1 / -1;
-  }
-
-  .weak-key {
-    display: none; /* 窄屏隐藏 mono 键名,避免挤压 */
   }
 
   /* 会话顶栏允许换行 */

@@ -236,6 +236,30 @@ export interface WeakPointItem {
   due_at: string | null
 }
 
+/** 知识点看板分栏(后端按优先级派生):weak=薄弱 / due=待复习 / mastered=已巩固 / learning=学习中 / fresh=未开始 */
+export type BoardStatus = 'weak' | 'due' | 'mastered' | 'learning' | 'fresh'
+
+/** 知识点卡片(知识点看板视图,GET /practice/knowledge-points) */
+export interface KnowledgePointCard {
+  knowledge_key: string
+  knowledge_name: string
+  /** 粗分类(如 cwe / general) */
+  category: string | null
+  languages: string[]
+  /** 作答统计(无作答记录为 0) */
+  attempts: number
+  correct_count: number
+  accuracy: number | null
+  /** SM-2 记忆参数(无作答记录为默认值) */
+  repetitions: number
+  interval_days: number
+  ease_factor: number
+  due_at: string | null
+  /** 题库中该知识点的 active 题数 */
+  question_count: number
+  board_status: BoardStatus
+}
+
 export interface PracticeStats {
   ability: number
   due_count: number

@@ -78,6 +78,13 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: true },
   },
   {
+    // 知识点看板页(知识点掌握全景 + 专项练习入口),从练习页「知识点看板」入口进入
+    path: '/practice/board',
+    name: 'practice-board',
+    component: () => import('@/views/KnowledgeBoardView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     path: '/login',
     name: 'login',
     component: () => import('@/views/LoginView.vue'),
@@ -148,8 +155,13 @@ router.beforeEach(async (to, from) => {
   }
 
   // 练习功能开关:后端关闭时直连练习相关页回退(入口已隐藏,此处兜底)
-  // —— /practice 与记录页回首页;/settings/practice 回账户设置页
-  if (to.name === 'practice' || to.name === 'practice-history' || to.name === 'settings-practice') {
+  // —— /practice 与记录/看板页回首页;/settings/practice 回账户设置页
+  if (
+    to.name === 'practice' ||
+    to.name === 'practice-history' ||
+    to.name === 'practice-board' ||
+    to.name === 'settings-practice'
+  ) {
     await ensureFeaturesLoaded()
     if (!practiceEnabled.value) {
       return to.name === 'settings-practice' ? { name: 'settings-account' } : { name: 'home' }

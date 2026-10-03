@@ -43,6 +43,7 @@ from app.schemas.practice import (
     GenerateModelResponse,
     GenerateRequest,
     KnowledgeStateResponse,
+    KnowledgePointCardItem,
     PracticeSummaryResponse,
     QuestionListItem,
     SessionAttemptItem,
@@ -69,7 +70,12 @@ from app.services.practice.generator import (
     generate_questions_for_task,
     resolve_generate_model_info,
 )
-from app.services.practice.selector import CandidateInfo, select_questions
+from app.services.practice.selector import (
+    WEAKNESS_ERROR_RATE,
+    WEAKNESS_MIN_ATTEMPTS,
+    CandidateInfo,
+    select_questions,
+)
 from app.services.practice.sm2 import (
     SM2State,
     apply_sm2,
@@ -974,6 +980,107 @@ def get_stats(
         active_question_count=active_count,
         draft_question_count=draft_count,
     )
+
+
+@router.get("/knowledge-points", response_model=list[KnowledgePointCardItem])
+def list_knowledge_points(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[KnowledgePointCardItem]:
+    """知识点卡片列表(知识点看板视图):全量知识点 + SM-2 状态 + 题数 + 分栏状态
+
+    分栏按优先级派生(与 selector 薄弱判定同一套常量):
+    weak(错误率超阈值且样本足) > due(SM-2 到期) > mastered(连续答对已巩固)
+    > learning(有作答记录) > fresh(从未作答)。
+    排序:分栏优先,栏内薄弱按错误率、待复习按最急到期、其余按作答数。
+    """
+    now = _now()
+    kps = (
+        db.query(KnowledgePoint)
+        .filter(KnowledgePoint.user_id == current_user.id)
+        .all()
+    )
+    if not kps:
+        return []
+    kp_ids = [kp.id for kp in kps]
+    states = {
+        s.knowledge_point_id: s
+        for s in db.query(UserKnowledgeState).filter(
+            UserKnowledgeState.user_id == current_user.id,
+            UserKnowledgeState.knowledge_point_id.in_(kp_ids),
+        ).all()
+    }
+    q_counts = dict(
+        db.query(Question.knowledge_point_id, sa_func.count(Question.id))
+        .filter(
+            Question.user_id == current_user.id,
+            Question.status == QuestionStatus.ACTIVE,
+            Question.knowledge_point_id.in_(kp_ids),
+        )
+        .group_by(Question.knowledge_point_id)
+        .all()
+    )
+
+    # 已巩固判定:连续答对累计 3 次以上且正确率 >= 75%
+    mastered_min_repetitions = 3
+    mastered_min_accuracy = 0.75
+
+    items: list[KnowledgePointCardItem] = []
+    for kp in kps:
+        st = states.get(kp.id)
+        attempts = st.attempts if st else 0
+        correct = st.correct_count if st else 0
+        accuracy = (correct / attempts) if attempts else None
+        repetitions = st.repetitions if st else 0
+        due_at = st.due_at if st else None
+        if (
+            attempts >= WEAKNESS_MIN_ATTEMPTS
+            and accuracy is not None
+            and (1.0 - accuracy) > WEAKNESS_ERROR_RATE
+        ):
+            status = "weak"
+        elif due_at is not None and due_at <= now:
+            status = "due"
+        elif (
+            repetitions >= mastered_min_repetitions
+            and accuracy is not None
+            and accuracy >= mastered_min_accuracy
+        ):
+            status = "mastered"
+        elif attempts > 0:
+            status = "learning"
+        else:
+            status = "fresh"
+        items.append(KnowledgePointCardItem(
+            knowledge_key=kp.key,
+            knowledge_name=kp.name,
+            category=kp.category,
+            languages=kp.languages or [],
+            attempts=attempts,
+            correct_count=correct,
+            accuracy=accuracy,
+            repetitions=repetitions,
+            interval_days=st.interval_days if st else 0.0,
+            ease_factor=st.ease_factor if st else 2.5,
+            due_at=due_at,
+            question_count=q_counts.get(kp.id, 0) or 0,
+            board_status=status,
+        ))
+
+    # 稳定排序:分栏优先,栏内薄弱按错误率降序、待复习按最急到期、
+    # 其余按作答数降序(跨栏第一位的 rank 已分出大小,不会比较后续异构字段)
+    rank = {"weak": 0, "due": 1, "mastered": 2, "learning": 3, "fresh": 4}
+
+    def _sort_key(item: KnowledgePointCardItem):
+        r = rank[item.board_status]
+        if item.board_status == "weak":
+            return (r, -(1.0 - (item.accuracy or 0.0)), -item.attempts, item.knowledge_key)
+        if item.board_status == "due":
+            return (r, item.due_at or now, item.knowledge_key)
+        return (r, -item.attempts, -item.question_count, item.knowledge_key)
+
+    items.sort(key=_sort_key)
+    return items
 
 
 @router.get("/questions", response_model=list[QuestionListItem])
