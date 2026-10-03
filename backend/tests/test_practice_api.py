@@ -678,22 +678,26 @@ def test_ensure_user_topics_seeds_and_idempotent(ctx):
     """播种:补齐内置 4 行;重复调用不重复插行;文案与排序正确"""
     ctx.login()
     s = ctx.session_factory()
-    topics = ensure_user_topics(s, ctx.user.id)
-    s.commit()
-    assert [t.key for t in topics] == [
-        "security", "architecture", "coding", "contract",
-    ]
-    assert all(t.is_builtin and t.enabled for t in topics)
-    assert [t.sort_order for t in topics] == [10, 20, 30, 40]
-    # 幂等:重复调用不重复插行
-    ensure_user_topics(s, ctx.user.id)
-    s.commit()
-    count = s.query(LearningTopic).filter(
-        LearningTopic.user_id == ctx.user.id
-    ).count()
-    assert count == 4
-    # 内置描述非空(分类提示词与设置页展示用)
-    assert all(t.description for t in topics)
+    try:
+        topics = ensure_user_topics(s, ctx.user.id)
+        s.commit()
+        assert [t.key for t in topics] == [
+            "security", "architecture", "coding", "contract",
+        ]
+        assert all(t.is_builtin and t.enabled for t in topics)
+        assert [t.sort_order for t in topics] == [10, 20, 30, 40]
+        # 幂等:重复调用不重复插行
+        ensure_user_topics(s, ctx.user.id)
+        s.commit()
+        count = s.query(LearningTopic).filter(
+            LearningTopic.user_id == ctx.user.id
+        ).count()
+        assert count == 4
+        # 内置描述非空(分类提示词与设置页展示用)
+        assert all(t.description for t in topics)
+    finally:
+        # 显式关闭:防事务悬挂阻塞下一用例的 TRUNCATE
+        s.close()
 
 
 def test_topics_list_seeds_builtins(ctx):
