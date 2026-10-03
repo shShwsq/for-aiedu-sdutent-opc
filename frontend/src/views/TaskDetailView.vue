@@ -109,6 +109,13 @@ function toggleDetail(): void {
   detailCollapsed.value = !detailCollapsed.value
 }
 
+// 从首页「最近任务」进入时带 ?workspace=1:自动展开历史任务侧栏
+// (列表→详情的浏览连续性),读取后清掉参数,避免用户手动折叠后刷新又被强制展开
+if (route.query.workspace === '1') {
+  workspaceCollapsed.value = false
+  router.replace({ query: { ...route.query, workspace: undefined } })
+}
+
 // ---- 工作区变更(任务完成时捕获的 git diff patch) ----
 
 /** 任务的工作区 diff 产物(任务完成时由后端捕获,kind="git_diff") */

@@ -116,7 +116,8 @@ function formatRelativeTime(iso: string): string {
 }
 
 function goToTask(id: string): void {
-  router.push(`/tasks/${id}`)
+  // 带 workspace=1:进入详情页时自动展开历史任务侧栏(首页列表 → 详情的浏览连续性)
+  router.push({ path: `/tasks/${id}`, query: { workspace: '1' } })
 }
 </script>
 
