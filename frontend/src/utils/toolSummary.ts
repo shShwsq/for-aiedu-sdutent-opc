@@ -7,6 +7,8 @@
  * - tool_result content:工具返回的结构化 JSON(read_file/find_files/search_code/list_files)
  */
 
+import { stripWorkspaceRoot } from './workspacePath'
+
 /** 工具项最小结构(TaskDetailView 的 DisplayItem 满足此接口) */
 export interface ToolItem {
   id: string
@@ -60,10 +62,10 @@ export function commandOf(call: ToolItem): string {
   return detail
 }
 
-/** 剥掉 /repos/<仓库名>/ 前缀,路径更短更易读 */
+/** 剥掉工作区根前缀(sandbox 的 /repos/<仓库>/ 或 local 的临时目录),路径更短更易读;
+ *  规则见 workspacePath.stripWorkspaceRoot(顺带把 Windows 反斜杠归一成正斜杠) */
 export function shortenPath(p: string): string {
-  const m = p.match(/\/repos\/[^/]+\/(.+)$/)
-  return m ? m[1] : p
+  return stripWorkspaceRoot(p)
 }
 
 function stripQuotes(s: string): string {
@@ -424,7 +426,8 @@ export function toolFileTargetOf(
   if (!rawPath || rawPath === '?') return null
 
   // read_file 结果路径已是仓库相对路径(摘要原样展示);
-  // CLI/Bash 可能带沙箱绝对路径前缀,展示与跳转都剥掉 /repos/<仓库>/
+  // CLI/Bash 给的是工作区绝对路径,展示与跳转都剥掉工作区根前缀。
+  // 摘要与 path 必须出自同一个 shortenPath 调用:下面的 indexOf 匹配依赖两者文本一致
   const display = name === 'read_file' ? rawPath : shortenPath(rawPath)
   const summary = buildToolSummary(call, result)
   const idx = summary.indexOf(display)

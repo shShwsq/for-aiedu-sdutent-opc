@@ -22,6 +22,7 @@ import {
   restoreWorkspace,
 } from '@/api/workspace'
 import { extractErrorMessage } from '@/utils/error'
+import { toWorkspaceRelative } from '@/utils/workspacePath'
 
 const props = defineProps<{
   /** 当前要浏览工作区的来源任务 id(null 时展示空态) */
@@ -45,6 +46,8 @@ const emit = defineEmits<{
 const loading = ref(false)
 const available = ref(false)
 const unavailableReason = ref('')
+/** 后端返回的工作区根绝对路径(把模型给的绝对路径剥成仓库相对路径用) */
+const repoPath = ref('')
 const restoring = ref(false)
 const restoreError = ref('')
 
@@ -315,6 +318,7 @@ async function locateInTree(path: string): Promise<void> {
 async function init(): Promise<void> {
   available.value = false
   unavailableReason.value = ''
+  repoPath.value = ''
   restoreError.value = ''
   selectedFile.value = null
   fileContent.value = ''
@@ -325,6 +329,7 @@ async function init(): Promise<void> {
   try {
     const info = await getWorkspaceInfo(props.taskId)
     available.value = info.available
+    repoPath.value = info.repo_path ?? ''
     unavailableReason.value = info.available ? '' : (info.reason || '工作区不可用')
     if (info.available) {
       await loadTree()
@@ -338,11 +343,16 @@ async function init(): Promise<void> {
   }
 }
 
-/** 按当前 locateFile/locateLine 展开目录并打开文件 */
+/** 按当前 locateFile/locateLine 展开目录并打开文件
+ *
+ * locateFile 是模型输出的题目字段(source_file),常照抄它读到的工作区绝对路径
+ * (local 模式下还是 Windows 反斜杠路径),不归一直接按段名在树里定位会落空。
+ */
 async function applyLocate(): Promise<void> {
   if (!props.locateFile) return
-  await locateInTree(props.locateFile)
-  await openFile(props.locateFile, props.locateLine, props.locateLine)
+  const relPath = toWorkspaceRelative(props.locateFile, repoPath.value)
+  await locateInTree(relPath)
+  await openFile(relPath, props.locateLine, props.locateLine)
 }
 
 /** 重新拉取代码(工作区过期后用户显式触发) */

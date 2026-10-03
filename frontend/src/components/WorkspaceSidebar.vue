@@ -27,6 +27,7 @@ import {
   updateTaskTitle,
 } from '@/api/task'
 import { extractErrorMessage } from '@/utils/error'
+import { toWorkspaceRelative } from '@/utils/workspacePath'
 import type { TaskListItem, TaskStatus } from '@/types/task'
 import type {
   WorkspaceEntry,
@@ -497,6 +498,9 @@ onUnmounted(() => {
 const available = ref(false)
 const unavailableReason = ref('')
 const checkingAvailable = ref(false)
+/** 后端返回的工作区根绝对路径:跳转前用它把模型/CLI 给的路径剥成相对路径。
+ *  local 模式下根目录是随机命名的宿主机临时目录,不能靠固定前缀猜 */
+const repoPath = ref('')
 
 // ---- 重新克隆(工作区过期后用户显式触发,复用 restore 接口) ----
 
@@ -624,6 +628,7 @@ function resetFileTree(): void {
   fileContent.value = ''
   available.value = false
   unavailableReason.value = ''
+  repoPath.value = ''
   errorMsg.value = ''
   treeTruncated.value = false
   initialized = false
@@ -674,6 +679,7 @@ async function checkAvailable(): Promise<void> {
     const info = await getWorkspaceInfo(selectedTaskId.value)
     available.value = info.available
     unavailableReason.value = info.reason ?? ''
+    repoPath.value = info.repo_path ?? ''
     hasUploads.value = info.has_uploads ?? false
     canRestore.value = info.can_restore ?? false
     if (info.available && !treeRoot.loaded) {
@@ -1118,7 +1124,10 @@ async function jumpToLine(line: number): Promise<void> {
 /**
  * 打开指定任务的指定文件并定位行号(供 TaskDetailView 结果清单点击调用)
  *
- * 流程:切换/初始化任务工作区 → 逐层展开到目标文件 → 选中加载 → 定位行号
+ * 流程:切换/初始化任务工作区 → 归一跳转路径 → 逐层展开到目标文件 → 选中加载 → 定位行号
+ *
+ * filePath 允许是工作区相对路径或绝对路径(后者来自 CLI 工具/模型 metadata),
+ * 绝对路径会被剥成相对路径后再查树——树条目路径恒为相对 repo_path 的正斜杠路径。
  */
 async function openTaskFile(taskId: string, filePath: string, line?: number): Promise<void> {
   // 切换/初始化任务工作区
@@ -1131,10 +1140,13 @@ async function openTaskFile(taskId: string, filePath: string, line?: number): Pr
     view.value = 'workspace'
     if (!initialized) await ensureInitialized()
   }
+  // 路径归一必须排在初始化之后:repoPath 要等工作区信息接口回来才拿得到
+  const relPath = toWorkspaceRelative(filePath, repoPath.value)
+
   if (!available.value) {
     // 沙箱不可用:回退上传树(上传任务过期后结果清单仍可跳转)
     if (!uploadsTreeReady.value) return
-    const node = findInUploadsTree(filePath)
+    const node = findInUploadsTree(relPath)
     if (!node) return
     await selectFile(node, 'uploads')
     if (line && line > 0) {
@@ -1144,13 +1156,13 @@ async function openTaskFile(taskId: string, filePath: string, line?: number): Pr
   }
 
   // 展开到目标文件
-  const node = await expandToPath(filePath)
+  const node = await expandToPath(relPath)
   if (node) {
     await selectFile(node)
   } else {
     // 工作区树无此文件(如重新克隆后追问上传文件不在新仓库里):回退上传树
     if (!uploadsTreeReady.value) return
-    const upNode = findInUploadsTree(filePath)
+    const upNode = findInUploadsTree(relPath)
     if (!upNode) return
     await selectFile(upNode, 'uploads')
   }

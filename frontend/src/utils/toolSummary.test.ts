@@ -308,6 +308,14 @@ describe('shortenPath', () => {
       .toBe('services/app.py')
   })
 
+  it('剥掉 local 模式宿主机临时目录前缀(Windows 反斜杠)', () => {
+    expect(
+      shortenPath(
+        'C:\\Users\\njwjx\\AppData\\Local\\Temp\\sandbox_local_5_bgvr6o\\myrepo\\app.py',
+      ),
+    ).toBe('app.py')
+  })
+
   it('无仓库前缀时保持原样', () => {
     expect(shortenPath('src/main.py')).toBe('src/main.py')
   })
@@ -518,6 +526,17 @@ describe('toolFileTargetOf', () => {
     const t = toolFileTargetOf(c, result('2', 'content'))
     expect(t?.path).toBe('src/util.py')
     expect(t!.display).toBe('src/util.py')
+  })
+
+  it('CLI Read(local 模式):Windows 绝对路径也生成可跳转目标', () => {
+    // 回归:local 模式 repo_path 是宿主机临时目录,旧规则只认 /repos/ 会留下
+    // 带盘符的绝对路径,前端按段名查树必然落空 → 点击文件链接静默无反应
+    const fp = 'C:\\Users\\njwjx\\AppData\\Local\\Temp\\sandbox_local_5_bgvr6o\\uploaded_files\\doc.md'
+    const c = call('1', `读取文件 ${fp} [Read]\n${JSON.stringify({ file_path: fp })}`)
+    const t = toolFileTargetOf(c, result('2', 'content'))
+    expect(t?.path).toBe('doc.md')
+    expect(t!.display).toBe('doc.md')
+    expect(t!.prefix + t!.display + t!.suffix).toBe(buildToolSummary(c, result('2', 'content')))
   })
 
   it('Bash cat 单文件:提取跳转目标', () => {
