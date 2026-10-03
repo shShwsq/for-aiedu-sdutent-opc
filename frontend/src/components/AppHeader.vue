@@ -121,8 +121,6 @@ function handleCloseHelp(): void {
           <slot name="nav">
             <RouterLink to="/">首页</RouterLink>
             <RouterLink to="/tasks/new">提交任务</RouterLink>
-
-            <RouterLink to="/skills">技能管理</RouterLink>
             <RouterLink v-if="practiceEnabled" to="/practice" data-onboarding="app-header-nav-practice">
               自适应练习
               <span v-if="practiceDueCount > 0" class="practice-badge">{{
@@ -130,6 +128,7 @@ function handleCloseHelp(): void {
               }}</span>
             </RouterLink>
             <RouterLink to="/memory">记忆管理</RouterLink>
+            <RouterLink to="/skills">技能管理</RouterLink>
           </slot>
         </nav>
       </div>
