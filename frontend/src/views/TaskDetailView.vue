@@ -4178,11 +4178,8 @@ function toggleResult(id: string): void {
   padding-bottom: var(--space-1);
 }
 
-/* ---- 迭代块(agent1 一次 ReAct 循环,结构容器:无摘要行、无边框包装) ---- */
-.iteration-block {
-  /* 透明容器,仅承载 iteration-body 的间距 */
-}
-
+/* ---- 迭代块(agent1 一次 ReAct 循环,结构容器:无摘要行、无边框包装) ----
+   .iteration-block 为透明容器,仅承载 iteration-body 的间距 */
 .iteration-body {
   display: flex;
   flex-direction: column;
