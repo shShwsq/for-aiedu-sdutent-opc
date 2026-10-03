@@ -45,6 +45,7 @@ const routes: RouteRecordRaw[] = [
       { path: 'models', name: 'settings-models', component: () => import('@/views/settings/ModelSettingsPanel.vue') },
       { path: 'cli', name: 'settings-cli', component: () => import('@/views/settings/CliSettingsPanel.vue') },
       { path: 'policy', name: 'settings-policy', component: () => import('@/views/settings/AgentPolicyPanel.vue') },
+      { path: 'practice', name: 'settings-practice', component: () => import('@/views/settings/PracticeSettingsPanel.vue') },
     ],
   },
   // 旧路径重定向(兼容书签)
@@ -146,10 +147,13 @@ router.beforeEach(async (to, from) => {
     }
   }
 
-  // 练习功能开关:后端关闭时直连 /practice(含记录页)回首页(入口已隐藏,此处兜底)
-  if (to.name === 'practice' || to.name === 'practice-history') {
+  // 练习功能开关:后端关闭时直连练习相关页回退(入口已隐藏,此处兜底)
+  // —— /practice 与记录页回首页;/settings/practice 回账户设置页
+  if (to.name === 'practice' || to.name === 'practice-history' || to.name === 'settings-practice') {
     await ensureFeaturesLoaded()
-    if (!practiceEnabled.value) return { name: 'home' }
+    if (!practiceEnabled.value) {
+      return to.name === 'settings-practice' ? { name: 'settings-account' } : { name: 'home' }
+    }
   }
 
   // 已登录访问登录页 → 跳首页

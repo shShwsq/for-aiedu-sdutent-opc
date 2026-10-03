@@ -20,15 +20,11 @@ import AppHeader from '@/components/AppHeader.vue'
 import PracticeCodeSidebar from '@/components/PracticeCodeSidebar.vue'
 import PracticeGenerateDialog from '@/components/PracticeGenerateDialog.vue'
 import PracticeGenerateSidebar from '@/components/PracticeGenerateSidebar.vue'
-import PracticeSettingsDialog from '@/components/PracticeSettingsDialog.vue'
 import WorkspaceSidebar from '@/components/WorkspaceSidebar.vue'
 import WorkspaceToggleButton from '@/components/WorkspaceToggleButton.vue'
-import { getPreferences, savePracticeSettings } from '@/api/memory'
-import { getMyModels } from '@/api/model_configs'
 import {
   activateQuestions,
   archiveQuestion,
-  clearPracticeRecords,
   getPracticeStats,
   listGenerateJobs,
   listQuestions,
@@ -36,8 +32,6 @@ import {
   submitAnswer,
 } from '@/api/practice'
 import { extractErrorMessage } from '@/utils/error'
-import type { LLMConfigItemOut } from '@/types/model_configs'
-import type { PracticeThinkingMode } from '@/types/memory'
 import type {
   GenerateJobSummary,
   PracticeStats,
@@ -166,188 +160,6 @@ function showToast(msg: string, type: 'success' | 'error'): void {
   setTimeout(() => {
     toast.value = null
   }, 4000)
-}
-
-// ============================================================
-// 练习设置弹窗(自动生成开关 / 出题前恢复工作区 / 思考模式 / 默认出题模型,切换即保存)
-// (学习主题设置已移除:出题时按发现内容自动匹配主题)
-// ============================================================
-const settingsOpen = ref(false)
-const autoGenPractice = ref(true)
-const restoreWorkspace = ref(false)
-/** 出题思考模式(follow=跟随模型配置/on=强制开/off=强制关) */
-const thinkingMode = ref<PracticeThinkingMode>('follow')
-/** 默认出题模型配置 id(空串=跟随系统默认) */
-const defaultModelId = ref('')
-/** 始终用默认出题模型(忽略任务自带模型配置) */
-const forceDefaultLlm = ref(false)
-/** 用户已保存的 LLM 配置列表(默认出题模型下拉选项来源) */
-const llmConfigs = ref<LLMConfigItemOut[]>([])
-const autoGenLoading = ref(false)
-const settingsError = ref('')
-
-async function loadPracticeSettings(): Promise<void> {
-  try {
-    const pref = await getPreferences()
-    autoGenPractice.value = pref.auto_generate_practice
-    restoreWorkspace.value = pref.restore_workspace_for_practice
-    thinkingMode.value = pref.thinking_mode_for_practice
-    defaultModelId.value = pref.default_llm_config_id ?? ''
-    forceDefaultLlm.value = pref.force_default_llm
-  } catch {
-    // 静默失败,保持默认值
-  }
-  try {
-    const models = await getMyModels()
-    llmConfigs.value = models.llm_configs
-  } catch {
-    // 静默失败,下拉只展示「跟随系统默认」
-  }
-}
-
-async function togglePracticeAuto(): Promise<void> {
-  if (autoGenLoading.value) return
-  autoGenLoading.value = true
-  settingsError.value = ''
-  const next = !autoGenPractice.value
-  try {
-    const latest = await savePracticeSettings({ auto_generate_practice: next })
-    autoGenPractice.value = latest.auto_generate_practice
-    showToast(next ? '已开启自动生成练习题' : '已关闭自动生成练习题', 'success')
-  } catch (err) {
-    settingsError.value = extractErrorMessage(err)
-  } finally {
-    autoGenLoading.value = false
-  }
-}
-
-/** 切换出题前恢复工作区开关(沙箱已清理时重新 clone) */
-async function toggleRestoreWorkspace(): Promise<void> {
-  if (autoGenLoading.value) return
-  autoGenLoading.value = true
-  settingsError.value = ''
-  const next = !restoreWorkspace.value
-  try {
-    const latest = await savePracticeSettings({
-      auto_generate_practice: autoGenPractice.value,
-      restore_workspace_for_practice: next,
-    })
-    restoreWorkspace.value = latest.restore_workspace_for_practice
-    showToast(
-      next ? '已开启出题前恢复工作区' : '已关闭出题前恢复工作区',
-      'success',
-    )
-  } catch (err) {
-    settingsError.value = extractErrorMessage(err)
-  } finally {
-    autoGenLoading.value = false
-  }
-}
-
-/** 切换出题思考模式(follow=跟随模型配置/on=强制开/off=强制关) */
-async function selectThinkingMode(mode: PracticeThinkingMode): Promise<void> {
-  if (autoGenLoading.value || mode === thinkingMode.value) return
-  autoGenLoading.value = true
-  settingsError.value = ''
-  try {
-    const latest = await savePracticeSettings({
-      auto_generate_practice: autoGenPractice.value,
-      thinking_mode_for_practice: mode,
-    })
-    thinkingMode.value = latest.thinking_mode_for_practice
-    const label = mode === 'follow' ? '跟随模型配置'
-      : mode === 'on' ? '强制开启' : '强制关闭'
-    showToast(`出题思考模式已切换为「${label}」`, 'success')
-  } catch (err) {
-    settingsError.value = extractErrorMessage(err)
-  } finally {
-    autoGenLoading.value = false
-  }
-}
-
-/** 切换「始终用默认出题模型」(忽略任务自带配置,全局统一用默认模型) */
-async function toggleForceDefaultLlm(): Promise<void> {
-  if (autoGenLoading.value) return
-  autoGenLoading.value = true
-  settingsError.value = ''
-  const next = !forceDefaultLlm.value
-  try {
-    const latest = await savePracticeSettings({
-      auto_generate_practice: autoGenPractice.value,
-      force_default_llm: next,
-    })
-    forceDefaultLlm.value = latest.force_default_llm
-    showToast(
-      next ? '已开启「始终用默认出题模型」' : '已关闭「始终用默认出题模型」',
-      'success',
-    )
-  } catch (err) {
-    settingsError.value = extractErrorMessage(err)
-  } finally {
-    autoGenLoading.value = false
-  }
-}
-
-/** 切换默认出题模型(空串=清空,回退任务级/env 默认) */
-async function selectModel(configId: string): Promise<void> {
-  if (autoGenLoading.value || configId === defaultModelId.value) return
-  autoGenLoading.value = true
-  settingsError.value = ''
-  try {
-    const latest = await savePracticeSettings({
-      auto_generate_practice: autoGenPractice.value,
-      default_llm_config_id: configId,
-    })
-    defaultModelId.value = latest.default_llm_config_id ?? ''
-    showToast(
-      configId ? '默认出题模型已更新' : '默认出题模型已重置为跟随系统默认',
-      'success',
-    )
-  } catch (err) {
-    settingsError.value = extractErrorMessage(err)
-  } finally {
-    autoGenLoading.value = false
-  }
-}
-
-// ---- 危险操作:清空练习数据(不可逆,弹窗内已二次确认) ----
-/** 清空中(禁用弹窗交互) */
-const clearing = ref(false)
-
-/**
- * 清空练习数据
- *
- * includeQuestions=false:进度归零,保留题库;
- * includeQuestions=true:连题库一并删除。
- * 正在作答的会话已被清除,直接退回首页;成功后重拉全部联动数据。
- */
-async function handleClearPractice(includeQuestions: boolean): Promise<void> {
-  if (clearing.value || autoGenLoading.value) return
-  clearing.value = true
-  settingsError.value = ''
-  try {
-    await clearPracticeRecords(includeQuestions)
-    // 进行中的会话已失效,退回首页
-    mode.value = 'home'
-    sessionId.value = ''
-    sessionQuestions.value = []
-    sessionResults.value = []
-    feedback.value = null
-    codeSidebarOpen.value = false
-    codeTaskOverride.value = null
-    settingsOpen.value = false
-    showToast(
-      includeQuestions ? '已清空全部练习数据' : '已清空练习记录',
-      'success',
-    )
-    loadStats()
-    loadQuestionBank()
-    loadMistakes()
-  } catch (err) {
-    settingsError.value = extractErrorMessage(err)
-  } finally {
-    clearing.value = false
-  }
 }
 
 // ============================================================
@@ -603,7 +415,6 @@ onMounted(() => {
   loadStats()
   loadQuestionBank()
   loadMistakes()
-  loadPracticeSettings()
   // 出题进度:进页先拉一次,之后每 5 秒轮询发现运行中 job
   pollGenerateJobs()
   genPollTimer = setInterval(pollGenerateJobs, 5000)
@@ -817,17 +628,17 @@ onBeforeUnmount(() => {
                 </svg>
                 历史记录
               </RouterLink>
-              <button
-                class="practice-settings-btn"
+              <RouterLink
+                class="gen-toggle-btn"
                 title="练习设置"
-                @click="settingsOpen = true"
+                :to="{ name: 'settings-practice' }"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <circle cx="12" cy="12" r="3" />
                   <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
                 </svg>
                 练习设置
-              </button>
+              </RouterLink>
             </div>
           </div>
           <p>题目来自审计任务的真实发现 · 到期复习优先,薄弱点强化,按能力匹配难度</p>
@@ -1044,28 +855,6 @@ onBeforeUnmount(() => {
       />
     </div>
 
-    <!-- ============ 练习设置弹窗 ============ -->
-    <PracticeSettingsDialog
-      :open="settingsOpen"
-      :auto-generate="autoGenPractice"
-      :restore-workspace="restoreWorkspace"
-      :thinking-mode="thinkingMode"
-      :default-model-id="defaultModelId"
-      :force-default-llm="forceDefaultLlm"
-      :llm-configs="llmConfigs"
-      :loading="autoGenLoading"
-      :clearing="clearing"
-      :error="settingsError"
-      @toggle="togglePracticeAuto"
-      @toggle-restore="toggleRestoreWorkspace"
-      @thinking="selectThinkingMode"
-      @model="selectModel"
-      @toggle-force-default="toggleForceDefaultLlm"
-      @clear-records="handleClearPractice(false)"
-      @clear-all="handleClearPractice(true)"
-      @cancel="settingsOpen = false"
-    />
-
     <!-- ============ 题目入库弹窗(出题进度侧栏入口,与任务详情页同款) ============ -->
     <PracticeGenerateDialog
       v-if="practiceDialogTaskId"
@@ -1145,29 +934,7 @@ onBeforeUnmount(() => {
   gap: var(--space-2);
 }
 
-/* 页头右侧「练习设置」入口(打开自动生成练习题开关弹窗) */
-.practice-settings-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-1);
-  padding: var(--space-1) var(--space-3);
-  font-size: var(--fs-xs);
-  font-weight: var(--fw-medium);
-  color: var(--color-text-secondary);
-  background: transparent;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  transition: all var(--transition-fast);
-}
-
-.practice-settings-btn:hover {
-  color: var(--color-primary);
-  border-color: var(--color-primary);
-  background: var(--color-primary-light);
-}
-
-/* 页头右侧「出题进度」切换按钮(有运行中 job 时带呼吸小红点);「历史记录」RouterLink 复用同款样式 */
+/* 页头右侧「出题进度」切换按钮(有运行中 job 时带呼吸小红点);「历史记录」与「练习设置」RouterLink 复用同款样式 */
 .gen-toggle-btn {
   position: relative;
   display: inline-flex;
