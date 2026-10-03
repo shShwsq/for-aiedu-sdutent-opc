@@ -35,7 +35,6 @@ from app.agents.orchestrator import (
     retry_failed_task,
     run_dual_agent_audit,
 )
-from app.agents.react_agent import build_first_round_question
 from app.database import SessionLocal, get_db
 from app.deps import get_optional_user, get_optional_user_sse
 from app.event_bus import (
@@ -48,6 +47,7 @@ from app.event_bus import (
 from app.models.task import Conversation, Result, Task, TaskStatus
 from app.models.task_artifact import TaskArtifact
 from app.clone_skip import clear_skip_state, request_skip_clone
+from app.prompts.executor import build_first_round_question
 from app.models.user import User
 from app.models.user_llm_config import UserLLMConfig
 from app.pause_controller import (

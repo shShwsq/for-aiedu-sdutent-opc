@@ -2,10 +2,10 @@
 
 覆盖 _merge_structured / _clean_items / _parse_summary_json / generate_memory_summary。
 """
+from app.prompts.memory_curator import PROJECT_CATEGORIES
 from app.services.memory_summarize import (
     MAX_PROJECT_MEM_INJECT,
     MAX_PROJECT_MEM_STORE,
-    PROJECT_CATEGORIES,
     _clean_items,
     _merge_structured,
     _parse_summary_json,

@@ -16,12 +16,10 @@
 import json
 import logging
 import os
-import re
 import time
 import uuid
 from typing import Any
 
-from json_repair import repair_json
 from sqlalchemy.orm import Session
 
 from app.event_bus import publish
@@ -46,7 +44,27 @@ from app.agents.runtime.llm_stream import (
     strip_tool_call_blocks as _strip_tool_call_blocks,
     stream_llm,
 )
+from app.agents.runtime.plan import extract_plan as _extract_plan
 from app.agents.runtime.tool_intent import build_tool_intent as _build_tool_intent
+
+# LLM 文本资产(system prompt / 追问指引 / plan 提醒 / repo context 段落 /
+# 历史压缩 prompt 等)集中管理于 app/prompts/executor.py,本模块只留执行逻辑
+from app.prompts.executor import (
+    FOLLOWUP_ATTACHMENT_NOTE,
+    FOLLOWUP_GUIDANCE,
+    HISTORY_COMPRESS_PROMPT,
+    LOOP_BREAK_PROMPT,
+    MAX_ITERATION_PROMPT,
+    REACT_AGENT_SYSTEM_PROMPT,
+    SYSTEM_INJECT_MARKER,
+    _has_creation_upload,
+    build_first_round_question,
+    build_history_compress_segments,
+    build_repo_context_section,
+    format_injected_user_messages,
+    format_plan_reminder,
+    round_compact_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,109 +82,6 @@ LOOP_WINDOW_SIZE = 6
 LOOP_MIN_DISTINCT = 2
 
 
-def _has_creation_upload(params: dict | None) -> bool:
-    """创建时是否带上传交付物(兼容 legacy 单数 upload_id 与多文件 upload_ids)
-
-    react_agent 用它判定"上传任务"语境(首轮提问提示 + repo_context 措辞),
-    与 orchestrator._creation_upload_ids 语义一致;此处内联避免跨模块循环导入。
-    """
-    p = params or {}
-    return bool(p.get("upload_id") or p.get("upload_ids"))
-
-
-def build_first_round_question(user_input: str, params: dict | None) -> str:
-    """构造首轮"用户提问"对话的落库内容(user_input + 仓库/分支/上传来源提示)
-
-    任务创建时(create_task)即以此内容落库 role=user / type=question 对话,
-    保证前端首屏 getTask 快照立即显示用户提问,无需等待后台线程完成预 clone、
-    react_agent 启动后才出现(此前问题气泡会晚于助手回答显示)。
-
-    react_agent 首轮复用同一函数构造 user_msg,保证展示内容与创建时落库完全
-    一致 —— 这是 (task, round_idx, user, question) 幂等去重成立的前提。
-
-    注意:不含"预 clone 上下文段"与"跨轮历史记忆块",两者属系统编排信息,
-    只进发送给 LLM 的内容,不落库展示。
-    """
-    params = params or {}
-    content = user_input
-    if params.get("repo_url"):
-        content += f"\n仓库地址: {params['repo_url']}"
-    if params.get("branch"):
-        content += f"\n分支: {params['branch']}"
-    if _has_creation_upload(params):
-        content += "\n交付物来源:用户上传的文件(已就绪在任务工作区,无需 clone)"
-    return content
-
-
-# ============================================================
-# 通用 system prompt(场景降级后,不再从场景读取)
-# ============================================================
-
-REACT_AGENT_SYSTEM_PROMPT = """你是 react_agent(执行智能体),负责执行实际的分析任务(如代码审计、审查、质量分析等)。
-
-## 你的职责
-根据任务指令对目标仓库执行分析,发现并记录问题,最后用自然语言总结你的发现。
-
-## 工作方式(ReAct 循环)
-你通过"思考-行动-观察"循环工作:
-1. **思考**:分析当前状态,决定下一步该做什么
-2. **行动**:调用工具(clone_repo / list_files / find_files / read_file /
-   search_code / run_semgrep / query_cve / list_dependencies / write_file /
-   run_python_code / git_log / git_blame / git_diff / run_command / run_lint /
-   run_coverage / str_replace_editor / list_skills / skill 等)
-3. **观察**:查看工具返回的结果
-4. 重复以上步骤,直到完成分析
-
-## 可用工具
-- clone_repo:克隆 GitHub 仓库到沙箱(若系统已预克隆,无需调用)
-- list_files:列出目录结构(单层,跳过 .git/node_modules 等噪声目录)
-- find_files:按文件名 glob 模式递归查找文件(如 **/*.py、**/test_*.py),返回路径列表
-- read_file:读取文件内容(带行号,支持 offset 翻页)
-- search_code:正则搜索代码,支持 content/files_with_matches/count 三种输出模式
-- run_semgrep:运行 Semgrep 静态分析(local 模式需宿主机已装 semgrep,sandbox 模式自动安装)
-- query_cve:查询指定包+版本的已知 CVE 漏洞(OSV API,按依赖逐个查)
-- list_dependencies:扫描仓库清单文件返回结构化依赖清单(依赖审计先调它,再逐个 query_cve)
-- write_file:在工作区写产物(PoC 脚本、报告等);改仓库代码用 str_replace_editor
-- run_python_code:在沙箱执行 Python 代码,验证 PoC / 跑分析脚本 / 执行测试
-- run_command:在沙箱执行任意 shell 命令(构建/测试/脚本,如 pytest、npm test),与 CLI 的 bash 对齐
-- run_lint:静态 lint 检查返回结构化问题清单(Python 走 ruff;JS 需仓库自带 eslint 配置)
-- run_coverage:跑测试并解析覆盖率(总覆盖率 + 未覆盖 top 文件),测试覆盖度审查优先用它
-- str_replace_editor:对仓库文件做精准编辑(create/str_replace/insert),就地改代码(git diff/checkout 可逆)
-- git_log:查看仓库提交历史(默认 --oneline),理解代码演化、定位改动何时引入(需完整克隆,默认即完整)
-- git_blame:追溯某文件每行的最后修改提交/作者,定位"这行是谁/哪次提交改的"(需完整克隆)
-- git_diff:查看两个 ref 间的结构化 diff(增量审查;默认最近一次提交,大区间先用 stat_only 总览)
-- list_skills / skill:查看并加载专家技能(获取 SKILL.md 指令后按其指引执行)
-
-## 工作原则
-- **自适应任务类型**:根据用户意图判断任务性质(安全审计/代码审查/质量分析/
-  架构理解/功能梳理等),采用相应的分析方法。可调用 list_skills 查看是否有
-  适用的专家技能。
-- **系统性覆盖**:按指令指定的维度逐一分析,不遗漏。
-- **证据导向**:每个结论都应有具体文件位置和代码证据,不臆测。
-- **高效执行**:优先用 search_code 定位关键代码,再 read_file 确认细节,
-  避免盲目遍历所有文件。
-- **计划性**:复杂任务先输出 <plan> 步骤清单,逐步推进。
-
-## 计划格式(可选,复杂任务建议)
-在思考内容中输出 <plan> 标签包裹的计划:
-<plan>
-[{"id": 1, "text": "步骤描述", "status": "pending"},
- {"id": 2, "text": "步骤描述", "status": "pending"}]
-</plan>
-status 可选:pending / in_progress / done。后端会解析并推送前端展示。
-
-## 输出要求
-- 每轮结束(不再调用工具时),用自然语言总结你的发现:
-  - 发现了哪些问题/现象/结论(按任务性质组织,如漏洞/缺陷/风险/改进点/架构特点)
-  - 具体文件位置和代码片段
-  - 影响范围/严重程度(若适用)
-  - 修复或改进建议(若适用)
-- 总结要具体、有证据,**面向用户可直接理解与行动**(你的总结是展示给用户的
-  核心回答;后台质检员会另行核查,不需要你面向评审组织语言)。
-- 用户的问题需要明确结论时,在总结中直接给出结论。
-- 不要在总结中编造未经验证的发现。
-"""
-
 # 跨轮记忆传递:从 Conversation 表加载之前轮次的对话,以结构化 messages
 # 注入当前轮(保留 user/assistant/system 角色边界),用户追问原文作为
 # 最后一条独立 user 消息 —— 对齐 Codex 的"历史 append-only + 用户消息零包装"。
@@ -176,19 +91,9 @@ status 可选:pending / in_progress / done。后端会解析并推送前端展�
 # 可用环境变量 HISTORY_TOKEN_BUDGET 覆盖,默认 8000)
 MAX_HISTORY_TOKEN_BUDGET = int(os.getenv("HISTORY_TOKEN_BUDGET", "8000"))
 
-# 系统注入消息的边界标记(对齐 Codex ContextualUserFragment 的 marker 思路):
-# 所有编排注入(工具摘要/评审反馈/仓库路径/续跑指引)的消息内容必须以
-# "[系统注入|来源]" 开头,让模型能区分"用户原话"与"系统注入",
-# 防止注入内容被当成用户指令(间接注入面)
-SYSTEM_INJECT_MARKER = "[系统注入|"
-
-# 追问轮的编排指引模板(系统注入,与用户追问分离)
-FOLLOWUP_GUIDANCE = (
-    f"{SYSTEM_INJECT_MARKER}续跑指引]\n"
-    "本消息之前的历史对话是同一任务之前轮次的执行记录。"
-    "请基于已有进度处理接下来的用户消息:用户追问可直接回答,"
-    "新需求/修正则执行对应工作,续跑则接着完成,均不要重做已完成的部分。"
-)
+# 系统注入消息的边界标记与追问轮指引模板:
+# 集中管理于 app/prompts/executor.py(SYSTEM_INJECT_MARKER / FOLLOWUP_GUIDANCE),
+# 此处经模块级 import 提供给本模块与(经 import 链)外部测试使用
 
 
 def run_react_agent(
@@ -293,20 +198,8 @@ def run_react_agent(
         # orchestrator 已准备好交付物(clone 或上传)时,注入上下文提示跳过 clone_repo
         if repo_context:
             # 上传任务:工作区里是用户上传的文件,不是 clone 的仓库
-            if _has_creation_upload(params):
-                repo_ctx_section = (
-                    "\n\n[交付物已就绪,无需调用 clone_repo]\n"
-                    + repo_context
-                    + "\n\n请直接基于上述路径开始执行任务(用 read_file / search_code / "
-                    "list_files 等工具),不要调用 clone_repo。"
-                )
-            else:
-                repo_ctx_section = (
-                    "\n\n[仓库已预先 clone,无需你再调用 clone_repo]\n"
-                    + repo_context
-                    + "\n\n请直接基于上述仓库路径开始执行任务(用 read_file / search_code / "
-                    "list_files 等工具),不要再调用 clone_repo。"
-                )
+            variant = "upload" if _has_creation_upload(params) else "clone"
+            repo_ctx_section = build_repo_context_section(repo_context, variant)
     else:
         # 追问轮:不重新 clone,基于已有仓库继续
         # 跨轮记忆以结构化 messages 注入(保留 user/assistant/system 角色边界,
@@ -409,7 +302,7 @@ def run_react_agent(
     # 跨轮 plan 续接:若有上轮 plan,作为 system 提醒注入首轮 messages,
     # 让 LLM 看到之前进度(已完成的步骤保持 done,只推进未完成项)
     if current_plan:
-        initial_reminder = _format_plan_reminder(current_plan)
+        initial_reminder = format_plan_reminder(current_plan)
         if initial_reminder:
             messages.append({"role": "system", "content": initial_reminder})
             # 推送 plan 事件让前端也同步显示跨轮 plan 状态
@@ -492,15 +385,12 @@ def run_react_agent(
                     sandbox_tools.add_uploads_to_workspace(
                         task_id_str, merged, "followup_uploads"
                     )
-                    attachment_note = (
-                        "\n\n[用户本轮附带了新文件,已放入工作区 followup_uploads/ 目录,"
-                        "可用 list_files / read_file 查看]"
-                    )
+                    attachment_note = FOLLOWUP_ATTACHMENT_NOTE
                 except Exception as e:
                     logger.warning(
                         f"[task={task.id}] 追问上传文件传输失败(忽略,文字消息照常注入): {e}"
                     )
-            injected = _format_injected_user_messages(
+            injected = format_injected_user_messages(
                 pending_user_msgs, attachment_note=attachment_note
             )
             if injected:
@@ -696,7 +586,7 @@ def run_react_agent(
         # 用可替换的 system 消息(不累积,避免 messages 膨胀):
         # 找到上一轮注入的 plan 提醒就替换,否则追加新的
         if current_plan:
-            reminder = _format_plan_reminder(current_plan)
+            reminder = format_plan_reminder(current_plan)
             if reminder:
                 # 查找并替换已有的 plan 提醒消息(避免累积)
                 replaced = False
@@ -742,20 +632,14 @@ def run_react_agent(
             )
             messages.append({
                 "role": "user",
-                "content": (
-                    "系统提示:你陷入了重复调用循环。"
-                    "请停止调用工具,用自然语言总结当前已确认的发现。"
-                ),
+                "content": LOOP_BREAK_PROMPT,
             })
     else:
         # 循环跑满了,让 react_agent 输出自然语言总结
         logger.warning(f"[task={task.id}] react_agent 达到最大迭代次数")
         messages.append({
             "role": "user",
-            "content": (
-                "系统提示:已达最大迭代次数。请用自然语言总结本轮审计的发现,"
-                "包括已确认的漏洞、已检查的范围、未完成的检查项。"
-            ),
+            "content": MAX_ITERATION_PROMPT,
         })
         try:
             reasoning_full, content_full, tool_calls_full, finish_reason, _conv_id = _stream_llm_response(
@@ -774,48 +658,6 @@ def run_react_agent(
 
     # 修复 4:返回本轮结束时的 plan 状态,供 orchestrator 传给下一轮
     return [], summary, current_plan
-
-
-# ============================================================
-# 用户补充消息注入(运行中/暂停中场景)
-# ============================================================
-
-
-def _format_injected_user_messages(
-    messages: list[dict[str, Any]], attachment_note: str = "",
-) -> str:
-    """把 drain 出的用户补充消息格式化为一条 LLM user 消息文本
-
-    多条消息按时间顺序合并为一条,加前缀说明这是用户在审计过程中追加的指令,
-    引导模型理解为新的检查方向/补充要求,而非替换原始任务。
-
-    attachment_note:本批消息附带文件已传输进工作区的目录级提示(可空),
-    拼在正文后,让模型知道去 followup_uploads/ 查看新文件。
-
-    返回空字符串表示无可注入内容(消息 content 全为空)。
-    """
-    parts: list[str] = []
-    for msg in messages:
-        content = (msg.get("content") or "").strip()
-        if not content:
-            continue
-        parts.append(content)
-
-    if not parts:
-        return ""
-
-    if len(parts) == 1:
-        body = parts[0]
-    else:
-        body = "\n\n".join(f"[{i + 1}] {p}" for i, p in enumerate(parts))
-
-    return (
-        "[用户在审计过程中追加的消息]\n"
-        "请把以下内容作为新的检查方向或补充要求纳入当前任务,"
-        "结合已掌握的仓库信息继续执行(无需重新 clone):\n\n"
-        f"{body}"
-        f"{attachment_note}"
-    )
 
 
 # ============================================================
@@ -859,99 +701,6 @@ def _stream_llm_response(
         result.conv_id,
         result.finish_reason,
     )
-
-
-
-
-
-
-# 计划清单提取:<plan>...</plan> 块,支持两种格式:
-# 1. JSON 数组(system prompt 示范格式,经 json_repair 容错修复):
-#    [{"id": 1, "text": "步骤描述", "status": "pending"}, ...]
-# 2. 逐行格式:序号 + 可选状态标记 + 文本
-_PLAN_BLOCK_RE = re.compile(r"<plan>\s*(.*?)\s*</plan>", re.DOTALL)
-_PLAN_LINE_RE = re.compile(
-    r"^\s*(?:\d+[.、)]\s*)?(?:\[([\w_]+)\]\s*)?(.+)$"
-)
-# 含文字字符(字母/数字/下划线/中文)才算有效步骤行,
-# 纯符号行("["、"]"、"," 等)跳过,避免变成无意义步骤
-_PLAN_LINE_HAS_TEXT_RE = re.compile(r"[\w\u4e00-\u9fff]")
-
-
-def _parse_plan_json(block: str) -> list[dict] | None:
-    """尝试把 plan 块按 JSON 解析(对象数组,或逐行多个对象)
-
-    system prompt 示范的是 JSON 数组格式,模型照做时逐行解析会把整行 JSON
-    当成步骤文本,这里优先走 JSON 解析。依赖 json_repair 容错修复
-    (尾逗号/截断/缺引号等)。无包裹数组的逐行对象自动补 [ ] 再修复。
-    解析失败/无有效步骤返回 None,由调用方回退逐行解析。
-    """
-    text = block.strip()
-    if not text or text[0] not in "[{":
-        return None
-    candidate = text if text[0] == "[" else f"[{text}]"
-    try:
-        repaired = repair_json(candidate, return_objects=True)
-    except Exception:
-        return None
-    if not isinstance(repaired, list):
-        repaired = [repaired]
-    steps: list[dict] = []
-    for e in repaired:
-        if not isinstance(e, dict):
-            continue
-        step_text = str(e.get("text") or e.get("content") or "").strip()
-        if not step_text:
-            continue
-        status = str(e.get("status") or "pending").strip()
-        if status not in ("pending", "in_progress", "done"):
-            status = "pending"
-        steps.append({"id": len(steps) + 1, "text": step_text, "status": status})
-    return steps or None
-
-
-def _extract_plan(content: str) -> list[dict] | None:
-    """从 thinking content 中提取 <plan>...</plan> 计划清单
-
-    逐行格式(状态标记可选,缺省 pending):
-        <plan>
-        1. [done] 克隆仓库并查看结构
-        2. [in_progress] 审计依赖漏洞
-        3. [pending] 审计注入类漏洞
-        </plan>
-
-    JSON 格式(system prompt 示范,优先按 JSON 解析):
-        <plan>
-        [{"id": 1, "text": "克隆仓库", "status": "done"}]
-        </plan>
-
-    返回 [{"id": 1, "text": "...", "status": "pending|in_progress|done"}]
-    无 plan 块或解析为空时返回 None。
-    """
-    m = _PLAN_BLOCK_RE.search(content)
-    if not m:
-        return None
-    block = m.group(1)
-    # 优先 JSON 解析(模型按 system prompt 示范输出 JSON 数组)
-    json_steps = _parse_plan_json(block)
-    if json_steps:
-        return json_steps
-    steps: list[dict] = []
-    for i, line in enumerate(block.split("\n"), 1):
-        line = line.strip()
-        if not line:
-            continue
-        if not _PLAN_LINE_HAS_TEXT_RE.search(line):
-            continue
-        lm = _PLAN_LINE_RE.match(line)
-        if not lm:
-            continue
-        status = lm.group(1) or "pending"
-        text = lm.group(2).strip()
-        if status not in ("pending", "in_progress", "done"):
-            status = "pending"
-        steps.append({"id": i, "text": text, "status": status})
-    return steps if steps else None
 
 
 # ---- plan 状态维护(代码驱动 + LLM 显式更新合并) ----
@@ -1066,22 +815,6 @@ def _merge_plan(current: list[dict], llm_update: list[dict]) -> list[dict]:
             merged.append(new_s)
 
     return merged
-
-
-def _format_plan_reminder(plan_steps: list[dict]) -> str:
-    """格式化 plan 状态,作为 system 提醒注入 messages
-
-    让 LLM 在下一轮思考时看到当前进度,决定是否标 done。
-    """
-    if not plan_steps:
-        return ""
-    lines = ["[系统提醒] 当前计划清单状态(已完成的请标记 [done],正在做的标 [in_progress]):"]
-    status_symbol = {"pending": "○", "in_progress": "◌", "done": "✓"}
-    for s in plan_steps:
-        sym = status_symbol.get(s["status"], "○")
-        lines.append(f"{sym} [{s['status']}] {s['text']}")
-    lines.append("如果某个步骤状态有变化,请在回答开头的 <plan> 里输出更新后的完整清单(完成的标 done)。")
-    return "\n".join(lines)
 
 
 # ============================================================
@@ -1402,22 +1135,6 @@ def _rounds_to_messages(
     return messages
 
 
-def _round_compact_text(rd: dict[str, Any]) -> str:
-    """单轮压缩输入文本(Level 2 增量压缩的缓存单位)
-
-    包含用户要求:用户原话是压缩摘要必须保留的信息(任务的原始指令
-    与历次追问方向),丢失会导致早期轮次"为什么这么做"的语义断链。
-    """
-    segs = [f"=== 第 {rd['ridx']} 轮 ==="]
-    if rd["question"]:
-        segs.append(f"[用户要求]\n{rd['question']}")
-    if rd["assistant_summary"]:
-        segs.append(f"[执行总结]\n{rd['assistant_summary']}")
-    if rd["review"]:
-        segs.append(f"[评审反馈]\n{rd['review']}")
-    return "\n".join(segs)
-
-
 def _format_rounds_span(rounds: list[int]) -> str:
     """轮次列表 → 展示用区间文本,如 [1, 2, 3] → "第 1-3 轮\""""
     if not rounds:
@@ -1452,24 +1169,8 @@ def _truncate_messages(
 
 # ============================================================
 # Level 2:LLM 压缩(带缓存 + 增量压缩)
+# 压缩 prompt 与输入拼装段集中管理于 app/prompts/executor.py
 # ============================================================
-
-# LLM 压缩 prompt
-_HISTORY_COMPRESS_PROMPT = """你是审计历史压缩助手。以下是之前几轮双智能体协作的对话记忆,
-请压缩成一段简洁的摘要,必须保留:
-- 每轮用户的原始要求/追问方向(用户当轮原话的要点)
-- 每轮 react_agent 的关键发现(漏洞/问题/已确认的结论)
-- agent2 标记的已覆盖维度(covered)和未覆盖维度(missing)
-- agent2 审查指出的待改进方向与建议深挖的检查项
-
-丢弃冗余的工具调用细节、重复信息和无关叙述。输出纯文本摘要(不要 JSON,不要 markdown 标题),
-按轮次顺序组织,每轮用"第 N 轮:"开头。
-
-{old_hint}
-
-[待压缩的历史记忆]
-{history_text}
-"""
 
 
 def _llm_compress_history(
@@ -1485,15 +1186,9 @@ def _llm_compress_history(
 
     返回压缩后的摘要文本。失败时返回拼接的原文(降级,不丢信息)。
     """
-    # 拼接待压缩文本
-    if old_summary:
-        history_text = f"[已有摘要]\n{old_summary}\n\n[新增轮次]\n" + "\n\n".join(new_segments)
-        old_hint = "已有摘要是之前压缩的结果,请把它和新增轮次合并成一段新的摘要。"
-    else:
-        history_text = "\n\n".join(new_segments)
-        old_hint = ""
+    history_text, old_hint = build_history_compress_segments(old_summary, new_segments)
 
-    prompt = _HISTORY_COMPRESS_PROMPT.format(
+    prompt = HISTORY_COMPRESS_PROMPT.format(
         old_hint=old_hint,
         history_text=history_text[:20000],  # 保护性截断,避免超长
     )
@@ -1585,7 +1280,7 @@ def _get_or_create_compressed(
     if cached_text and new_ridxs:
         # 增量压缩:旧摘要 + 新轮次
         new_segments = [
-            _round_compact_text(old_by_ridx[r]) for r in new_ridxs if r in old_by_ridx
+            round_compact_text(old_by_ridx[r]) for r in new_ridxs if r in old_by_ridx
         ]
         if new_segments:
             compressed = _llm_compress_history(client, cached_text, new_segments)
@@ -1595,7 +1290,7 @@ def _get_or_create_compressed(
     elif new_ridxs:
         # 无缓存,压缩所有需要压缩的轮次
         new_segments = [
-            _round_compact_text(old_by_ridx[r]) for r in need_ridxs if r in old_by_ridx
+            round_compact_text(old_by_ridx[r]) for r in need_ridxs if r in old_by_ridx
         ]
         if not new_segments:
             return "", []

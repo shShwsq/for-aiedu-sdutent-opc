@@ -10,13 +10,13 @@ import pytest
 
 from app.agents.react_agent import (
     _build_tool_intent,
-    _extract_plan,
     _extract_text_tool_calls,
-    _format_plan_reminder,
     _infer_step_from_tool,
     _merge_plan,
     _strip_tool_call_blocks,
 )
+from app.agents.runtime.plan import extract_plan as _extract_plan
+from app.prompts.executor import format_plan_reminder as _format_plan_reminder
 
 
 # ============================================================

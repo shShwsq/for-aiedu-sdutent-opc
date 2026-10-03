@@ -20,9 +20,11 @@ import pytest
 from fastapi import HTTPException
 
 import app.agents.orchestrator as orchestrator
+import app.models.task_artifact  # noqa: F401  单跑本文件时注册 TaskArtifact,Task mapper 才能初始化
+import app.models.user_git_binding  # noqa: F401  单跑本文件时注册 UserGitBinding,User mapper 才能初始化
 import app.routers.tasks as tasks_router
 import app.tools.sandbox_tools as sandbox_tools
-from app.agents.react_agent import _format_injected_user_messages
+from app.prompts.executor import format_injected_user_messages as _format_injected_user_messages
 from app.config import settings
 from app.models.task import Task, TaskStatus
 from app.schemas.task import SendMessageRequest

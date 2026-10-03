@@ -16,7 +16,6 @@ import pytest
 import app.agents.react_agent as react_agent
 from app.agents.react_agent import (
     MAX_HISTORY_TOKEN_BUDGET,
-    SYSTEM_INJECT_MARKER,
     _estimate_tokens,
     _extract_round_data,
     _format_rounds_span,
@@ -26,6 +25,7 @@ from app.agents.react_agent import (
     _build_history_messages,
     precompress_history_for_next_round,
 )
+from app.prompts.executor import SYSTEM_INJECT_MARKER
 import app.agents.orchestrator as orchestrator
 from app.agents.orchestrator import _load_plan_from_task, _save_plan_to_task
 

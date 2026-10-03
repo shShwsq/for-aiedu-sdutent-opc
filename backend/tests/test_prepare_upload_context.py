@@ -96,7 +96,7 @@ def test_creation_upload_ids_none_and_empty():
 # ============================================================
 
 def test_single_upload_uses_transfer_to_workspace(monkeypatch):
-    """单个上传:走 transfer_upload_to_workspace(根布局),header 含文件名 + 无需 clone"""
+    """单个上传:走 transfer_upload_to_workspace(根布局),header 直白陈述文件位置"""
     single_calls, multi_calls = _patch_transfer(monkeypatch)
     uid = save_upload(b"doc-bytes", "proj.txt", "u1")["upload_id"]
     task = _mk_task({"upload_id": uid})
@@ -107,7 +107,10 @@ def test_single_upload_uses_transfer_to_workspace(monkeypatch):
     assert single_calls[0][0] == "t1"
     assert repo_path == "/ws/uploaded_files"
     assert "proj.txt" in ctx_text
-    assert "无需 clone" in ctx_text
+    # 直白措辞:陈述文件位置,不用内部术语,不提 clone
+    assert "用户上传的文件" in ctx_text
+    assert "已放入 /ws/uploaded_files" in ctx_text
+    assert "可直接开始处理" in ctx_text
 
 
 def test_single_upload_legacy_list_alone(monkeypatch):
@@ -133,9 +136,9 @@ def test_multi_upload_uses_transfer_to_root(monkeypatch):
     assert multi_calls and not single_calls
     assert multi_calls[0][1] == [u1, u2]
     assert repo_path == "/ws/uploaded_files"
-    assert "2 个交付物" in ctx_text
+    assert "2 组文件" in ctx_text
     assert "one.txt" in ctx_text and "two.txt" in ctx_text
-    assert "各占独立子目录" in ctx_text
+    assert "独立子目录" in ctx_text
 
 
 def test_multi_upload_merges_legacy_dedup(monkeypatch):

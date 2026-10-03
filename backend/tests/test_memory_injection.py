@@ -6,9 +6,11 @@ build_global_memory_section。
 from unittest.mock import MagicMock
 
 from app.services.memory_injection import (
+    MAX_PROJECT_MEM_CHARS,
     build_global_memory_section,
     build_react_agent_memory_section,
     build_agent2_memory_section,
+    load_project_memory_brief,
 )
 
 
@@ -78,6 +80,44 @@ def test_react_section_summary_empty_falls_back_to_content():
     assert "## Known Issues\n- issue B" in result
     # 末尾有路径提示
     assert "/home/user/.agent_memory/project_memory.md" in result
+
+
+# ---------- load_project_memory_brief(单源数据加载,react / CLI 两侧共用) ----------
+
+def test_brief_prefers_summary_over_content():
+    """summary 非空 → 返回精简版 + alias(包装由各侧自行添加)。"""
+    proj = MagicMock()
+    proj.memory_content = "完整记忆原文"
+    proj.memory_summary = "精简摘要"
+    proj.alias = "my-repo"
+    db = _mock_db(first_result=proj)
+    text, alias = load_project_memory_brief(db, 1, "https://github.com/a/b")
+    assert text == "精简摘要"
+    assert alias == "my-repo"
+
+
+def test_brief_falls_back_to_truncated_content():
+    """summary 为空 → 回退 memory_content 截断(旧数据同样有值;
+    CLI 侧经此获得此前缺失的回退能力)。"""
+    long_content = "x" * (MAX_PROJECT_MEM_CHARS + 100)
+    proj = MagicMock()
+    proj.memory_content = long_content
+    proj.memory_summary = ""
+    proj.alias = None
+    db = _mock_db(first_result=proj)
+    text, alias = load_project_memory_brief(db, 1, "https://github.com/a/b")
+    assert text == "x" * MAX_PROJECT_MEM_CHARS + "\n[...truncated...]"
+    assert alias is None
+
+
+def test_brief_empty_when_no_project():
+    db = _mock_db(first_result=None)
+    assert load_project_memory_brief(db, 1, "https://github.com/a/b") == ("", None)
+
+
+def test_brief_empty_for_anonymous():
+    db = _mock_db()
+    assert load_project_memory_brief(db, None, "https://github.com/a/b") == ("", None)
 
 
 # ---------- build_agent2_memory_section ----------

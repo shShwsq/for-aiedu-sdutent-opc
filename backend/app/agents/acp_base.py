@@ -59,6 +59,15 @@ from app.event_bus import publish
 from app.models.task import Conversation, Task
 from app.models.user_agent_config import UserAgentConfig
 from app.perf import perf_log
+# CLI prompt 文案资产与上传检测(纯函数),集中管理于 app/prompts/
+from app.prompts.executor import (
+    FOLLOWUP_CORE_GUIDANCE,
+    _has_creation_upload,
+    build_cli_memory_section,
+    build_cli_repo_context_section,
+    build_first_round_question,
+    format_plan_reminder,
+)
 from app.security import decrypt_secret
 from app.tools import sandbox_tools
 from app.tools.schema import set_current_task
@@ -2041,95 +2050,34 @@ def _extract_json_string_field(text: str, field: str) -> str:
 
 
 # ============================================================
-# Plan 提取(复用 <plan> 格式,与 react_agent 的解析逻辑保持一致)
+# Plan 提取(复用 <plan> 格式;解析实现收敛于 runtime/plan.py,
+# 与 react_agent 共用同一实现,消除手抄副本)
 # ============================================================
 
 
 # ACP plan 通知状态 → 前端状态(completed → done)
 _ACP_PLAN_STATUS_MAP = {"completed": "done"}
 
-_PLAN_BLOCK_RE = re.compile(r"<plan>\s*(.*?)\s*</plan>", re.DOTALL)
-_PLAN_LINE_RE = re.compile(
-    r"^\s*(?:\d+[.、)]\s*)?(?:\[([\w_]+)\]\s*)?(.+)$"
-)
-# 纯符号行("["、"]"、"," 等)不算步骤,避免 JSON 括号变成无意义步骤
-_PLAN_LINE_HAS_TEXT_RE = re.compile(r"[\w\u4e00-\u9fff]")
-
-
-def _parse_plan_json(block: str) -> list[dict] | None:
-    """尝试把 plan 块按 JSON 解析(对象数组,或逐行多个对象)
-
-    CLI 也可能在文本里输出 JSON 数组格式的 <plan>,逐行解析会把整行 JSON
-    当成步骤文本,这里优先走 JSON 解析。依赖 json_repair 容错修复
-    (尾逗号/截断/缺引号等)。解析失败返回 None,回退逐行解析。
-    """
-    text = block.strip()
-    if not text or text[0] not in "[{":
-        return None
-    candidate = text if text[0] == "[" else f"[{text}]"
-    try:
-        repaired = repair_json(candidate, return_objects=True)
-    except Exception:
-        return None
-    if not isinstance(repaired, list):
-        repaired = [repaired]
-    steps: list[dict] = []
-    for e in repaired:
-        if not isinstance(e, dict):
-            continue
-        step_text = str(e.get("text") or e.get("content") or "").strip()
-        if not step_text:
-            continue
-        status = str(e.get("status") or "pending").strip()
-        if status not in ("pending", "in_progress", "done"):
-            status = "pending"
-        steps.append({"id": len(steps) + 1, "text": step_text, "status": status})
-    return steps or None
-
 
 def _extract_plan(content: str) -> list[dict] | None:
-    """从 content 提取 <plan>...</plan> 计划清单
+    """从 content 提取 <plan>...</plan> 计划清单(委托 runtime/plan.py)
 
     优先 JSON 格式(对象数组),回退逐行格式([status] 文本)。
     无 plan 块时返回 None。
     """
-    m = _PLAN_BLOCK_RE.search(content)
-    if not m:
-        return None
-    block = m.group(1)
-    json_steps = _parse_plan_json(block)
-    if json_steps:
-        return json_steps
-    steps: list[dict] = []
-    for i, line in enumerate(block.split("\n"), 1):
-        line = line.strip()
-        if not line:
-            continue
-        if not _PLAN_LINE_HAS_TEXT_RE.search(line):
-            continue
-        lm = _PLAN_LINE_RE.match(line)
-        if not lm:
-            continue
-        status = lm.group(1) or "pending"
-        text = lm.group(2).strip()
-        if status not in ("pending", "in_progress", "done"):
-            status = "pending"
-        steps.append({"id": i, "text": text, "status": status})
-    return steps if steps else None
+    from app.agents.runtime.plan import extract_plan
+
+    return extract_plan(content)
 
 
 def _format_plan_reminder(plan_steps: list[dict]) -> str:
-    """格式化 plan 状态,注入 prompt 让 CLI 续接进度"""
-    if not plan_steps:
-        return ""
-    lines = [
-        "[系统提醒] 当前计划清单状态(状态有变化时请用自己的方式更新完整清单——"
-        "在 <plan> 里继续输出或更新你的 TodoList 等计划工具,完成的标 done):"
-    ]
-    sym = {"pending": "○", "in_progress": "◌", "done": "✓"}
-    for s in plan_steps:
-        lines.append(f"{sym.get(s['status'], '○')} [{s['status']}] {s['text']}")
-    return "\n".join(lines)
+    """格式化 plan 状态,注入 prompt 让 CLI 续接进度
+
+    文案实现收敛于 app/prompts/executor.py 的 format_plan_reminder(variant="cli",
+    中立措辞兼容 CLI 原生 TodoList 等计划工具;与内置 react_agent 侧的
+    react 变体同源集中管理,消除手抄副本)。
+    """
+    return format_plan_reminder(plan_steps, variant="cli")
 
 
 # ============================================================
@@ -2138,8 +2086,11 @@ def _format_plan_reminder(plan_steps: list[dict]) -> str:
 
 
 def _load_project_memory_summary(db: Session, task: Task) -> str:
-    """按 task.user_id + repo_url 查 Project,返回 memory_summary(精简版,注入 prompt 用)。
+    """加载项目记忆精简版(注入 CLI prompt 用)。
 
+    委托 memory_injection.load_project_memory_brief(与内置 react_agent
+    共用同一数据源):memory_summary 优先,为空回退 memory_content 截断
+    ——旧数据(未生成 summary)同样注入,消除两侧回退行为分叉。
     无 Project / 无 repo_url / 匿名任务 / 查询异常 → 返回 ""(不注入)。
     完整记忆已由 orchestrator 在 clone 后写入沙箱文件,这里只取精简版注入 prompt。
     """
@@ -2150,23 +2101,10 @@ def _load_project_memory_summary(db: Session, task: Task) -> str:
         repo_url = params.get("repo_url")
         if not repo_url:
             return ""
-        from app.models.project import Project
-        from app.services.repo_url import normalize_repo_url
+        from app.services.memory_injection import load_project_memory_brief
 
-        norm = normalize_repo_url(repo_url)
-        if not norm:
-            return ""
-        proj = (
-            db.query(Project)
-            .filter(
-                Project.user_id == task.user_id,
-                Project.repo_url_normalized == norm,
-            )
-            .first()
-        )
-        if proj is None:
-            return ""
-        return proj.memory_summary or ""
+        memory_text, _alias = load_project_memory_brief(db, task.user_id, repo_url)
+        return memory_text
     except Exception as e:
         logger.warning(f"[task={task.id}] 加载项目记忆精简版失败(忽略): {e}")
         return ""
@@ -2209,12 +2147,14 @@ def _build_prompt_message(
     落库展示用 _build_base_prompt(纯指令);预 clone 上下文段与记忆段
     都只进发送内容,不落库不展示。
     """
+    variant = "upload" if _has_creation_upload(task.params) else "clone"
     return (
         _build_base_prompt(
             task, round_idx, followup_query, repo_context, repo_path, previous_plan,
         )
         + _build_repo_context_section(
             repo_context if followup_query is None else None,
+            variant,
         )
         + _build_memory_section(memory_summary, global_memory)
     )
@@ -2237,12 +2177,10 @@ def _build_base_prompt(
     单独拼接只进发送内容(属系统编排信息,非用户原话)。
     """
     if followup_query is None:
-        msg = task.user_input
-        params = task.params or {}
-        if params.get("repo_url"):
-            msg += f"\n仓库地址: {params['repo_url']}"
-        if params.get("branch"):
-            msg += f"\n分支: {params['branch']}"
+        # 委托共享拼装(与 create_task 落库 / 内置 react_agent 首轮完全一致,
+        # 修复此前 CLI 首轮与落库展示不同步的双轨不一致;上传任务会带上
+        # "用户上传的文件已放入任务工作区"行)
+        msg = build_first_round_question(task.user_input, task.params)
 
         # 预 clone 上下文见 _build_repo_context_section(只进发送内容);
         # 未预 clone 但有路径时,展示仓库路径供用户确认
@@ -2251,8 +2189,7 @@ def _build_base_prompt(
     else:
         msg = (
             "基于之前的执行进度,请处理以下新消息"
-            "(用户追问可直接回答,新需求/修正则执行对应工作,续跑则接着完成,"
-            "均不要重做已完成的部分)"
+            f"({FOLLOWUP_CORE_GUIDANCE})"
         )
         # 只有工作区确实有文件才声称"已 clone":预 clone 可能失败降级为
         # 空目录,此时若断言已 clone 会误导 CLI 跳过 clone
@@ -2268,51 +2205,31 @@ def _build_base_prompt(
     return msg
 
 
-def _build_repo_context_section(repo_context: str | None) -> str:
-    """构造预 clone 仓库上下文段(拼在发送给 CLI 的 prompt 中,不落库不展示)
+def _build_repo_context_section(
+    repo_context: str | None, variant: str = "clone",
+) -> str:
+    """构造仓库/上传文件上下文段(拼在发送给 CLI 的 prompt 中,不落库不展示)
 
-    orchestrator 主动 clone 成功后注入,提示 CLI 跳过 clone_repo。
-    属系统编排信息而非用户原话,与记忆注入段同样处理:落库内容保持纯净。
+    文案实现收敛于 app/prompts/executor.py 的 build_cli_repo_context_section
+    (与内置 react_agent 侧同源集中管理,消除双轨手抄)。
+
+    variant:
+    - "clone":orchestrator 主动 clone 成功后注入,提示 CLI 跳过 clone_repo。
+      属系统编排信息而非用户原话,与记忆注入段同样处理:落库内容保持纯净。
+    - "upload":工作区是用户上传的文件,直接陈述位置(不提 clone,
+      修复此前上传任务被包"仓库已预先 clone"与正文矛盾的退化)。
     repo_context 为空时返回空串。
     """
-    if not repo_context:
-        return ""
-    return (
-        "\n\n[仓库已预先 clone,无需你再调用 clone_repo]\n"
-        + repo_context
-        + "\n\n请直接基于上述仓库路径开始执行任务。"
-    )
+    return build_cli_repo_context_section(repo_context, variant)
 
 
 def _build_memory_section(memory_summary: str = "", global_memory: str = "") -> str:
     """构造记忆注入段(拼在发送给 CLI 的 prompt 末尾,不落库不展示)
 
-    - 项目记忆精简版 + 完整记忆文件路径提示(供 CLI read_file 查阅)
-    - 全局长期记忆段(跨项目通用经验)+ 完整记忆文件路径提示
-
-    两部分都为空时返回空串。
+    文案实现收敛于 app/prompts/executor.py 的 build_cli_memory_section
+    (与内置 react_agent 侧的包装同源集中管理)。两部分都为空时返回空串。
     """
-    section = ""
-
-    # 项目记忆精简版 + 完整记忆文件路径提示(每轮注入,与 react_agent system prompt 行为一致)
-    summary = (memory_summary or "").strip()
-    if summary:
-        section += (
-            "\n\n[项目记忆摘要]\n"
-            + summary
-            + "\n\n完整项目记忆可 read_file /home/user/.agent_memory/project_memory.md 查阅"
-        )
-
-    # 全局长期记忆(跨项目通用经验,影响执行方式;与 react_agent system prompt 行为一致)
-    # 完整文件在任务启动时已写入沙箱,超截断上限时 CLI 可 read_file 查全量
-    gmem = (global_memory or "").strip()
-    if gmem:
-        section += (
-            "\n\n" + gmem
-            + "\n\n完整全局记忆可 read_file /home/user/.agent_memory/global_memory.md 查阅"
-        )
-
-    return section
+    return build_cli_memory_section(memory_summary, global_memory)
 
 
 # ============================================================
@@ -2589,10 +2506,15 @@ def run_acp_agent(
                     content=base_msg,
                 )
 
+            # 上传任务走 upload 包裹变体(不称"已预先 clone",与正文一致)
+            _repo_ctx_variant = (
+                "upload" if _has_creation_upload(task.params) else "clone"
+            )
             user_msg = (
                 base_msg
                 + _build_repo_context_section(
                     repo_context if followup_query is None else None,
+                    _repo_ctx_variant,
                 )
                 + _build_memory_section(memory_summary, global_memory)
             )

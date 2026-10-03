@@ -122,6 +122,29 @@ def test_base_prompt_excludes_repo_context():
     assert "分支: main" in base
 
 
+def test_base_prompt_first_round_matches_create_task_record():
+    """非上传任务:CLI 首轮 base 与 create_task 落库拼装逐字一致(幂等去重前提)。"""
+    from app.prompts.executor import build_first_round_question
+
+    task = _mk_task(params={"repo_url": "https://github.com/a/b", "branch": "main"})
+    base = _build_base_prompt(task, 1, None, "[repo context]", "/home/user/repos/r", None)
+    assert base == build_first_round_question(task.user_input, task.params)
+
+
+def test_base_prompt_upload_task_includes_upload_line():
+    """上传任务:CLI 首轮带上"用户上传的文件已放入任务工作区"行(与落库一致)。"""
+    task = _mk_task(params={"upload_id": "u1"})
+    base = _build_base_prompt(task, 1, None, "[repo context]", "/ws/uploaded_files", None)
+    assert "用户上传的文件已放入任务工作区" in base
+
+
+def test_base_prompt_repo_path_fallback_kept():
+    """未预 clone 但有路径:保留"仓库路径"兜底行(委托共享拼装后行为不变)。"""
+    task = _mk_task(params={"repo_url": "https://github.com/a/b"})
+    base = _build_base_prompt(task, 1, None, None, "/home/user/repos/r", None)
+    assert "仓库路径: /home/user/repos/r" in base
+
+
 def test_repo_context_section_roundtrip():
     """_build_repo_context_section:有内容时包裹提示语,空时返回空串。"""
     assert _build_repo_context_section(None) == ""
@@ -129,6 +152,52 @@ def test_repo_context_section_roundtrip():
     section = _build_repo_context_section("仓库 xxx 已克隆到 /home/user/repos/r")
     assert "仓库已预先 clone" in section
     assert "已克隆到 /home/user/repos/r" in section
+
+
+def test_repo_context_section_upload_variant():
+    """上传任务:upload 变体直接陈述用户上传文件,不再称"已预先 clone"(修复矛盾 bug)。"""
+    section = _build_repo_context_section(
+        "用户上传的文件(a.zip,共 3 个)已放入 /ws/uploaded_files",
+        variant="upload",
+    )
+    assert "[用户上传的文件已就绪]" in section
+    assert "仓库已预先 clone" not in section
+    assert "clone_repo" not in section
+
+
+def test_prompt_message_upload_task_uses_upload_variant():
+    """_build_prompt_message 按 task.params 自动选 upload 变体。"""
+    task = _mk_task(
+        params={"repo_url": "https://github.com/a/b", "upload_id": "u1"},
+    )
+    msg = _build_prompt_message(
+        task, 1, None,
+        "用户上传的文件(a.zip,共 3 个)已放入 /ws/uploaded_files",
+        "/ws/uploaded_files", None,
+    )
+    assert "[用户上传的文件已就绪]" in msg
+    assert "仓库已预先 clone" not in msg
+
+
+def test_load_project_memory_summary_falls_back_to_content():
+    """CLI 侧项目记忆:summary 为空回退 memory_content(与内置 agent 对齐的增强)。
+
+    数据源已收敛到 memory_injection.load_project_memory_brief 单一实现,
+    旧数据(未生成 summary)此前 CLI 不注入,现在注入截断的 memory_content。
+    """
+    from app.agents.acp_base import _load_project_memory_summary
+
+    proj = MagicMock()
+    proj.memory_content = "## Known Issues\n- issue B"
+    proj.memory_summary = ""
+    proj.alias = None
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = proj
+    task = MagicMock()
+    task.user_id = 1
+    task.params = {"repo_url": "https://github.com/a/b"}
+    task.id = "t1"
+    assert _load_project_memory_summary(db, task) == "## Known Issues\n- issue B"
 
 
 def test_memory_section_contains_both_and_global_file_hint():

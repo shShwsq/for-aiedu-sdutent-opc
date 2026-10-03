@@ -12,7 +12,7 @@ AGENT2_SYSTEM_PROMPT 为审查模式的兼容别名。
 """
 import pytest
 
-from app.agents.agent2 import (
+from app.prompts.agent2 import (
     AGENT2_REVIEW_PROMPT,
     AGENT2_SYSTEM_PROMPT,
 )

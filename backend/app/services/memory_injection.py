@@ -98,24 +98,26 @@ def build_agent2_memory_section(
     return "\n\n".join(parts)
 
 
-def build_react_agent_memory_section(
+def load_project_memory_brief(
     db: Session, user_id, repo_url: str | None,
-) -> str:
-    """构造 react_agent 的"分项目记忆"段。
+) -> tuple[str, str | None]:
+    """加载项目记忆数据(单源,无包装):返回 (记忆原文, 项目 alias)。
 
-    优先注入精简版 memory_summary(LLM 生成,≤注入上限);为空时回退 memory_content 截断
-    (兼容未生成 summary 的旧数据)。末尾附完整记忆文件路径提示,引导 agent 用 read_file
-    查阅突破字数限制的完整记忆。
+    记忆原文优先取精简版 memory_summary(LLM 生成,≤注入上限);
+    为空时回退 memory_content 截断(兼容未生成 summary 的旧数据)。
 
-    user_id 为 None / repo_url 为空 / 无对应 Project / 记忆为空 → 返回空串。
-    注入到 react_agent system prompt 末尾,影响审计方向(优先检查已知问题)。
+    内置 react_agent(build_react_agent_memory_section,英文 header + alias
+    + read_file 提示包装)与 CLI 侧(acp_base,裸文本 + 中文路径提示包装)
+    共用此数据源,消除两侧各自查询导致的回退行为分叉。
+
+    user_id 为 None / repo_url 为空 / 无对应 Project / 记忆为空 → ("", None)。
     """
     if user_id is None or not repo_url:
-        return ""
+        return "", None
 
     norm = normalize_repo_url(repo_url)
     if not norm:
-        return ""
+        return "", None
 
     proj = (
         db.query(Project)
@@ -126,7 +128,7 @@ def build_react_agent_memory_section(
         .first()
     )
     if not proj:
-        return ""
+        return "", None
 
     # 优先用精简版(已 ≤ MAX_PROJECT_MEM_CHARS,无需截断);为空回退完整内容截断
     summary = (proj.memory_summary or "").strip()
@@ -136,6 +138,22 @@ def build_react_agent_memory_section(
         memory_text = _truncate(
             (proj.memory_content or "").strip(), MAX_PROJECT_MEM_CHARS
         )
+    return memory_text, proj.alias
+
+
+def build_react_agent_memory_section(
+    db: Session, user_id, repo_url: str | None,
+) -> str:
+    """构造 react_agent 的"分项目记忆"段。
+
+    数据经 load_project_memory_brief 单源加载(summary 优先,memory_content
+    截断回退);此处只做 react 侧包装(英文 header + alias)。
+    末尾附完整记忆文件路径提示,引导 agent 用 read_file 查阅突破字数限制。
+
+    user_id 为 None / repo_url 为空 / 无对应 Project / 记忆为空 → 返回空串。
+    注入到 react_agent system prompt 末尾,影响审计方向(优先检查已知问题)。
+    """
+    memory_text, alias = load_project_memory_brief(db, user_id, repo_url)
     if not memory_text:
         return ""
 
@@ -143,8 +161,8 @@ def build_react_agent_memory_section(
         "The following is your known issues and historical memory for this project, "
         "organized by category. Prioritize checking Hard Constraints and Known Issues:"
     )
-    if proj.alias:
-        header += f"\nProject alias: {proj.alias}"
+    if alias:
+        header += f"\nProject alias: {alias}"
     # 完整记忆已写入沙箱文件,提示 agent 可 read_file 查阅突破字数限制
     memory_text += (
         "\n\nFull memory available via read_file "

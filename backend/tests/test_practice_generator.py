@@ -26,6 +26,7 @@ import pytest
 
 import app.models.task_artifact  # noqa: F401  让 Task mapper 能解析 TaskArtifact 关联
 import app.services.practice.generator as gen
+from app.prompts.practice import build_system_prompt
 from app.services.practice.generator import (
     _MAX_TOOL_RESULT_CHARS,
     _apply_thinking_mode,
@@ -35,7 +36,6 @@ from app.services.practice.generator import (
     _fatal_llm_reason,
     _normalize_raw_question,
     _parse_llm_questions,
-    build_system_prompt,
     compute_dedup_hash,
 )
 

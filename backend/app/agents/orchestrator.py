@@ -61,6 +61,15 @@ from app.models.user import User
 from app.models.user_llm_config import UserLLMConfig
 from app.pause_controller import clear_pause_state, wait_if_paused
 from app.perf import perf_log
+from app.prompts.executor import (
+    RESUME_ATTACHMENT_NOTE,
+    RETRY_MSG_LABEL,
+    USER_FOLLOWUP_MSG_LABEL,
+    build_first_round_question,
+    build_retry_message,
+    build_upload_header,
+    format_repo_context_body,
+)
 from app.security import decrypt_secret
 from app.tools import sandbox_tools
 from app.tools.schema import set_current_git_tokens, set_current_task
@@ -296,15 +305,9 @@ def run_dual_agent_audit(task: Task, db: Session) -> None:
 
     # agent_policy / ua_enabled 已在函数开头解析
 
-    # 用户原始意图
-    user_intent = task.user_input
-    params = task.params or {}
-    if params.get("repo_url"):
-        user_intent += f"\n仓库地址: {params['repo_url']}"
-    if params.get("branch"):
-        user_intent += f"\n分支: {params['branch']}"
-    if _creation_upload_ids(params):
-        user_intent += "\n交付物来源:用户上传的文件(已就绪在任务工作区,无需 clone)"
+    # 用户原始意图:复用 build_first_round_question(与 react_agent 首轮消息 /
+    # create_task 落库同一拼装,消除逐字重复的双轨实现)
+    user_intent = build_first_round_question(task.user_input, task.params)
 
     # react_agent 历轮结果摘要(给 agent2 评估用)
     react_summaries: list[dict] = []
@@ -1332,7 +1335,7 @@ def _prepare_repo_context(
         )
         return repo_path, ""
 
-    repo_context = _format_repo_context(repo_url, repo_path, files_result)
+    repo_context = format_repo_context_body(repo_url, repo_path, files_result)
     return repo_path, repo_context
 
 
@@ -1440,21 +1443,8 @@ def _prepare_upload_context(
         )
         return repo_path, ""
 
-    if len(creation_ids) == 1:
-        meta = metas[0]
-        filename = meta.get("filename") or "上传文件"
-        file_count = meta.get("file_count") or "?"
-        header = (
-            f"用户上传的交付物({filename},共 {file_count} 个文件)"
-            f"已就绪在 {repo_path},可直接开始处理,无需 clone"
-        )
-    else:
-        names = "、".join((m.get("filename") or "上传文件") for m in metas)
-        header = (
-            f"用户上传的 {len(creation_ids)} 个交付物({names})"
-            f"已就绪在 {repo_path}(各占独立子目录),可直接开始处理,无需 clone"
-        )
-    repo_context = _format_repo_context("", repo_path, files_result, header=header)
+    header = build_upload_header(metas, repo_path)
+    repo_context = format_repo_context_body("", repo_path, files_result, header=header)
     return repo_path, repo_context
 
 
@@ -1513,38 +1503,6 @@ def _write_memory_files_for_task(
         )
     except Exception as e:
         logger.warning(f"[task={task.id}] 写入项目记忆文件失败(忽略): {e}")
-
-
-def _format_repo_context(
-    repo_url: str, repo_path: str, files_result: dict, header: str | None = None,
-) -> str:
-    """把 clone / 上传结果 + list_files 结果格式化成给 agent 看的上下文文本
-
-    格式:
-        仓库 <url> 已克隆到 <path>   (或 header 自定义首行,如上传交付物)
-        根目录结构(共 N 项):
-          [目录] src
-          [文件] README.md (1234 B)
-          ...
-    """
-    entries = files_result.get("entries", [])
-    total = files_result.get("total", 0)
-    truncated = files_result.get("truncated", False)
-
-    lines = [header or f"仓库 {repo_url} 已克隆到 {repo_path}"]
-    trunc_hint = ", 已截断(仅显示部分)" if truncated else ""
-    lines.append(f"根目录结构(共 {total} 项{trunc_hint}):")
-    for e in entries:
-        etype = e.get("type", "file")
-        name = e.get("name", "?")
-        if etype == "dir":
-            lines.append(f"  [目录] {name}")
-        else:
-            size = e.get("size", 0)
-            size_str = f" ({size} B)" if size else ""
-            lines.append(f"  [文件] {name}{size_str}")
-
-    return "\n".join(lines)
 
 
 def _restore_workspace_if_needed(
@@ -1740,10 +1698,7 @@ def resume_audit_with_message(
                 logger.warning(
                     f"[task={task.id}] 追问上传文件传输失败(忽略,文字消息照常处理): {e}"
                 )
-        attachment_note = (
-            "\n\n[本轮附带文件已放入工作区 followup_uploads/ 目录,"
-            "可用 list_files / read_file 查看]"
-        )
+        attachment_note = RESUME_ATTACHMENT_NOTE
 
     # agent1 本轮执行的追问文本(含附件提示,让 agent 感知新文件)
     followup_text = user_message + attachment_note
@@ -1751,7 +1706,7 @@ def resume_audit_with_message(
     # 把用户消息拼到 user_intent 后面,供 agent1 结束后的后台审查参考
     # (审查需知道完整意图,含追问/重试语境);重试场景用专门标记,
     # 避免审查把续跑当成用户新增需求
-    msg_label = "[重试续跑]" if retry else "[用户追加消息]"
+    msg_label = RETRY_MSG_LABEL if retry else USER_FOLLOWUP_MSG_LABEL
     effective_intent = task.user_input + f"\n\n{msg_label}\n{followup_text}"
 
     # 本轮是否正常完成(内存标志):与 run_dual_agent_audit 同理,
@@ -2005,11 +1960,7 @@ def retry_failed_task(task: Task, db: Session) -> None:
         _prepare_repo_context(task, db, task_id_str, git_tokens)
 
     # 以重试续跑消息恢复执行(状态流转/记忆文件重建/轮次续接由 resume 链路处理)
-    retry_message = (
-        f"该任务上一次执行因错误中断: {last_error}\n"
-        "这是一次失败重试(断点续跑),不是用户的新需求: "
-        "请基于已有进度继续完成原任务,不要重做已完成的部分。"
-    )
+    retry_message = build_retry_message(last_error)
     resume_audit_with_message(task, db, retry_message, retry=True)
 
 

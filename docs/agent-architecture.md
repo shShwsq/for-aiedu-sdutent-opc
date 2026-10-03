@@ -113,7 +113,7 @@ def run_agent2(
 ) -> dict
 ```
 
-> 单 prompt:`AGENT2_REVIEW_PROMPT`(单次完整审查,无 followup/done/轮次语义)。旧名 `AGENT2_SYSTEM_PROMPT` 保留为 `AGENT2_REVIEW_PROMPT` 的兼容别名。resume 时用户消息直接交给 agent1,不经 agent2 分析转述(原 `mode="analyze"` 已移除)。
+> 单 prompt:`AGENT2_REVIEW_PROMPT`(定义于 [app/prompts/agent2.py](../backend/app/prompts/agent2.py),单次完整审查,无 followup/done/轮次语义)。旧名 `AGENT2_SYSTEM_PROMPT` 保留为 `AGENT2_REVIEW_PROMPT` 的兼容别名。resume 时用户消息直接交给 agent1,不经 agent2 分析转述(原 `mode="analyze"` 已移除)。
 
 ### 2.3 输出结构
 
@@ -249,12 +249,17 @@ def run_react_agent(
 
 ### 3.3 上下文构造
 
+> 所有 LLM 文本资产（system prompt 常量、追问指引、plan 提醒、repo context 包裹段、
+> 兜底提示、历史压缩 prompt 等）集中管理于 [app/prompts/executor.py](../backend/app/prompts/executor.py)
+> （零 app.* 依赖的纯文本层，由 tests/test_prompts_purity.py 固化）；
+> `react_agent.py` / `orchestrator.py` 只保留执行逻辑，经 import 消费（§9）。
+
 #### System Prompt（`REACT_AGENT_SYSTEM_PROMPT`）
 
 固定模板 + 末尾追加两段记忆：
 
 1. **分项目记忆**（`build_react_agent_memory_section`）
-   - 来源：`Project.memory_summary`（优先）/ `memory_content`（回退截断）
+   - 来源：`Project.memory_summary`（优先）/ `memory_content`（回退截断），数据经 `load_project_memory_brief` 单源加载（与 CLI 侧共用，§5）
    - 引导语："Prioritize checking Hard Constraints and Known Issues"
    - 末尾附："Full memory available via read_file /home/user/.agent_memory/project_memory.md"
    - 完整记忆已由 orchestrator 在 clone 后写入沙箱该路径（突破字数限制）
@@ -265,15 +270,20 @@ def run_react_agent(
 
 #### User Message
 
-**第 1 轮（`followup_query=None`）**：
+**第 1 轮（`followup_query=None`）**：底座由 `build_first_round_question`（prompts/executor.py）拼装——与 create_task 落库、CLI 首轮共用同一实现：
 ```
 {task.user_input}
 仓库地址: {repo_url}
 分支: {branch}
+用户上传的文件已放入任务工作区        ← 仅上传任务(直白陈述,不提 clone)
+```
 
-[仓库已预先 clone,无需你再调用 clone_repo]
+预 clone 上下文段（只进发送内容不落库）按任务类型选变体：
+```
+[仓库已预先 clone,无需你再调用 clone_repo]        ← clone 任务
+[用户上传的文件已就绪]                             ← 上传任务(直白陈述,不提 clone)
 {repo_context}
-请直接基于上述仓库路径开始审计(用 read_file / search_code / list_files 等)...
+请直接基于上述仓库路径开始执行任务(用 read_file / search_code / list_files 等工具)...
 ```
 
 **追问轮（`followup_query` 非空，resume/重试时为用户消息或重试指令原文）**：
@@ -308,7 +318,7 @@ def run_react_agent(
 1. 全部 Level 0 ≤ 预算 → 直接用
 2. 超限 → 按优先级降级（低的先丢工具摘要，同优先级 FIFO），全 Level 1 还超 → 进入 Level 2
 3. **Level 2**：保留最近 `HISTORY_KEEP_RECENT=1` 轮 Level 1，早期轮次压缩为单条 `[系统注入|早期轮次压缩摘要]` system 消息
-   - 压缩 prompt：`_HISTORY_COMPRESS_PROMPT`（必须保留用户要求/关键发现/covered/missing），关闭 thinking 模式加速
+   - 压缩 prompt：`HISTORY_COMPRESS_PROMPT`（prompts/executor.py，必须保留用户要求/关键发现/covered/missing），关闭 thinking 模式加速
    - **带缓存 + 增量压缩**：`_get_or_create_compressed` 查 `type=history_compress` 缓存记录，部分覆盖时增量压缩（旧摘要 + 新轮次），结果落库为新缓存
    - **后台预压缩**：`precompress_history_for_next_round` 在审查完成后/单 agent 收尾时预写缓存，用户下一次追问直接命中，消除追问路径上的同步 LLM 压缩延迟
 4. 无 client 或压缩失败 → 兜底强制截断（`_truncate_messages`，从最早消息裁剪保最近）
@@ -322,13 +332,13 @@ def run_react_agent(
 2. **用户补充消息注入**：`drain_user_messages(task.id)` 取用户在运行中/暂停中追加的消息，合并为一条 user 消息注入 `messages`
 3. **流式调 LLM**：`_stream_llm_response` 返回 `reasoning_full / content_full / tool_calls_full / finish_reason`
 4. **落库 thinking**：`type=thinking, publish_event=False`（流式卡片已展示，避免重复推 SSE）
-5. **提取 plan**：`_extract_plan(content_full)` 从 `<plan>...</plan>` 块解析，`_merge_plan` 合并到 `current_plan`
+5. **提取 plan**：`_extract_plan(content_full)`（[runtime/plan.py](../backend/app/agents/runtime/plan.py) `extract_plan`，与 CLI 侧共用）从 `<plan>...</plan>` 块解析，`_merge_plan` 合并到 `current_plan`
 6. **tool_calls 兜底**：结构化 `tool_calls_full` 为空时，从 content 文本解析 `<tool_call>` 块
 7. **结束判断**：`not tool_calls_full and finish_reason != "length"` → 真正结束，`content_full` 作为 summary
 8. **执行工具**：`execute_tool(fn_name, fn_args)`，结果以 `role=tool` 消息加回 `messages`
    - 工具调用签名记录到 `recent_calls`（循环检测）
    - plan 推进：`_infer_step_from_tool` 根据 tool_name 关键词匹配 step.text，标 `in_progress`
-9. **plan 提醒注入**：`_format_plan_reminder(current_plan)` 作为 system 消息加到 `messages`（可替换，避免累积）
+9. **plan 提醒注入**：`format_plan_reminder(current_plan, variant="react")`（prompts/executor.py，CLI 侧同函数 `variant="cli"`）作为 system 消息加到 `messages`（可替换，避免累积）
 10. **循环检测**：连续 `MAX_SAME_CALLS=3` 次相同调用，或滑动窗口 `LOOP_WINDOW_SIZE=6` 内不同签名 ≤ `LOOP_MIN_DISTINCT=2` → 强制转入总结
 
 ### 3.6 plan 状态机（代码 + LLM 双向同步）
@@ -475,6 +485,7 @@ ExecutorAgent (ABC)
 5. sandbox_tools._get_or_create_session(task_id_str)
    → 复用 orchestrator 预 clone 的沙箱会话
 6. _load_project_memory_summary(db, task) + _load_global_memory(db, task)
+   → 项目记忆委托 memory_injection.load_project_memory_brief(与内置侧同源,含 content 截断回退)
 7. _ensure_cli_env(session, agent_type)
    → 创建 bridge 脚本目录 + 写入 bridge 脚本 + 检查 CLI(不可用则安装)
 8. pre_bridge_hook(session, credentials, agent_type)  [wrapper 钩子]
@@ -490,10 +501,10 @@ ExecutorAgent (ABC)
 13. client.new_session(cwd=repo_path or "/home/user")
 14. post_session_setup(client, session_id, task)  [wrapper 钩子]
     → deepseek_cli 用此调 set_config_option(model / reasoning_effort)
-15. _build_prompt_message(task, round_idx, followup_query, repo_context, repo_path,
-                          previous_plan, memory_summary, global_memory)
-    → 构造发给 CLI 的 prompt(与内置 react_agent 对齐)
-16. _add_conversation(role=user, type=question, content=user_msg)
+15. _build_base_prompt(纯指令,落库) → 幂等查重后 _add_conversation
+    → 再拼 _build_repo_context_section(按上传/clone 选变体) + _build_memory_section
+      = 完整发送 user_msg(各段文案收敛于 prompts/executor.py,见 §4.4)
+16. _add_conversation(role=user, type=question, content=base_msg)
 17. collector = _ACPCollector(task, db, round_idx)
 18. client.prompt(session_id, [{"type":"text","text":user_msg}], on_event=collector)
 19. recorder.close() + collector.close()
@@ -503,20 +514,23 @@ ExecutorAgent (ABC)
 23. return [], summary, current_plan
 ```
 
-### 4.4 Prompt 消息构造（`_build_prompt_message`）
+### 4.4 Prompt 消息构造（`_build_base_prompt` + 共享段落工厂）
 
-**第 1 轮**：
+CLI 侧每轮构造单条 user 文本：**纯指令**（`_build_base_prompt`，落库展示）+ **预 clone/上传上下文段** + **记忆注入段**（后两段只进发送内容）。各段文案实现收敛于 [app/prompts/executor.py](../backend/app/prompts/executor.py)（与内置 react_agent 侧同源集中管理，消除"注释里约定两边保持一致"的双轨手抄；`_build_prompt_message` 为三段拼接的聚合视图，供测试锚定）。
+
+**第 1 轮**（底座复用 `build_first_round_question`——与 create_task 落库、内置 react_agent 首轮完全一致；上传任务会带"用户上传的文件已放入任务工作区"行；未预 clone 但有路径时附"仓库路径"兜底行）：
 ```
 {task.user_input}
 仓库地址: {repo_url}
 分支: {branch}
 
-[仓库已预先 clone,无需你再调用 clone_repo]
+[仓库已预先 clone,无需你再调用 clone_repo]     ← clone 任务(clone 变体)
+[用户上传的文件已就绪]                         ← 上传任务(upload 变体,不再与正文矛盾)
 {repo_context}
-请直接基于上述仓库路径开始审计。
+请直接基于上述仓库路径开始执行任务。
 ```
 
-**追问轮**：
+**追问轮**（核心指引文本与内置侧共享 `FOLLOWUP_CORE_GUIDANCE`，两侧仅包装不同）：
 ```
 基于之前的执行进度,请处理以下新消息(用户追问可直接回答,新需求/修正则执行对应工作,续跑则接着完成,均不要重做已完成的部分):
 仓库路径(已 clone): {repo_path}
@@ -526,8 +540,8 @@ ExecutorAgent (ABC)
 ```
 
 **每轮末尾追加**（与内置 react_agent system prompt 行为一致）：
-- 若有 `previous_plan`：`_format_plan_reminder(previous_plan)`（注入 plan 状态让 CLI 续接进度）
-- 若有 `memory_summary`：`[项目记忆摘要] ... 完整项目记忆可 read_file /home/user/.agent_memory/project_memory.md 查阅`
+- 若有 `previous_plan`：`format_plan_reminder(previous_plan, variant="cli")`（中立措辞，兼容 CLI 原生 TodoList 等计划工具）
+- 若有 `memory_summary`：`[项目记忆摘要] ... 完整项目记忆可 read_file /home/user/.agent_memory/project_memory.md 查阅`（数据经 `memory_injection.load_project_memory_brief` 单源加载，summary 为空回退 memory_content 截断——与内置侧回退行为一致）
 - 若有 `global_memory`：跨项目通用经验段
 
 > **注意**：CLI agent 不像内置 react_agent 那样维护 `messages` 列表，每次 prompt 都是独立的 user 消息。跨轮记忆主要依赖：
@@ -715,7 +729,7 @@ list of `{label, header_name, header_value}`：
 | agent2 → agent1 | agent2 落库 `type=review` 的 reasoning（旧版任务为 `type=evaluation`），内置 react_agent 经 `_build_history_messages` 加载 | - |
 | 长期记忆 → agent2 | `build_agent2_memory_section` 注入 system prompt | 各段 2000 |
 | 长期记忆 → agent1（内置） | `build_react_agent_memory_section` + `build_global_memory_section` 注入 system prompt | 各段 2000 |
-| 长期记忆 → CLI agent | `_load_project_memory_summary` + `_load_global_memory` 注入 prompt 末尾 | 各段 2000 |
+| 长期记忆 → CLI agent | `_load_project_memory_summary`（委托 `memory_injection.load_project_memory_brief` 单源加载）+ `_load_global_memory` 注入 prompt 末尾 | 各段 2000 |
 | 完整项目记忆 → 沙箱 | orchestrator clone 后 `write_project_memory_file` 写入 `/home/user/.agent_memory/project_memory.md` | 无限制（agent1 的内置 react_agent / CLI 实现均可 read_file 查阅） |
 
 ### 7.3 用户交互上下文
@@ -796,8 +810,9 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 | [runtime/conversation.py](../backend/app/agents/runtime/conversation.py) | `record_conversation()` 统一落库 + SSE 推送（payload 超集形状：id / reasoning / tool_call_id / created_at + extra_payload 如 verify=true；`publish_event=False` 供 thinking 防重复推送） | react_agent / orchestrator / acp_base 以 `_add_conversation` 别名导入（monkeypatch 兼容）；agent2 / verifier 工具落库直接调用。顺带修复：verifier 此前落库不带 id / tool_call_id，前端无法把 result 与 call 配对展示 |
 | [runtime/tool_intent.py](../backend/app/agents/runtime/tool_intent.py) | `build_tool_intent(fn, args, prefix=...)` 单一注册表（react_agent 全量工具 + agent2 `check_reference` + verifier `http_request`），末尾 `[tool_name]` 标签与前端提取逻辑不变 | 三方共用；agent2 传 `prefix="[agent2 质检]"` 保留质检语境 |
 | [runtime/constants.py](../backend/app/agents/runtime/constants.py) | `MAX_HISTORY_MSG_CHARS` / `MAX_HISTORY_TOTAL_CHARS` 单一事实源 | react_agent 与 agent2 导入使用，消除"注释里约定两边保持一致"的手工同步 |
+| [runtime/plan.py](../backend/app/agents/runtime/plan.py) | `<plan>...</plan>` 计划清单解析单一事实源：`extract_plan`（JSON 数组优先 + json_repair 容错，回退逐行格式）+ `parse_plan_json` + 正则常量 | react_agent（thinking content）与 acp_base（最终 content）导入使用，此前的两份逐字相同手抄副本已收敛 |
 
-**不在 runtime 的（职责边界）**：三个智能体的循环策略——react_agent 的 ReAct 迭代 / plan 状态机 / 循环检测 / 三级历史压缩（token 预算）、agent2 的工具配额（只读 12 / verify 3 / 引用 3）/ `superseded_check` 并行门控 / 重试降级、verifier 的 `per_action` 授权拦截；以及各自的 prompt、工具定义与门控、历史注入策略（react_agent 结构化 messages vs agent2 文本前缀）。这些保持各模块独立演进，不抽基类（避免模板方法钩子地狱）。
+**不在 runtime 的（职责边界）**：三个智能体的循环策略——react_agent 的 ReAct 迭代 / plan 状态机 / 循环检测 / 三级历史压缩（token 预算）、agent2 的工具配额（只读 12 / verify 3 / 引用 3）/ `superseded_check` 并行门控 / 重试降级、verifier 的 `per_action` 授权拦截；以及各自的 prompt 文本资产（集中收敛到 [app/prompts/](../backend/app/prompts/)，见 §9）、工具定义与门控、历史注入策略（react_agent 结构化 messages vs agent2 文本前缀）。循环策略保持各模块独立演进，不抽基类（避免模板方法钩子地狱）。
 
 ---
 
@@ -805,11 +820,18 @@ orchestrator / agent2 / react_agent / CLI agent / verifier_agent 都通过 `even
 
 | 文件 | 职责 |
 |------|------|
+| [prompts/__init__.py](../backend/app/prompts/__init__.py) | LLM 提示词与上下文段落资产包（纯文本层，零 app.* 依赖，tests/test_prompts_purity.py 固化） |
+| [prompts/executor.py](../backend/app/prompts/executor.py) | 执行链文本资产：REACT_AGENT_SYSTEM_PROMPT / 追问指引（含 react/cli 共享核心文本）/ build_first_round_question（create_task 落库与两侧首轮共用）/ repo context 包裹（clone/upload 变体）/ plan 提醒（react/cli 双变体）/ 循环与迭代兜底 / 历史压缩 prompt / CLI 记忆段包装 |
+| [prompts/agent2.py](../backend/app/prompts/agent2.py) | agent2 文本资产：AGENT2_REVIEW_PROMPT + 三类工具定义（只读 / verify / check_reference） |
+| [prompts/verifier.py](../backend/app/prompts/verifier.py) | verifier 文本资产：VERIFIER_SYSTEM_PROMPT + 登录身份动态注入段 |
+| [prompts/memory_curator.py](../backend/app/prompts/memory_curator.py) | 记忆归纳/精简模板 + 记忆类别枚举 |
+| [prompts/practice.py](../backend/app/prompts/practice.py) | 练习出题文本资产：4 主题 head / 工具说明段 / 通用规则 / build_system_prompt / 主题分类器 / 出题模板 |
 | [orchestrator.py](../backend/app/agents/orchestrator.py) | 双智能体协作编排（agent1 单轮 + 后台审查 + resume） |
 | [runtime/llm_stream.py](../backend/app/agents/runtime/llm_stream.py) | 共享运行时：统一流式 LLM 调用 + 跨 chunk 工具累积 + 文本 tool_call 兜底解析（§8.6） |
 | [runtime/conversation.py](../backend/app/agents/runtime/conversation.py) | 共享运行时：统一对话落库 + SSE 推送（tool_call_id 配对 + extra_payload） |
 | [runtime/tool_intent.py](../backend/app/agents/runtime/tool_intent.py) | 共享运行时：工具意图生成单一注册表（prefix 支持） |
 | [runtime/constants.py](../backend/app/agents/runtime/constants.py) | 共享运行时：跨智能体截断常量单一事实源 |
+| [runtime/plan.py](../backend/app/agents/runtime/plan.py) | 共享运行时：plan 计划清单解析单一事实源（react_agent 与 acp_base 共用） |
 | [agent2.py](../backend/app/agents/agent2.py) | agent2 实现（质检评估 / 审查维度自定 / 跨轮自记忆） |
 | [react_agent.py](../backend/app/agents/react_agent.py) | 内置 react_agent（流式 LLM / 工具调用 / plan 状态机 / 三级压缩跨轮记忆 / 循环检测） |
 | [verifier_agent.py](../backend/app/agents/verifier_agent.py) | 验证智能体（独立 ReAct 循环 + http_request / run_python_code 工具 + per_action 授权） |

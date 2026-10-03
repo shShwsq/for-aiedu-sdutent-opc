@@ -10,6 +10,7 @@
 import json
 from unittest.mock import MagicMock
 
+import app.models.task_artifact  # noqa: F401  单跑本文件时注册 TaskArtifact,Task mapper 才能初始化
 import app.agents.agent2 as agent2
 from app.agents.agent2 import run_agent2
 from app.models.task import Conversation
