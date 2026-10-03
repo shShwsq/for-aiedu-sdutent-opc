@@ -45,14 +45,16 @@ export interface OnboardingStep {
  * - v2: 主导航文案对齐实际 7 项(补「技能管理」),并补充主题切换入口说明。
  * - v3: 感知练习功能开关(PRACTICE_ENABLED):启用部署新增「自适应练习」介绍步骤,
  *       home-nav 文案补全该导航项;关闭部署步骤与文案保持 v2 不变。
+ * - v4: 首页改为工作台布局(操作行 + 最近任务列表,欢迎卡/特性介绍区移除):
+ *       欢迎步骤锚点从欢迎卡改到操作行,新增「最近任务」步骤。
  */
-export const ONBOARDING_VERSION = 3
+export const ONBOARDING_VERSION = 4
 
 /**
  * 全部引导步骤(按路由分组,组内按顺序播放)。
  *
  * 路由划分:
- * - home:        首页欢迎 + CTA + 工作区 + 主导航(4 步)
+ * - home:        首页欢迎 + CTA + 最近任务 + 历史任务栏 + 主导航 + 账号按钮(6 步,练习启用时 +1)
  * - task-create: 场景 + 模型 + 执行器 + 输入 + 发送(5 步)
  * - task-detail: 结果清单 + 对话流 + 暂停 + 历史切换(4 步)
  * - settings:    账号设置入口说明(1 步,从 home 阶段末尾的齿轮步骤跳转进入)
@@ -65,7 +67,7 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
   // ---- 路由:home(首页) ----
   {
     id: 'home-welcome',
-    target: 'home-welcome-card',
+    target: 'home-actions',
     route: 'home',
     placement: 'bottom',
     title: '欢迎使用 SecondLook',
@@ -79,6 +81,15 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
     placement: 'right',
     title: '提交新任务',
     content: '点这里进入任务提交页,描述你的需求并选择执行器。',
+  },
+  {
+    id: 'home-recent-tasks',
+    target: 'home-recent-tasks',
+    route: 'home',
+    placement: 'right',
+    title: '最近任务',
+    content:
+      '首页直接展示最近的任务:点击任意一行进入任务详情,查看对话流与检查助手的质检结果;「展开全部任务」可打开左侧历史任务栏查找更早的任务。',
   },
   {
     id: 'home-workspace',
