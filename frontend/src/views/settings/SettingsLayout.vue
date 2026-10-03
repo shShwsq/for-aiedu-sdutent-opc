@@ -35,18 +35,21 @@ function toggleWorkspace(): void {
     <div class="page-body">
       <WorkspaceSidebar v-if="!workspaceCollapsed" />
 
-      <!-- 左侧设置导航 -->
-      <nav class="settings-nav">
-        <RouterLink to="/settings/account" class="nav-item">账户设置</RouterLink>
-        <RouterLink to="/settings/models" class="nav-item">模型设置</RouterLink>
-        <RouterLink to="/settings/cli" class="nav-item">CLI 设置</RouterLink>
-        <RouterLink to="/settings/policy" class="nav-item">协作策略</RouterLink>
-      </nav>
+      <!-- 导航 + 内容整体居中 -->
+      <div class="settings-shell">
+        <!-- 左侧设置导航 -->
+        <nav class="settings-nav">
+          <RouterLink to="/settings/account" class="nav-item">账户设置</RouterLink>
+          <RouterLink to="/settings/models" class="nav-item">模型设置</RouterLink>
+          <RouterLink to="/settings/cli" class="nav-item">CLI 设置</RouterLink>
+          <RouterLink to="/settings/policy" class="nav-item">协作策略</RouterLink>
+        </nav>
 
-      <!-- 右侧子路由内容 -->
-      <main class="settings-content">
-        <RouterView />
-      </main>
+        <!-- 右侧子路由内容 -->
+        <main class="settings-content">
+          <RouterView />
+        </main>
+      </div>
     </div>
   </div>
 </template>
@@ -69,15 +72,25 @@ function toggleWorkspace(): void {
   overflow: hidden;
 }
 
-/* ---- 左侧设置导航 ---- */
+/* ---- 导航 + 内容居中容器 ---- */
+.settings-shell {
+  flex: 1;
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  max-width: 1180px;
+  margin: 0 auto;
+  overflow: hidden;
+}
+
+/* ---- 左侧设置导航(无边框,靠留白与 active 高亮区分) ---- */
 .settings-nav {
   flex-shrink: 0;
-  width: 200px;
+  width: 168px;
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
-  padding: var(--space-5) var(--space-3);
-  border-right: 1px solid var(--color-border);
+  padding: var(--space-6) var(--space-4);
   overflow-y: auto;
 }
 
@@ -113,8 +126,8 @@ function toggleWorkspace(): void {
 /* ---- 响应式:窄屏(手机) ---- */
 @media (max-width: 768px) {
   .settings-nav {
-    width: 160px;
-    padding: var(--space-3) var(--space-2);
+    width: 140px;
+    padding: var(--space-4) var(--space-2);
   }
 
   .nav-item {
@@ -124,15 +137,14 @@ function toggleWorkspace(): void {
 }
 
 @media (max-width: 640px) {
-  .page-body {
+  .settings-shell {
     flex-direction: column;
+    max-width: none;
   }
 
   .settings-nav {
     width: 100%;
     flex-direction: row;
-    border-right: none;
-    border-bottom: 1px solid var(--color-border);
     padding: var(--space-2) var(--space-3);
     overflow-x: auto;
     overflow-y: hidden;
